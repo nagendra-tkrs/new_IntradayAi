@@ -1,0 +1,356 @@
+import pandas as pd
+import numpy as np
+from typing import Optional
+from app.models.schemas import (
+    SignalDirection, SignalScore, TradeSetup,
+    SignalExplanation, DataSource
+)
+from app.services.indicators import calculate_all_indicators
+from app.core.market_session import now_ist
+import uuid
+
+
+def _normalize(value: float, min_val: float, max_val: float) -> float:
+    if max_val == min_val:
+        return 0.0
+    return max(0.0, min(1.0, (value - min_val) / (max_val - min_val)))
+
+
+def score_trend(row: pd.Series) -> tuple[float, list[str]]:
+    score = 0.0
+    reasons = []
+    ema_9 = row.get("ema_9", np.nan)
+    ema_20 = row.get("ema_20", np.nan)
+    ema_50 = row.get("ema_50", np.nan)
+    price = row.get("close", np.nan)
+    if pd.isna(ema_9) or pd.isna(ema_20) or pd.isna(ema_50):
+        return 0.0, ["Insufficient data for trend"]
+    if ema_9 > ema_20 > ema_50:
+        score = 20
+        reasons.append("Strong bullish EMA alignment (9>20>50)")
+    elif ema_9 > ema_20:
+        score = 12
+        reasons.append("Short-term bullish trend (EMA 9>20)")
+    elif ema_9 < ema_20 < ema_50:
+        score = 0
+        reasons.append("Strong bearish EMA alignment (9<20<50)")
+    elif ema_9 < ema_20:
+        score = 6
+        reasons.append("Short-term bearish trend (EMA 9<20)")
+    adx = row.get("adx_14", np.nan)
+    if not pd.isna(adx):
+        if adx > 25:
+            reasons.append(f"Strong trend (ADX {adx:.0f})")
+            score = min(20, score + 2)
+        elif adx < 15:
+            reasons.append(f"Weak trend (ADX {adx:.0f})")
+            score = max(0, score - 3)
+    return score, reasons
+
+
+def score_momentum(row: pd.Series) -> tuple[float, list[str]]:
+    score = 0.0
+    reasons = []
+    rsi = row.get("rsi_14", 50)
+    macd_hist = row.get("macd_histogram", 0)
+    roc = row.get("roc_5", 0)
+    if pd.isna(rsi):
+        return 0.0, ["Insufficient data for momentum"]
+    if 40 <= rsi <= 60:
+        score += 5
+        reasons.append(f"RSI neutral ({rsi:.0f})")
+    elif 30 <= rsi < 40:
+        score += 8
+        reasons.append(f"RSI recovering ({rsi:.0f})")
+    elif rsi < 30:
+        score += 3
+        reasons.append(f"RSI oversold ({rsi:.0f}) - caution")
+    elif 60 < rsi <= 70:
+        score += 8
+        reasons.append(f"RSI strong ({rsi:.0f})")
+    elif rsi > 70:
+        score += 3
+        reasons.append(f"RSI overbought ({rsi:.0f}) - caution")
+    if not pd.isna(macd_hist):
+        if macd_hist > 0:
+            score += 5
+            reasons.append("MACD momentum positive")
+        else:
+            score += 1
+            reasons.append("MACD momentum negative")
+    if not pd.isna(roc):
+        if abs(roc) > 1:
+            score += 2
+            reasons.append(f"Rate of change {roc:.1f}%")
+    return min(15, score), reasons
+
+
+def score_volume(row: pd.Series) -> tuple[float, list[str]]:
+    score = 0.0
+    reasons = []
+    rel_vol = row.get("relative_volume", 1.0)
+    if pd.isna(rel_vol):
+        return 0.0, ["Insufficient volume data"]
+    if rel_vol > 2.0:
+        score = 15
+        reasons.append(f"Very high relative volume ({rel_vol:.1f}x)")
+    elif rel_vol > 1.5:
+        score = 12
+        reasons.append(f"High relative volume ({rel_vol:.1f}x)")
+    elif rel_vol > 1.0:
+        score = 8
+        reasons.append(f"Above-average volume ({rel_vol:.1f}x)")
+    elif rel_vol > 0.5:
+        score = 4
+        reasons.append(f"Average volume ({rel_vol:.1f}x)")
+    else:
+        score = 1
+        reasons.append(f"Low volume ({rel_vol:.1f}x) - caution")
+    return score, reasons
+
+
+def score_vwap(row: pd.Series) -> tuple[float, list[str]]:
+    score = 0.0
+    reasons = []
+    dist = row.get("distance_from_vwap", 0)
+    vwap_val = row.get("vwap", np.nan)
+    price = row.get("close", np.nan)
+    if pd.isna(dist) or pd.isna(vwap_val) or vwap_val == 0:
+        return 0.0, ["VWAP not available"]
+    if dist > 0:
+        score = 12 + min(3, dist * 2)
+        reasons.append(f"Price above VWAP (+{dist:.1f}%)")
+    else:
+        score = 3 + max(0, 12 + dist * 2)
+        reasons.append(f"Price below VWAP ({dist:.1f}%)")
+    return min(15, max(0, score)), reasons
+
+
+def score_price_action(row: pd.Series) -> tuple[float, list[str]]:
+    score = 0.0
+    reasons = []
+    price = row.get("close", 0)
+    or_high = row.get("opening_range_high", np.nan)
+    or_low = row.get("opening_range_low", np.nan)
+    prev_high = row.get("prev_high", np.nan)
+    prev_low = row.get("prev_low", np.nan)
+    if pd.isna(or_high) or pd.isna(or_low):
+        return 7.5, ["Opening range not established"]
+    if price > or_high:
+        score += 8
+        reasons.append("Breakout above opening range")
+    elif price < or_low:
+        score += 8
+        reasons.append("Breakdown below opening range")
+    else:
+        score += 4
+        reasons.append("Within opening range")
+    if not pd.isna(prev_high) and price > prev_high:
+        score += 4
+        reasons.append("Above previous high")
+    if not pd.isna(prev_low) and price < prev_low:
+        score += 4
+        reasons.append("Below previous low")
+    bb_upper = row.get("bb_upper", np.nan)
+    bb_lower = row.get("bb_lower", np.nan)
+    if not pd.isna(bb_upper) and price > bb_upper:
+        score += 3
+        reasons.append("Above Bollinger Band upper")
+    elif not pd.isna(bb_lower) and price < bb_lower:
+        score += 3
+        reasons.append("Below Bollinger Band lower")
+    return min(15, score), reasons
+
+
+def score_market_context(row: pd.Series, market_context: dict | None = None) -> tuple[float, list[str]]:
+    if market_context is None:
+        return 5.0, ["Market context neutral (no index data available)"]
+
+    score = 5.0
+    reasons = []
+
+    nifty_trend = market_context.get("nifty_trend", "UNKNOWN")
+    nifty_change_pct = market_context.get("nifty_change_pct", 0)
+    banknifty_change_pct = market_context.get("banknifty_change_pct", 0)
+
+    if nifty_trend == "BULLISH":
+        score += 3
+        reasons.append(f"NIFTY trending bullish ({nifty_change_pct:+.1f}%)")
+    elif nifty_trend == "BEARISH":
+        score -= 2
+        reasons.append(f"NIFTY trending bearish ({nifty_change_pct:+.1f}%)")
+    else:
+        reasons.append(f"NIFTY neutral ({nifty_change_pct:+.1f}%)")
+
+    if nifty_change_pct > 0.5:
+        score += 2
+        reasons.append("Strong positive market breadth")
+    elif nifty_change_pct < -0.5:
+        score -= 1
+        reasons.append("Negative market breadth")
+
+    return max(0, min(10, score)), reasons
+
+
+def score_risk_quality(row: pd.Series) -> tuple[float, list[str]]:
+    score = 0.0
+    reasons = []
+    atr_val = row.get("atr_14", np.nan)
+    price = row.get("close", np.nan)
+    vol = row.get("volatility_20", np.nan)
+    if pd.isna(atr_val) or pd.isna(price) or price == 0:
+        return 5.0, ["Insufficient data for risk assessment"]
+    atr_pct = (atr_val / price) * 100
+    if 0.3 < atr_pct < 2.0:
+        score = 10
+        reasons.append(f"Good volatility (ATR {atr_pct:.1f}%)")
+    elif atr_pct <= 0.3:
+        score = 3
+        reasons.append(f"Low volatility (ATR {atr_pct:.1f}%) - limited opportunity")
+    elif atr_pct >= 2.0:
+        score = 5
+        reasons.append(f"High volatility (ATR {atr_pct:.1f}%) - elevated risk")
+    return score, reasons
+
+
+def compute_trade_setup(row: pd.Series, direction: str) -> TradeSetup:
+    price = row.get("close", 0)
+    atr_val = row.get("atr_14", 0)
+    if pd.isna(atr_val) or atr_val == 0:
+        atr_val = price * 0.01
+    if direction in ("LONG", "STRONG LONG", "WEAK LONG"):
+        entry = price
+        stop_loss = round(price - 1.5 * atr_val, 2)
+        target_1 = round(price + 2.0 * atr_val, 2)
+        target_2 = round(price + 3.0 * atr_val, 2)
+    elif direction in ("SHORT", "STRONG SHORT", "WEAK SHORT"):
+        entry = price
+        stop_loss = round(price + 1.5 * atr_val, 2)
+        target_1 = round(price - 2.0 * atr_val, 2)
+        target_2 = round(price - 3.0 * atr_val, 2)
+    else:
+        return TradeSetup()
+    risk = abs(entry - stop_loss)
+    reward_1 = abs(target_1 - entry)
+    reward_2 = abs(target_2 - entry)
+    rr_1 = round(reward_1 / risk, 2) if risk > 0 else 0
+    return TradeSetup(
+        entry=round(entry, 2),
+        stop_loss=stop_loss,
+        target_1=target_1,
+        target_2=target_2,
+        risk_per_share=round(risk, 2),
+        reward_per_share=round(reward_1, 2),
+        risk_reward_ratio=rr_1,
+    )
+
+
+def determine_direction(total_score: float) -> SignalDirection:
+    if total_score >= 78:
+        return SignalDirection.STRONG_LONG
+    elif total_score >= 65:
+        return SignalDirection.LONG
+    elif total_score >= 55:
+        return SignalDirection.WEAK_LONG
+    elif total_score >= 45:
+        return SignalDirection.NO_TRADE
+    elif total_score >= 35:
+        return SignalDirection.WEAK_SHORT
+    elif total_score >= 22:
+        return SignalDirection.SHORT
+    else:
+        return SignalDirection.STRONG_SHORT
+
+
+def compute_confidence(score: SignalScore, direction: SignalDirection) -> float:
+    if direction == SignalDirection.NO_TRADE:
+        return 0.0
+    base = score.total
+    alignment_bonus = 0
+    if direction in (SignalDirection.STRONG_LONG, SignalDirection.LONG):
+        if score.trend_score > 14:
+            alignment_bonus += 5
+        if score.volume_score > 10:
+            alignment_bonus += 3
+        if score.vwap_score > 10:
+            alignment_bonus += 3
+    elif direction in (SignalDirection.STRONG_SHORT, SignalDirection.SHORT):
+        if score.trend_score < 6:
+            alignment_bonus += 5
+        if score.volume_score > 10:
+            alignment_bonus += 3
+    confidence = min(100, base * 0.7 + alignment_bonus + 10)
+    return round(confidence, 1)
+
+
+def evaluate_signal(
+    df: pd.DataFrame,
+    symbol: str,
+    strategy: str = "multi_factor",
+    data_source: DataSource = DataSource.MOCK,
+    market_context: dict | None = None,
+) -> Optional[dict]:
+    if len(df) < 55:
+        return None
+    row = df.iloc[-1]
+    trend_score, trend_reasons = score_trend(row)
+    momentum_score, momentum_reasons = score_momentum(row)
+    volume_score, volume_reasons = score_volume(row)
+    vwap_score, vwap_reasons = score_vwap(row)
+    pa_score, pa_reasons = score_price_action(row)
+    ctx_score, ctx_reasons = score_market_context(row, market_context)
+    risk_score, risk_reasons = score_risk_quality(row)
+    total = trend_score + momentum_score + volume_score + vwap_score + pa_score + ctx_score + risk_score
+    signal_score = SignalScore(
+        trend_score=trend_score,
+        momentum_score=momentum_score,
+        volume_score=volume_score,
+        vwap_score=vwap_score,
+        price_action_score=pa_score,
+        market_context_score=ctx_score,
+        risk_quality_score=risk_score,
+        total=total,
+    )
+    direction = determine_direction(total)
+    if direction == SignalDirection.NO_TRADE:
+        confidence = 0.0
+        setup = TradeSetup()
+        all_reasons = ["No clear signal - multiple confirmations not met"]
+        all_risks = ["Insufficient confluence for a quality setup"]
+    else:
+        confidence = compute_confidence(signal_score, direction)
+        setup = compute_trade_setup(row, direction)
+        if setup.risk_reward_ratio < 1.2:
+            direction = SignalDirection.NO_TRADE
+            confidence = 0.0
+            setup = TradeSetup()
+            all_reasons = ["Setup rejected: risk/reward below minimum threshold (1.2)"]
+            all_risks = ["Poor risk/reward ratio"]
+        else:
+            all_reasons = trend_reasons + momentum_reasons + volume_reasons + vwap_reasons + pa_reasons
+            all_risks = risk_reasons
+            if confidence < 60:
+                all_risks.append("Low confidence score")
+    explanation = SignalExplanation(reasons=all_reasons, risks=all_risks)
+    indicator_values = {}
+    for col in ["ema_9", "ema_20", "ema_50", "rsi_14", "macd", "macd_signal",
+                "macd_histogram", "atr_14", "adx_14", "vwap", "bb_upper", "bb_lower",
+                "relative_volume", "distance_from_vwap", "volatility_20"]:
+        val = row.get(col, None)
+        if val is not None and not (isinstance(val, float) and np.isnan(val)):
+            indicator_values[col] = round(float(val), 2)
+        else:
+            indicator_values[col] = None
+    return {
+        "id": uuid.uuid4().hex[:16],
+        "symbol": symbol,
+        "timestamp": now_ist().isoformat(),
+        "direction": direction.value,
+        "confidence": confidence,
+        "signal_score": signal_score.model_dump(),
+        "setup": setup.model_dump(),
+        "explanation": explanation.model_dump(),
+        "strategy": strategy,
+        "data_source": data_source,
+        "indicator_values": indicator_values,
+    }

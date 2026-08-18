@@ -1,0 +1,11 @@
+node_modules/
+.next/
+backend/node_modules/
+*.pyc
+__pycache__/
+.env
+*.db
+.DS_Store
+frontend/.next/
+frontend/node_modules/
+backend/intradayai.db

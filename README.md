@@ -1,131 +1,132 @@
-# Payroll & Attendance — TKSR Product Services
+# IntradayAI - AI Intraday Stock Trading Application
 
-Attendance + payroll app for a small business. Employees log in, clock in/out, and admins manage accounts and salary.
+Production-quality intraday stock analysis and paper trading for Indian markets (NSE/BSE).
 
 ## Architecture
 
-- **Frontend** (static) — hosted on **GitHub Pages** at `payroll.tksrproductservices.com`
-- **Backend** — **Cloudflare Worker** (API) + **Cloudflare D1** (SQLite database)
-- **Auth** — email + password (PBKDF2) and optional **Sign in with Google** (OAuth 2.0 + PKCE). JWT sessions. Password hashing via PBKDF2 (Web Crypto).
-- **Roles**
-  - **Admin** — first account created is the admin. Manages employees, marks leave/absence, corrects clock times, approves clock-correction requests, views monthly reports, exports CSV, configures settings.
-  - **Employee** — logs in with an admin-created account, clocks in/out, sees own attendance, and requests clock corrections.
-
-## Repository layout
-
 ```
-index.html          Frontend (login + role-based app)
-styles.css          Styling
-app.js              Frontend logic (calls the Worker API)
-CNAME               Binds GitHub Pages to payroll.tksrproductservices.com
-worker/
-  wrangler.toml     Cloudflare Worker config (edit database_id)
-  schema.sql        D1 database schema
-  src/index.js      Cloudflare Worker API
-```
-
-## 1. Deploy the frontend (GitHub Pages) — already done
-
-Repo: `https://github.com/pushpinderjob-alt/payroll` — public, main branch, Actions-based Pages deployment.
-
-## 2. Deploy the backend (Cloudflare Worker)
-
-Requires a free Cloudflare account.
-
-```powershell
-cd worker
-npm i -g wrangler            # or: npx wrangler
-wrangler login               # opens browser to authenticate your Cloudflare account
-wrangler d1 create tksr-payroll     # note the printed database_id
+intradayai/
+├── backend/           Python FastAPI backend
+│   ├── app/
+│   │   ├── api/       REST API routes
+│   │   ├── core/      Config, database, market session
+│   │   ├── models/    SQLAlchemy + Pydantic models
+│   │   ├── services/  Business logic
+│   │   │   ├── market_data/   Provider abstraction
+│   │   │   ├── indicators.py  Technical indicators
+│   │   │   ├── signal_engine.py  Multi-factor scoring
+│   │   │   ├── scanner.py     Market scanner
+│   │   │   ├── risk_engine.py  Risk management
+│   │   │   ├── paper_trading.py  Virtual trading
+│   │   │   └── backtesting.py   Backtest engine
+│   │   └── main.py    FastAPI app entry
+│   └── requirements.txt
+├── frontend/          Next.js + TypeScript + Tailwind
+│   └── src/
+│       ├── app/       Pages (Dashboard, Scanner, Signals, etc.)
+│       ├── components/  UI components
+│       └── lib/api.ts  API client
+├── docker-compose.yml
+└── .env.example
 ```
 
-Edit `worker/wrangler.toml`: replace `database_id = "REPLACE_WITH_DATABASE_ID"`.
+## Features
 
-```powershell
-wrangler d1 execute tksr-payroll --remote --file=schema.sql   # create tables
-wrangler secret put JWT_SECRET                                # any long random string
-wrangler deploy                                               # deploy the API
+- **Market Scanner**: Scans 40 NIFTY50 stocks with 15+ technical indicators
+- **Signal Engine**: Multi-factor scoring (trend, momentum, volume, VWAP, price action, risk quality)
+- **Confidence Scoring**: 0-100 confidence with clear labeling (Very Strong, Strong, Good, Moderate, Avoid)
+- **Trade Setups**: ATR-based entry, stop-loss, targets, and risk/reward calculation
+- **Risk Management**: Position sizing, daily loss limits, trade count limits, cooldown
+- **Paper Trading**: Virtual portfolio with order execution and stop-loss management
+- **Backtesting**: Historical testing with transaction costs (brokerage, STT, slippage)
+- **Dashboard**: Dark-theme trading terminal with real-time signals
+
+## Setup
+
+### Quick Start (Development)
+
+**Backend:**
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate  # or venv\Scripts\activate on Windows
+pip install -r requirements.txt
+cp ../.env.example ../.env
+python -m uvicorn app.main:app --reload --port 8000
 ```
 
-The API URL will look like `https://tksr-payroll-api.<subdomain>.workers.dev`.
-
-## 3. Point the frontend at the API
-
-In `app.js`, set `API_BASE` to your worker URL:
-
-```js
-var API_BASE = "https://tksr-payroll-api.xxxxx.workers.dev";
+**Frontend:**
+```bash
+cd frontend
+npm install
+npm run dev
 ```
 
-Commit and push to `main` — GitHub Actions redeploys automatically.
+The app will be available at http://localhost:3000 (frontend) and http://localhost:8000 (API).
 
-## 4. First run
-
-1. Open `https://payroll.tksrproductservices.com`
-2. Click **Create Account** — the first account automatically becomes **Admin**.
-3. Sign in, go to **Employees**, add employees with their email + a temporary password (give it to them).
-4. Employees sign in and use **Clock In / Clock Out**; they can also request a **clock correction** (missed/mistyped time) from their dashboard.
-5. Admin uses **Attendance** (mark leave/absence, correct times), **Requests** (approve/reject employee clock corrections), and **Reports** (monthly summary + CSV).
-
-## 5. Enable Google login (optional)
-
-Employees can sign in with Google instead of a password. Google sign-in only works for emails that already have an account in the system (same email as the one used to log in before). No new accounts are auto-created.
-
-1. Go to <https://console.cloud.google.com> and create a project (or pick an existing one).
-2. **APIs & Services → OAuth consent screen** → set it up as an **External** app with the app name/domain. Add the test users if you keep the app in "Testing" mode.
-3. **APIs & Services → Credentials → Create Credentials → OAuth client ID → Web application**:
-   - **Authorized JavaScript origins:** `https://payroll.tksrproductservices.com`
-   - **Authorized redirect URIs:** `https://tksr-payroll-api.pushpinderjob.workers.dev/api/auth/google/callback`
-4. Copy the **Client ID** (public, safe to share) and the **Client secret**.
-5. Configure the Worker:
-
-```powershell
-cd worker
-npx wrangler secret put GOOGLE_CLIENT_SECRET    # paste the client secret
+### Docker Compose
+```bash
+docker-compose up --build
 ```
 
-   Add the public client ID and redirect URI to `worker/wrangler.toml`:
+## API Endpoints
 
-```toml
-[vars]
-GOOGLE_CLIENT_ID = "xxxx.apps.googleusercontent.com"
-GOOGLE_REDIRECT_URI = "https://tksr-payroll-api.pushpinderjob.workers.dev/api/auth/google/callback"
-```
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | /api/health | Health check |
+| GET | /api/market/status | Market session status |
+| GET | /api/market/index/{name} | Index data (NIFTY50, BANKNIFTY) |
+| GET | /api/stocks | List instruments |
+| GET | /api/stocks/{symbol} | Stock detail + indicators + signal |
+| GET | /api/scanner | Run full market scanner |
+| GET | /api/portfolio | Paper trading portfolio |
+| POST | /api/paper/orders | Place paper order |
+| POST | /api/paper/close | Close paper position |
+| GET | /api/paper/positions | Open positions |
+| GET | /api/paper/trades | Trade history |
+| POST | /api/backtest | Run backtest |
 
-6. Redeploy: `npx wrangler deploy`. The **Continue with Google** button now appears on the sign-in screen.
+## Signal Scoring Methodology
 
-> How it works: the browser redirects to Google, Google sends the code to the Worker's `/api/auth/google/callback` (on workers.dev, which always has a valid HTTPS certificate). The Worker exchanges it with the client secret, checks the email against the users table, and bounces back to the app with a JWT in the URL fragment. This avoids depending on a TLS certificate for the Pages custom domain.
+Each stock is evaluated on 7 independent factors:
 
-## API summary
+| Factor | Max Score | Description |
+|--------|-----------|-------------|
+| Trend | 20 | EMA 9/20/50 alignment + ADX strength |
+| Momentum | 15 | RSI position + MACD histogram + Rate of Change |
+| Volume | 15 | Relative volume vs 20-day average |
+| VWAP | 15 | Distance from VWAP |
+| Price Action | 15 | Opening range breakout + Previous high/low + Bollinger Bands |
+| Market Context | 10 | NIFTY trend alignment |
+| Risk Quality | 10 | ATR-based volatility assessment |
 
-| Method | Path | Access | Purpose |
-|--------|------|--------|---------|
-| POST | `/api/auth/signup` | public (first user) / admin | Create admin (bootstrap) or employee |
-| POST | `/api/auth/login` | public | Login -> JWT + user |
-| GET | `/api/auth/google/config` | public | Google OAuth config (client id, redirect uri) or `enabled:false` |
-| POST | `/api/auth/google/token` | public | Exchange Google OAuth code -> JWT + user |
-| GET | `/api/me` | any | Current user |
-| GET | `/api/me/status?date=` | employee | Today's record |
-| GET | `/api/me/attendance?month=` | employee | Own month records |
-| POST | `/api/clock/in` | employee | Clock in (`{date, time}`) |
-| POST | `/api/clock/out` | employee | Clock out (`{date, time}`) |
-| POST | `/api/corrections` | employee | Create clock-correction request |
-| GET | `/api/corrections/mine` | employee | Own correction requests |
-| GET | `/api/corrections?status=` | admin | List requests (optional pending filter) |
-| POST | `/api/corrections/:id/approve` | admin | Approve (updates attendance) |
-| POST | `/api/corrections/:id/reject` | admin | Reject |
-| GET | `/api/users` | admin | List users |
-| POST | `/api/users` | admin | Create user |
-| PUT | `/api/users/:id` | admin | Update user / reset password |
-| DELETE | `/api/users/:id` | admin | Delete user + records |
-| GET | `/api/attendance?date= or ?month=` | admin | Records |
-| POST | `/api/attendance` | admin | Upsert record (leave/absent/times) |
-| DELETE | `/api/attendance/:id` | admin | Delete record |
-| GET/PUT | `/api/settings` | any / admin | Working days + currency |
+Total score (0-100) maps to signal direction:
+- 78-100: STRONG LONG
+- 65-77: LONG  
+- 55-64: WEAK LONG
+- 45-54: NO TRADE
+- 35-44: WEAK SHORT
+- 22-34: SHORT
+- 0-21: STRONG SHORT
 
-## Salary calculation
+A minimum risk/reward ratio of 1.2 is required. No trade is generated below this threshold.
 
-- Working days per month counted from `work_days_per_week` (default Mon–Sat).
-- Daily rate = monthly salary ÷ working days in month.
-- **Present** or **Paid Leave** = one daily rate. **Absent** = nothing.
-- Month salary shown = daily rate × (present + paid leave days) recorded.
+## Limitations
+
+- **Simulated data only**: The mock provider generates realistic but fake market data. No real market data is used by default.
+- **No guaranteed accuracy**: Signal scores are heuristic-based and have NOT been statistically calibrated to predict actual profit probability.
+- **No broker integration**: Paper trading is virtual only. No real orders are placed.
+- **Experimental ML layer**: The architecture supports ML models but none are deployed in the current version.
+
+## Risk Disclaimer
+
+This application is for educational and research purposes only. It does not constitute financial advice. Trading in stocks involves significant risk of loss. Past performance, whether simulated or backtested, does not guarantee future results. Always consult a qualified financial advisor before making investment decisions.
+
+The signal confidence score (0-100) is a composite metric based on technical indicator confluence. It is NOT a probability of profit and should not be interpreted as such.
+
+## Tech Stack
+
+- **Backend**: Python 3.12+, FastAPI, SQLAlchemy, SQLite, pandas, NumPy
+- **Frontend**: Next.js 16, React 19, TypeScript, Tailwind CSS, Recharts
+- **Market Data**: Pluggable provider architecture (Mock, Live-ready)
+- **Deployment**: Docker Compose, environment variables

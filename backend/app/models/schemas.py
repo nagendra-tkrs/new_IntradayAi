@@ -1,0 +1,84 @@
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+from enum import Enum
+
+
+class DataSource(str, Enum):
+    LIVE = "live"
+    DELAYED = "delayed"
+    SIMULATED = "simulated"
+    MOCK = "mock"
+
+
+class SignalDirection(str, Enum):
+    STRONG_LONG = "STRONG LONG"
+    LONG = "LONG"
+    WEAK_LONG = "WEAK LONG"
+    NO_TRADE = "NO TRADE"
+    WEAK_SHORT = "WEAK SHORT"
+    SHORT = "SHORT"
+    STRONG_SHORT = "STRONG SHORT"
+
+
+class Quote(BaseModel):
+    symbol: str
+    price: float
+    change: float = 0.0
+    change_pct: float = 0.0
+    volume: int = 0
+    high: float = 0.0
+    low: float = 0.0
+    open: float = 0.0
+    timestamp: datetime
+    data_source: DataSource = DataSource.MOCK
+
+
+class OHLCV(BaseModel):
+    timestamp: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+
+
+class SignalScore(BaseModel):
+    trend_score: float = 0.0
+    momentum_score: float = 0.0
+    volume_score: float = 0.0
+    vwap_score: float = 0.0
+    price_action_score: float = 0.0
+    market_context_score: float = 0.0
+    risk_quality_score: float = 0.0
+    total: float = 0.0
+
+
+class SignalExplanation(BaseModel):
+    reasons: list[str] = []
+    risks: list[str] = []
+
+
+class TradeSetup(BaseModel):
+    entry: float = 0.0
+    stop_loss: float = 0.0
+    target_1: float = 0.0
+    target_2: float = 0.0
+    trailing_stop: Optional[float] = None
+    risk_per_share: float = 0.0
+    reward_per_share: float = 0.0
+    risk_reward_ratio: float = 0.0
+
+
+class SignalResponse(BaseModel):
+    id: str = ""
+    symbol: str
+    timestamp: datetime
+    direction: SignalDirection
+    confidence: float
+    signal_score: SignalScore
+    setup: TradeSetup
+    explanation: SignalExplanation
+    strategy: str
+    data_source: DataSource
+    indicator_values: dict = {}
