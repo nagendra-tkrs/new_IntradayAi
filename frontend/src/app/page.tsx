@@ -1,15 +1,25 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import Header from "@/components/Header";
 import SignalCard from "@/components/SignalCard";
 import { runScanner, getMarketStatus } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import Link from "next/link";
 
 export default function Dashboard() {
   const [scanner, setScanner] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const { user, loading: authLoading } = useAuth();
+  const router = useRouter();
+
+  useEffect(() => {
+    if (!authLoading && !user) {
+      router.replace("/login");
+    }
+  }, [user, authLoading, router]);
 
   useEffect(() => {
     async function load() {

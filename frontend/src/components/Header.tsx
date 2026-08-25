@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { getMarketStatus, getMarketIndex, getDataStatus } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -11,6 +12,7 @@ export default function Header() {
   const [bankNifty, setBankNifty] = useState<any>(null);
   const [dataStatus, setDataStatus] = useState<any>(null);
   const pathname = usePathname();
+  const { user, logout } = useAuth();
 
   useEffect(() => {
     async function load() {
@@ -74,13 +76,6 @@ export default function Header() {
     return "bg-red-500";
   };
 
-  const formatAge = (ageSeconds: number | null) => {
-    if (ageSeconds === null || ageSeconds === undefined) return null;
-    if (ageSeconds < 60) return `${Math.round(ageSeconds)}s ago`;
-    if (ageSeconds < 3600) return `${Math.round(ageSeconds / 60)}m ago`;
-    return `${Math.round(ageSeconds / 3600)}h ago`;
-  };
-
   return (
     <header className="sticky top-0 z-50 bg-[#0d1321] border-b border-[#2d3548]">
       <div className="max-w-[1440px] mx-auto px-4">
@@ -106,25 +101,12 @@ export default function Header() {
               ))}
             </nav>
           </div>
-          <div className="flex items-center gap-6 text-xs">
+          <div className="flex items-center gap-4 text-xs">
             <div className="flex items-center gap-2">
               <div className={`w-2 h-2 rounded-full ${getDataStatusDot(dataStatus)}`} />
               <span className={`font-semibold ${getDataStatusColor(dataStatus)}`}>
                 {getDataStatusText(dataStatus)}
               </span>
-              {dataStatus?.last_tick_time && (
-                <>
-                  <span className="text-gray-500">|</span>
-                  <span className="text-gray-400">
-                    Last: {new Date(dataStatus.last_tick_time).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })} IST
-                  </span>
-                </>
-              )}
-              {dataStatus?.signals_paused && (
-                <span className="text-orange-400 bg-orange-400/10 px-2 py-0.5 rounded">
-                  SIGNALS PAUSED
-                </span>
-              )}
             </div>
             {nifty && (
               <div className="hidden md:flex items-center gap-4">
@@ -134,16 +116,6 @@ export default function Header() {
                   <span className={nifty.change >= 0 ? "text-green-400 ml-1" : "text-red-400 ml-1"}>
                     {nifty.change >= 0 ? "+" : ""}{nifty.change?.toFixed(2)} ({nifty.change_pct?.toFixed(2)}%)
                   </span>
-                  {nifty.data_status && (
-                    <span className={`ml-1 text-[10px] px-1 rounded ${
-                      nifty.data_status === "LIVE" ? "bg-green-500/20 text-green-400" :
-                      nifty.data_status === "RECENT" ? "bg-green-500/20 text-green-400" :
-                      nifty.data_status === "DELAYED" ? "bg-yellow-500/20 text-yellow-400" :
-                      "bg-red-500/20 text-red-400"
-                    }`}>
-                      {nifty.data_status}
-                    </span>
-                  )}
                 </div>
                 {bankNifty && (
                   <div>
@@ -152,18 +124,29 @@ export default function Header() {
                     <span className={bankNifty.change >= 0 ? "text-green-400 ml-1" : "text-red-400 ml-1"}>
                       {bankNifty.change >= 0 ? "+" : ""}{bankNifty.change?.toFixed(2)} ({bankNifty.change_pct?.toFixed(2)}%)
                     </span>
-                    {bankNifty.data_status && (
-                      <span className={`ml-1 text-[10px] px-1 rounded ${
-                        bankNifty.data_status === "LIVE" ? "bg-green-500/20 text-green-400" :
-                        bankNifty.data_status === "RECENT" ? "bg-green-500/20 text-green-400" :
-                        bankNifty.data_status === "DELAYED" ? "bg-yellow-500/20 text-yellow-400" :
-                        "bg-red-500/20 text-red-400"
-                      }`}>
-                        {bankNifty.data_status}
-                      </span>
-                    )}
                   </div>
                 )}
+              </div>
+            )}
+            {user && (
+              <div className="flex items-center gap-3 ml-2 pl-3 border-l border-[#2d3548]">
+                {user.picture ? (
+                  <img src={user.picture} alt="" className="w-7 h-7 rounded-full" />
+                ) : (
+                  <div className="w-7 h-7 bg-blue-600 rounded-full flex items-center justify-center text-xs font-bold text-white">
+                    {user.name?.charAt(0)?.toUpperCase() || "U"}
+                  </div>
+                )}
+                <span className="text-gray-300 hidden lg:block">{user.name}</span>
+                <button
+                  onClick={logout}
+                  className="text-gray-500 hover:text-gray-300 transition-colors cursor-pointer"
+                  title="Sign out"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                  </svg>
+                </button>
               </div>
             )}
           </div>

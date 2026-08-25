@@ -16,7 +16,10 @@ class User(Base):
     id = Column(String(16), primary_key=True, default=gen_id)
     email = Column(String(255), unique=True, nullable=False, index=True)
     name = Column(String(255), nullable=False)
-    password_hash = Column(String(255), nullable=False)
+    password_hash = Column(String(255), nullable=True)
+    picture = Column(String(512), nullable=True)
+    auth_provider = Column(String(20), default="google")
+    last_login = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

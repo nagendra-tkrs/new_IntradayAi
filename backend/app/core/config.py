@@ -39,5 +39,10 @@ class Settings(BaseSettings):
     API_PORT: int = 8000
     CORS_ORIGINS: str = '["http://localhost:3000"]'
 
+    GOOGLE_CLIENT_ID: str = "678365536626-2ago6n13j2a71e36jp0gi33gj2jfr30f.apps.googleusercontent.com"
+    GOOGLE_CLIENT_SECRET: str = ""
+    GOOGLE_REDIRECT_URI: str = "https://trading.tksrproductservices.com/api/auth/google/callback"
+    FRONTEND_URL: str = "http://localhost:3000"
+
 
 settings = Settings()

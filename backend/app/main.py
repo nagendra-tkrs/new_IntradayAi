@@ -2,12 +2,30 @@ import json
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
 from app.core.config import settings
 from app.core.database import init_db
+from app.api.auth import router as auth_router, verify_token
 from app.api.market import router as market_router
 from app.api.trading import router as trading_router
 from app.api.backtest_api import router as backtest_router
+
+PUBLIC_PATHS = {"/api/auth/google/config", "/api/auth/google/callback", "/api/health"}
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path.startswith("/api/") and path not in PUBLIC_PATHS and not path.startswith("/api/auth/"):
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer "):
+                return JSONResponse(status_code=401, content={"detail": "Missing token"})
+            try:
+                verify_token(auth.split(" ", 1)[1])
+            except Exception:
+                return JSONResponse(status_code=401, content={"detail": "Invalid token"})
+        return await call_next(request)
 
 
 @asynccontextmanager
@@ -35,7 +53,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(AuthMiddleware)
 
+app.include_router(auth_router)
 app.include_router(market_router)
 app.include_router(trading_router)
 app.include_router(backtest_router)

@@ -9,10 +9,14 @@ services:
       - "8000:8000"
     environment:
       - DATABASE_URL=sqlite+aiosqlite:///./intradayai.db
-      - MARKET_DATA_PROVIDER=mock
+      - MARKET_DATA_PROVIDER=yfinance
       - INITIAL_CAPITAL=1000000
-      - MAX_RISK_PER_TRADE_PCT=2.0
-      - CORS_ORIGINS=["http://localhost:3000"]
+      - CORS_ORIGINS=["http://localhost:3000","https://trading.tksrproductservices.com"]
+      - GOOGLE_CLIENT_ID=678365536626-2ago6n13j2a71e36jp0gi33gj2jfr30f.apps.googleusercontent.com
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - GOOGLE_REDIRECT_URI=https://trading.tksrproductservices.com/api/auth/google/callback
+      - FRONTEND_URL=http://localhost:3000
+      - JWT_SECRET=${JWT_SECRET}
     volumes:
       - backend-data:/app/data
     restart: unless-stopped
@@ -21,6 +25,8 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=http://localhost:8000
     ports:
       - "3000:3000"
     depends_on:

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { AuthProvider } from "@/lib/auth";
 
 export const metadata: Metadata = {
   title: "IntradayAI - Stock Analysis & Paper Trading",
@@ -14,7 +15,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body className="min-h-screen bg-[#0a0e17] text-gray-200 antialiased">
-        {children}
+        <AuthProvider>{children}</AuthProvider>
       </body>
     </html>
   );
