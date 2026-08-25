@@ -36,7 +36,13 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
+    # Wilder's smoothing: alpha = 1/period
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+
+def wilders_smooth(series: pd.Series, period: int) -> pd.Series:
+    """Wilder's smoothing (used for ATR, ADX DI) - alpha = 1/period"""
+    return series.ewm(alpha=1/period, adjust=False).mean()
 
 
 def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
@@ -47,10 +53,11 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     plus_dm = pd.Series(plus_dm, index=high.index)
     minus_dm = pd.Series(minus_dm, index=high.index)
     atr_val = atr(high, low, close, period)
-    plus_di = 100 * ema(plus_dm, period) / atr_val.replace(0, np.nan)
-    minus_di = 100 * ema(minus_dm, period) / atr_val.replace(0, np.nan)
+    # Wilder's smoothing for DI
+    plus_di = 100 * wilders_smooth(plus_dm, period) / atr_val.replace(0, np.nan)
+    minus_di = 100 * wilders_smooth(minus_dm, period) / atr_val.replace(0, np.nan)
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx_val = ema(dx, period)
+    adx_val = wilders_smooth(dx, period)
     return adx_val
 
 
@@ -62,11 +69,21 @@ def bollinger_bands(close: pd.Series, period: int = 20, std_dev: float = 2.0):
     return upper, middle, lower
 
 
-def vwap(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series) -> pd.Series:
+def vwap(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, timestamp: pd.Series | None = None) -> pd.Series:
     typical_price = (high + low + close) / 3
-    cum_tp_vol = (typical_price * volume).cumsum()
-    cum_vol = volume.cumsum()
-    return cum_tp_vol / cum_vol.replace(0, np.nan)
+    tp_vol = typical_price * volume
+    
+    if timestamp is not None:
+        # Reset VWAP at each new trading day
+        date = timestamp.dt.date
+        tp_vol_cum = (typical_price * volume).groupby(date).cumsum()
+        vol_cum = volume.groupby(date).cumsum()
+    else:
+        # Fallback: cumulative from start (for backward compatibility)
+        tp_vol_cum = (typical_price * volume).cumsum()
+        vol_cum = volume.cumsum()
+    
+    return tp_vol_cum / vol_cum.replace(0, np.nan)
 
 
 def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -86,8 +103,11 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_upper"] = bb_upper
     df["bb_middle"] = bb_middle
     df["bb_lower"] = bb_lower
-    df["vwap"] = vwap(df["high"], df["low"], df["close"], df["volume"].astype(float))
-    df["relative_volume"] = df["volume"] / df["volume"].rolling(20).mean().replace(0, np.nan)
+    df["vwap"] = vwap(df["high"], df["low"], df["close"], df["volume"].astype(float), df["timestamp"])
+    # Relative volume: compare to 20-day average volume (75 bars * 20 days = 1500 bars for 5-min)
+    vol_ma_period = 20 * 75  # 20 trading days * 75 bars/day (5-min bars)
+    df["avg_volume_20d"] = df["volume"].rolling(window=vol_ma_period, min_periods=1).mean()
+    df["relative_volume"] = df["volume"] / df["avg_volume_20d"].replace(0, np.nan)
     df["price_change_pct"] = df["close"].pct_change() * 100
     df["volatility_20"] = df["close"].pct_change().rolling(20).std() * np.sqrt(252) * 100
     df["distance_from_vwap"] = ((df["close"] - df["vwap"]) / df["vwap"]) * 100
@@ -96,7 +116,13 @@ def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["prev_close"] = df["close"].shift(1)
     df["day_high"] = df["high"].rolling(75).max()
     df["day_low"] = df["low"].rolling(75).min()
-    df["opening_range_high"] = df["high"].head(3).max()
-    df["opening_range_low"] = df["low"].head(3).min()
+    # Opening range: first 3 bars of each trading day
+    if "timestamp" in df.columns:
+        date = df["timestamp"].dt.date
+        df["opening_range_high"] = df.groupby(df["timestamp"].dt.date)["high"].transform(lambda x: x.iloc[:3].max() if len(x) >= 3 else np.nan)
+        df["opening_range_low"] = df.groupby(df["timestamp"].dt.date)["low"].transform(lambda x: x.iloc[:3].min() if len(x) >= 3 else np.nan)
+    else:
+        df["opening_range_high"] = np.nan
+        df["opening_range_low"] = np.nan
     df["roc_5"] = df["close"].pct_change(5) * 100
     return df

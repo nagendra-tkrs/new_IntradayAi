@@ -9,3 +9,7 @@ __pycache__/
 frontend/.next/
 frontend/node_modules/
 backend/intradayai.db
+backend/app/data/daily_improvement/
+backend/app/data/reports/
+backend/app/data/review/
+backend/app/data/strategy_history.json

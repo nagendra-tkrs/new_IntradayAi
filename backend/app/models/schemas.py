@@ -12,13 +12,40 @@ class DataSource(str, Enum):
 
 
 class SignalDirection(str, Enum):
-    STRONG_LONG = "STRONG LONG"
+    STRONG_LONG = "STRONG_LONG"
     LONG = "LONG"
-    WEAK_LONG = "WEAK LONG"
-    NO_TRADE = "NO TRADE"
-    WEAK_SHORT = "WEAK SHORT"
+    WEAK_LONG = "WEAK_LONG"
+    NO_TRADE = "NO_TRADE"
+    WEAK_SHORT = "WEAK_SHORT"
     SHORT = "SHORT"
-    STRONG_SHORT = "STRONG SHORT"
+    STRONG_SHORT = "STRONG_SHORT"
+
+    @property
+    def display(self) -> str:
+        return self.value.replace("_", " ")
+
+    @property
+    def is_long(self) -> bool:
+        return self in (SignalDirection.STRONG_LONG, SignalDirection.LONG, SignalDirection.WEAK_LONG)
+
+    @property
+    def is_short(self) -> bool:
+        return self in (SignalDirection.STRONG_SHORT, SignalDirection.SHORT, SignalDirection.WEAK_SHORT)
+
+    @property
+    def is_strong(self) -> bool:
+        return self in (SignalDirection.STRONG_LONG, SignalDirection.STRONG_SHORT)
+
+    @property
+    def is_weak(self) -> bool:
+        return self in (SignalDirection.WEAK_LONG, SignalDirection.WEAK_SHORT)
+
+    def base_direction(self) -> "SignalDirection":
+        if self.is_strong:
+            return SignalDirection.LONG if self == SignalDirection.STRONG_LONG else SignalDirection.SHORT
+        if self.is_weak:
+            return SignalDirection.LONG if self == SignalDirection.WEAK_LONG else SignalDirection.SHORT
+        return self
 
 
 class Quote(BaseModel):

@@ -105,7 +105,13 @@ class MarketScanner:
                   "distance_from_vwap": round(float(row.get("distance_from_vwap", 0)), 2) if pd.notna(row.get("distance_from_vwap")) else None,
                   "trend": self._get_trend(row)}
 
-        signal = evaluate_signal(df, symbol, data_source=self.provider.data_source_label, market_context=market_ctx)
+        signal = evaluate_signal(
+            df, symbol, 
+            data_source=self.provider.data_source_label, 
+            market_context=market_ctx,
+            data_age_seconds=data_age,
+            data_status=data_status_val,
+        )
         if signal:
             result["signal"] = signal["direction"]
             result["confidence"] = signal["confidence"]
@@ -146,9 +152,11 @@ class MarketScanner:
             should_trade, trade_reason = data_status.should_trade(symbol)
 
             signal = evaluate_signal(
-                df, symbol,
-                data_source=self.provider.data_source_label,
+                df, symbol, 
+                data_source=self.provider.data_source_label, 
                 market_context=market_ctx,
+                data_age_seconds=data_age,
+                data_status=data_status_val,
             )
 
             return {

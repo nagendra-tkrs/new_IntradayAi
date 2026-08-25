@@ -98,6 +98,8 @@ async def stock_detail(symbol: str):
             df, symbol,
             data_source=provider.data_source_label,
             market_context=market_ctx,
+            data_age_seconds=data_age,
+            data_status=data_status_val,
         )
 
     return {

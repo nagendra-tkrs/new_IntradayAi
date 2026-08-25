@@ -93,13 +93,13 @@ def market_session(dt: datetime | None = None) -> str:
         return "closed"
     h, m = dt.hour, dt.minute
     t = h * 60 + m
-    if t < 555:
+    if t < 555:              # before 09:15
         return "pre_market"
-    elif t <= 555:
+    elif t == 555:           # exactly 09:15
         return "market_open"
-    elif t <= 915:
+    elif t < 915:            # 09:16 - 15:14
         return "trading"
-    elif t <= 930:
+    elif t <= 930:           # 15:15 - 15:30 (closing auction)
         return "closing"
     else:
         return "closed"

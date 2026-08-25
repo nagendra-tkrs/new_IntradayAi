@@ -73,7 +73,7 @@ export default function Dashboard() {
               <div className="card">
                 <div className="text-xs text-gray-500 uppercase tracking-wider">Strong Signals</div>
                 <div className="text-xl font-bold text-green-400 mt-1">
-                  {scanner.top_signals?.filter((s: any) => s.confidence >= 80).length || 0}
+                  {scanner.top_signals?.filter((s: any) => s.confidence >= 70).length || 0}
                 </div>
               </div>
             </div>
@@ -147,7 +147,7 @@ export default function Dashboard() {
                         }`}>{stock.signal}</span>
                       </td>
                       <td className={`num font-bold ${
-                        stock.confidence >= 80 ? "text-green-400" :
+                        stock.confidence >= 70 ? "text-green-400" :
                         stock.confidence >= 60 ? "text-blue-400" : "text-gray-400"
                       }`}>{stock.confidence || 0}</td>
                     </tr>
