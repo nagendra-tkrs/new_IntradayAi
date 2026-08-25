@@ -1,4 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "";
+const API_BASE = "/api";
 
 function getToken(): string | null {
   if (typeof window === "undefined") return null;
