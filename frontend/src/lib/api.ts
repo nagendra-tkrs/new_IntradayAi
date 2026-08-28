@@ -92,6 +92,10 @@ export async function getTradeHistory(limit: number = 50) {
   return fetchAPI(`/paper/trades?limit=${limit}`);
 }
 
+export async function getPerformance() {
+  return fetchAPI("/paper/performance");
+}
+
 export async function runBacktest(params: {
   symbol: string;
   strategy?: string;

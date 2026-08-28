@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import time
 import pandas as pd
 from typing import Optional
 from app.services.market_data.base import MarketDataProvider
@@ -11,11 +12,13 @@ from app.services.data_validation import data_status
 logger = logging.getLogger(__name__)
 
 MAX_PARALLEL_FETCHES = 8
+SCAN_CACHE_TTL = 300  # 5 minutes
 
 
 class MarketScanner:
     def __init__(self, provider: MarketDataProvider):
         self.provider = provider
+        self._scan_cache: dict[str, tuple[float, list[dict]]] = {}
 
     async def _get_market_context(self) -> dict:
         context = {
@@ -124,6 +127,13 @@ class MarketScanner:
         return result
 
     async def scan_universe(self, universe: str = "NIFTY50") -> list[dict]:
+        cache_key = universe
+        now = time.time()
+        if cache_key in self._scan_cache:
+            cached_time, cached_data = self._scan_cache[cache_key]
+            if now - cached_time < SCAN_CACHE_TTL:
+                return cached_data
+
         instruments = await self.provider.get_instruments(universe)
         market_ctx = await self._get_market_context()
 
@@ -134,7 +144,9 @@ class MarketScanner:
                 return await self._fetch_stock_data(inst)
 
         fetch_results = await asyncio.gather(*[bounded_fetch(inst) for inst in instruments])
-        return [self._process_stock(inst, fr, market_ctx) for inst, fr in zip(instruments, fetch_results)]
+        results = [self._process_stock(inst, fr, market_ctx) for inst, fr in zip(instruments, fetch_results)]
+        self._scan_cache[cache_key] = (now, results)
+        return results
 
     async def scan_symbol(self, symbol: str) -> Optional[dict]:
         try:

@@ -41,6 +41,12 @@ export default function SignalCard({ signal, onClick }: SignalCardProps) {
         <div>
           <h3 className="font-bold text-white text-lg">{signal.symbol}</h3>
           <p className="text-xs text-gray-500">{signal.strategy}</p>
+          {signal.timestamp && (
+            <p className="text-[10px] text-gray-600 mt-0.5 flex items-center gap-1">
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+              {new Date(signal.timestamp).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true, timeZone: "Asia/Kolkata" })}
+            </p>
+          )}
         </div>
         <div className="text-right">
           <span className={`inline-block px-2.5 py-1 rounded-full text-xs font-bold ${directionBadge(signal.direction)}`}>

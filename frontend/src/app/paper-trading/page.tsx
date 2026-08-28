@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Header from "@/components/Header";
-import { getPortfolio, getPositions, getTradeHistory, placePaperOrder, closePosition, getStocks } from "@/lib/api";
+import { getPortfolio, getPositions, getTradeHistory, placePaperOrder, closePosition, getStocks, getStockDetail, getPerformance } from "@/lib/api";
 
 export default function PaperTradingPage() {
   const [portfolio, setPortfolio] = useState<any>(null);
@@ -10,6 +10,7 @@ export default function PaperTradingPage() {
   const [trades, setTrades] = useState<any[]>([]);
   const [stocks, setStocks] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [performance, setPerformance] = useState<any>(null);
   const [orderSymbol, setOrderSymbol] = useState("");
   const [orderDir, setOrderDir] = useState("LONG");
   const [orderQty, setOrderQty] = useState(10);
@@ -22,13 +23,23 @@ export default function PaperTradingPage() {
   async function loadData() {
     try {
       setLoading(true);
-      const [p, pos, t, s] = await Promise.all([
-        getPortfolio(), getPositions(), getTradeHistory(50), getStocks()
+      const results = await Promise.allSettled([
+        getPortfolio(), getPositions(), getTradeHistory(50)
       ]);
-      setPortfolio(p);
-      setPositions(pos.positions || []);
-      setTrades(t.trades || []);
-      setStocks(s || []);
+      const p = results[0].status === "fulfilled" ? results[0].value : null;
+      const pos = results[1].status === "fulfilled" ? results[1].value : null;
+      const t = results[2].status === "fulfilled" ? results[2].value : null;
+      if (p) setPortfolio(p);
+      if (pos) setPositions(pos.positions || []);
+      if (t) setTrades(t.trades || []);
+      try {
+        const s = await getStocks();
+        setStocks(s || []);
+      } catch {}
+      try {
+        const perf = await getPerformance();
+        setPerformance(perf);
+      } catch {}
     } catch (e) {
       console.error(e);
     } finally {
@@ -39,7 +50,20 @@ export default function PaperTradingPage() {
   async function handleOrder() {
     try {
       setOrderMsg(null);
-      await placePaperOrder({ symbol: orderSymbol, direction: orderDir, quantity: orderQty });
+      let setup: any = {};
+      try {
+        const detail = await getStockDetail(orderSymbol);
+        setup = detail?.signal?.setup || {};
+      } catch {}
+      await placePaperOrder({
+        symbol: orderSymbol,
+        direction: orderDir,
+        quantity: orderQty,
+        entry_price: setup.entry || undefined,
+        stop_loss: setup.stop_loss || undefined,
+        target_1: setup.target_1 || undefined,
+        target_2: setup.target_2 || undefined,
+      });
       setOrderMsg(`${orderDir} order placed for ${orderQty} shares of ${orderSymbol}`);
       loadData();
     } catch (e: any) {
@@ -99,6 +123,28 @@ export default function PaperTradingPage() {
           </div>
         )}
 
+        {performance && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+            {(["daily", "weekly", "monthly", "all_time"] as const).map((period) => (
+              <div key={period} className="card">
+                <div className="text-[10px] text-gray-500 uppercase tracking-wider mb-2">{period === "all_time" ? "All Time" : period.charAt(0).toUpperCase() + period.slice(1)}</div>
+                <div className="flex items-center gap-3 mb-1">
+                  <span className="text-lg font-bold text-white">{performance[period]?.count || 0}</span>
+                  <span className="text-[10px] text-gray-500">trades</span>
+                </div>
+                <div className="flex items-center gap-2 text-xs">
+                  <span className="text-green-400 font-semibold">{performance[period]?.wins || 0}W</span>
+                  <span className="text-red-400 font-semibold">{performance[period]?.losses || 0}L</span>
+                  <span className="text-blue-400 font-semibold">{performance[period]?.win_rate || 0}%</span>
+                </div>
+                <div className={`text-sm font-bold mt-1 ${(performance[period]?.total_pnl || 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  ₹{performance[period]?.total_pnl?.toLocaleString() || 0}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
         <div className="card mb-6">
           <h3 className="text-sm font-semibold text-gray-400 mb-3 uppercase tracking-wider">Place Order</h3>
           <div className="flex items-center gap-3 flex-wrap">
@@ -132,6 +178,7 @@ export default function PaperTradingPage() {
                   <th className="num">Entry</th>
                   <th className="num">Current</th>
                   <th className="num">P&L</th>
+                  <th>Opened</th>
                   <th>Action</th>
                 </tr>
               </thead>
@@ -145,6 +192,9 @@ export default function PaperTradingPage() {
                     <td className="num">₹{pos.current_price?.toLocaleString()}</td>
                     <td className={`num font-semibold ${(pos.unrealized_pnl || 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
                       ₹{pos.unrealized_pnl?.toLocaleString()}
+                    </td>
+                    <td className="text-xs text-gray-500">
+                      {pos.opened_at ? new Date(pos.opened_at).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" }) : "-"}
                     </td>
                     <td><button onClick={() => handleClose(pos.id)} className="px-2 py-1 bg-red-600/20 text-red-400 text-xs rounded font-semibold hover:bg-red-600/30">Close</button></td>
                   </tr>
@@ -166,6 +216,7 @@ export default function PaperTradingPage() {
                   <th className="num">Exit</th>
                   <th className="num">Qty</th>
                   <th className="num">P&L</th>
+                  <th>Result</th>
                 </tr>
               </thead>
               <tbody>
@@ -178,6 +229,13 @@ export default function PaperTradingPage() {
                     <td className="num">{t.quantity}</td>
                     <td className={`num font-semibold ${(t.pnl || 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
                       ₹{t.pnl?.toLocaleString()}
+                    </td>
+                    <td>
+                      <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                        t.result === "WIN" ? "bg-green-500/20 text-green-400" :
+                        t.result === "LOSS" ? "bg-red-500/20 text-red-400" :
+                        "bg-gray-500/20 text-gray-400"
+                      }`}>{t.result || (t.pnl >= 0 ? "WIN" : "LOSS")}</span>
                     </td>
                   </tr>
                 ))}

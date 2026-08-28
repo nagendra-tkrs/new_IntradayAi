@@ -71,11 +71,18 @@ class PaperTradingEngine:
         else:
             pnl = (entry_price - exit_price) * quantity
         self.total_pnl += pnl
+        if pnl > 0:
+            result = "WIN"
+        elif pnl < 0:
+            result = "LOSS"
+        else:
+            result = "BREAKEVEN"
         trade = {
             **pos,
             "exit_price": exit_price,
             "exit_time": now_ist().isoformat(),
             "pnl": round(pnl, 2),
+            "result": result,
             "status": "closed",
         }
         self.closed_trades.append(trade)
