@@ -50,8 +50,30 @@ export async function getStockDetail(symbol: string) {
   return fetchAPI(`/stocks/${symbol}`);
 }
 
-export async function getStockChart(symbol: string, days: number = 1) {
-  return fetchAPI(`/stocks/${symbol}/chart?days=${days}`);
+export async function getTradeSetup(symbol: string) {
+  return fetchAPI(`/stocks/${symbol}/trade-setup`);
+}
+
+export async function saveTradeSetup(symbol: string, setup: {
+  entry?: number;
+  stop_loss?: number;
+  target?: number;
+  direction?: string;
+}) {
+  return fetchAPI(`/stocks/${symbol}/trade-setup`, {
+    method: "PATCH",
+    body: JSON.stringify(setup),
+  });
+}
+
+export async function clearTradeSetup(symbol: string) {
+  return fetchAPI(`/stocks/${symbol}/trade-setup`, {
+    method: "DELETE",
+  });
+}
+
+export async function getStockChart(symbol: string, days: number = 1, interval: string = "5m") {
+  return fetchAPI(`/stocks/${symbol}/chart?days=${days}&interval=${interval}`);
 }
 
 export async function runScanner(universe: string = "NIFTY50") {

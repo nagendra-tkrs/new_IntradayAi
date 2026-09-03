@@ -1,10 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
+import { useRouter } from "next/navigation";
 import Header from "@/components/Header";
 import { runScanner } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 
 type FilterType = "all" | "long" | "short" | "strong" | "high_volume" | "no_trade";
+
+const SCANNER_REFRESH_INTERVAL = 120000;
 
 export default function ScannerPage() {
   const [scanner, setScanner] = useState<any>(null);
@@ -12,22 +16,47 @@ export default function ScannerPage() {
   const [filter, setFilter] = useState<FilterType>("all");
   const [sortBy, setSortBy] = useState<string>("confidence");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
+  const { user, loading: authLoading } = useAuth();
+  const router = useRouter();
+  const intervalRef = useRef<number | null>(null);
+  const isMountedRef = useRef(true);
 
-  useEffect(() => {
-    loadScanner();
-  }, []);
-
-  async function loadScanner() {
+  const loadScanner = useCallback(async (isAutoRefresh = false) => {
     try {
-      setLoading(true);
+      if (!isAutoRefresh) setLoading(true);
       const data = await runScanner();
-      setScanner(data);
+      if (isMountedRef.current) {
+        setScanner(data);
+        setLastRefresh(new Date());
+      }
     } catch (e) {
       console.error(e);
     } finally {
-      setLoading(false);
+      if (isMountedRef.current) setLoading(false);
     }
-  }
+  }, []);
+
+  const loadScannerRef = useRef(loadScanner);
+  loadScannerRef.current = loadScanner;
+
+  useEffect(() => {
+    if (!authLoading && !user) {
+      router.replace("/login");
+    }
+  }, [user, authLoading, router]);
+
+  useEffect(() => {
+    if (authLoading || !user) return;
+    isMountedRef.current = true;
+    loadScannerRef.current();
+    const id = window.setInterval(() => { loadScannerRef.current(true); }, SCANNER_REFRESH_INTERVAL);
+    intervalRef.current = id;
+    return () => {
+      isMountedRef.current = false;
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, [authLoading, user]);
 
   function getFilteredResults() {
     if (!scanner?.results) return [];
@@ -86,9 +115,14 @@ export default function ScannerPage() {
           <div>
             <h1 className="text-2xl font-bold text-white">Market Scanner</h1>
             <p className="text-sm text-gray-500">Real-time scan of NIFTY50 universe with technical indicators</p>
+            {lastRefresh && (
+              <p className="text-[10px] text-gray-600 mt-1">
+                Last refreshed: {lastRefresh.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" })}
+              </p>
+            )}
           </div>
           <button
-            onClick={loadScanner}
+            onClick={() => loadScanner()}
             disabled={loading}
             className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold rounded-lg disabled:opacity-50 transition-colors"
           >

@@ -27,6 +27,29 @@ function directionBadge(direction: string) {
   return "badge-no-trade";
 }
 
+function formatIST(isoString: string | null | undefined): string {
+  if (!isoString) return "-";
+  try {
+    return new Date(isoString).toLocaleTimeString("en-IN", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true,
+      timeZone: "Asia/Kolkata",
+    });
+  } catch {
+    return "-";
+  }
+}
+
+function TimeIcon() {
+  return (
+    <svg className="w-3 h-3 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+  );
+}
+
 export default function SignalCard({ signal, onClick }: SignalCardProps) {
   if (!signal) return null;
   const confidence = signal.confidence || 0;
@@ -41,10 +64,10 @@ export default function SignalCard({ signal, onClick }: SignalCardProps) {
         <div>
           <h3 className="font-bold text-white text-lg">{signal.symbol}</h3>
           <p className="text-xs text-gray-500">{signal.strategy}</p>
-          {signal.timestamp && (
-            <p className="text-[10px] text-gray-600 mt-0.5 flex items-center gap-1">
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-              {new Date(signal.timestamp).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true, timeZone: "Asia/Kolkata" })}
+          {signal.signal_generated_at && (
+            <p className="text-[10px] text-gray-400 mt-0.5 flex items-center gap-1">
+              <TimeIcon />
+              <span>Signal: {formatIST(signal.signal_generated_at)}</span>
             </p>
           )}
         </div>
@@ -80,19 +103,44 @@ export default function SignalCard({ signal, onClick }: SignalCardProps) {
           <div className="bg-[#111827] rounded-lg p-2">
             <span className="text-gray-500">Entry</span>
             <p className="font-semibold text-white">₹{setup.entry?.toLocaleString()}</p>
+            {signal.entry_updated_at && (
+              <p className="text-[9px] text-gray-500 mt-0.5 flex items-center gap-0.5">
+                <TimeIcon />
+                {formatIST(signal.entry_updated_at)}
+              </p>
+            )}
           </div>
           <div className="bg-[#111827] rounded-lg p-2">
             <span className="text-gray-500">Stop Loss</span>
             <p className="font-semibold text-red-400">₹{setup.stop_loss?.toLocaleString()}</p>
+            {signal.stop_loss_updated_at && (
+              <p className="text-[9px] text-gray-500 mt-0.5 flex items-center gap-0.5">
+                <TimeIcon />
+                {formatIST(signal.stop_loss_updated_at)}
+              </p>
+            )}
           </div>
           <div className="bg-[#111827] rounded-lg p-2">
             <span className="text-gray-500">Target 1</span>
             <p className="font-semibold text-green-400">₹{setup.target_1?.toLocaleString()}</p>
+            {signal.target_updated_at && (
+              <p className="text-[9px] text-gray-500 mt-0.5 flex items-center gap-0.5">
+                <TimeIcon />
+                {formatIST(signal.target_updated_at)}
+              </p>
+            )}
           </div>
           <div className="bg-[#111827] rounded-lg p-2">
             <span className="text-gray-500">R:R Ratio</span>
             <p className="font-semibold text-blue-400">1:{setup.risk_reward_ratio?.toFixed(2)}</p>
           </div>
+        </div>
+      )}
+
+      {signal.market_data_timestamp && (
+        <div className="text-[9px] text-gray-500 mb-2 flex items-center gap-1">
+          <TimeIcon />
+          <span>Market Data: {formatIST(signal.market_data_timestamp)}</span>
         </div>
       )}
 

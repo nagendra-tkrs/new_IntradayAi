@@ -10,6 +10,7 @@ from app.api.auth import router as auth_router, verify_token
 from app.api.market import router as market_router
 from app.api.trading import router as trading_router
 from app.api.backtest_api import router as backtest_router
+from app.api.trade_setup import router as trade_setup_router
 
 PUBLIC_PATHS = {"/api/auth/google/config", "/api/auth/google/callback", "/api/health"}
 
@@ -59,6 +60,7 @@ app.include_router(auth_router)
 app.include_router(market_router)
 app.include_router(trading_router)
 app.include_router(backtest_router)
+app.include_router(trade_setup_router)
 
 
 @app.get("/api/health")

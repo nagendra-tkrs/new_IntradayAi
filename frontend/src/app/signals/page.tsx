@@ -1,15 +1,26 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import Header from "@/components/Header";
 import SignalCard from "@/components/SignalCard";
 import { runScanner } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 
 export default function SignalsPage() {
   const [signals, setSignals] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const { user, loading: authLoading } = useAuth();
+  const router = useRouter();
 
   useEffect(() => {
+    if (!authLoading && !user) {
+      router.replace("/login");
+    }
+  }, [user, authLoading, router]);
+
+  useEffect(() => {
+    if (authLoading || !user) return;
     async function load() {
       try {
         const data = await runScanner();
@@ -21,7 +32,7 @@ export default function SignalsPage() {
       }
     }
     load();
-  }, []);
+  }, [authLoading, user]);
 
   return (
     <div className="min-h-screen bg-[#0a0e17]">

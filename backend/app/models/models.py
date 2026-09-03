@@ -150,3 +150,26 @@ class Alert(Base):
     message = Column(Text)
     is_read = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class UserTradeSetup(Base):
+    """A user's custom (overridden) trade setup for a symbol.
+
+    Stores the user-edited Entry / Stop Loss / Target plus the recalculated R:R.
+    This is a USER OVERRIDE on top of the AI-generated setup: the AI values live in
+    the Signal.setup and are never touched here. Ownership is enforced via user_id so
+    one user can never read or modify another user's setup."""
+    __tablename__ = "user_trade_setups"
+    __table_args__ = (
+        Index("ix_user_trade_setup_user_symbol", "user_id", "symbol", unique=True),
+    )
+    id = Column(String(16), primary_key=True, default=gen_id)
+    user_id = Column(String(16), ForeignKey("users.id"), nullable=False)
+    symbol = Column(String(50), nullable=False)
+    entry = Column(Float, nullable=False)
+    stop_loss = Column(Float, nullable=False)
+    target = Column(Float, nullable=False)
+    risk_reward = Column(Float)
+    direction = Column(String(20))
+    override_active = Column(Boolean, default=True)
+    updated_at = Column(DateTime, default=datetime.utcnow)

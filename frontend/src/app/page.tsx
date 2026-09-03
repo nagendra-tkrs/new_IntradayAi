@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import Header from "@/components/Header";
 import SignalCard from "@/components/SignalCard";
@@ -8,12 +8,18 @@ import { runScanner, getMarketStatus } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import Link from "next/link";
 
+const REFRESH_INTERVAL = 60000;
+
 export default function Dashboard() {
   const [scanner, setScanner] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const { user, loading: authLoading } = useAuth();
   const router = useRouter();
+  const intervalRef = useRef<number | null>(null);
+  const isMountedRef = useRef(true);
 
   useEffect(() => {
     if (!authLoading && !user) {
@@ -21,20 +27,45 @@ export default function Dashboard() {
     }
   }, [user, authLoading, router]);
 
-  useEffect(() => {
-    async function load() {
-      try {
+  const loadData = useCallback(async (isAutoRefresh = false) => {
+    try {
+      if (isAutoRefresh) {
+        setIsRefreshing(true);
+      } else {
         setLoading(true);
-        const data = await runScanner();
+      }
+      setError(null);
+      const data = await runScanner();
+      if (isMountedRef.current) {
         setScanner(data);
-      } catch (e: any) {
+        setLastRefresh(new Date());
+      }
+    } catch (e: any) {
+      if (isMountedRef.current) {
         setError(e.message);
-      } finally {
+      }
+    } finally {
+      if (isMountedRef.current) {
         setLoading(false);
+        setIsRefreshing(false);
       }
     }
-    load();
   }, []);
+
+  const loadDataRef = useRef(loadData);
+  loadDataRef.current = loadData;
+
+  useEffect(() => {
+    if (authLoading || !user) return;
+    isMountedRef.current = true;
+    loadDataRef.current();
+    const id = window.setInterval(() => { loadDataRef.current(true); }, REFRESH_INTERVAL);
+    intervalRef.current = id;
+    return () => {
+      isMountedRef.current = false;
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, [authLoading, user]);
 
   return (
     <div className="min-h-screen bg-[#0a0e17]">
@@ -45,8 +76,12 @@ export default function Dashboard() {
           <p className="text-sm text-gray-500 mt-1">
             Intraday market scanner with multi-factor signal analysis
           </p>
-          <div className="mt-2 px-3 py-2 bg-blue-500/10 border border-blue-500/30 rounded-lg text-xs text-blue-400">
-            Data sourced via yfinance (Yahoo Finance). Prices may be delayed. This is not financial advice.
+          <div className="mt-2 px-3 py-2 bg-blue-500/10 border border-blue-500/30 rounded-lg text-xs text-blue-400 flex items-center justify-between">
+            <span>Data sourced via yfinance (Yahoo Finance). Prices may be delayed. This is not financial advice.</span>
+            <span className="flex items-center gap-2">
+              {isRefreshing && <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />}
+              {lastRefresh && <span>Last: {lastRefresh.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" })}</span>}
+            </span>
           </div>
         </div>
 
@@ -162,12 +197,18 @@ export default function Dashboard() {
                         stock.confidence >= 60 ? "text-blue-400" : "text-gray-400"
                       }`}>{stock.confidence || 0}</td>
                       <td className="text-[10px] text-gray-500">
-                        {stock.data_timestamp ? (
+                        {stock.signal_data?.signal_generated_at ? (
+                          <span className="flex items-center gap-1">
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                            {new Date(stock.signal_data.signal_generated_at).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" })}
+                          </span>
+                        ) : stock.data_timestamp ? (
                           <span className="flex items-center gap-1">
                             <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
                             {new Date(stock.data_timestamp).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" })}
                           </span>
                         ) : "-"}
+                      </td>
                     </tr>
                   ))}
                 </tbody>

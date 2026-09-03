@@ -109,3 +109,9 @@ class SignalResponse(BaseModel):
     strategy: str
     data_source: DataSource
     indicator_values: dict = {}
+    market_data_timestamp: Optional[datetime] = None
+    signal_generated_at: Optional[datetime] = None
+    entry_updated_at: Optional[datetime] = None
+    stop_loss_updated_at: Optional[datetime] = None
+    target_updated_at: Optional[datetime] = None
+    last_updated_at: Optional[datetime] = None

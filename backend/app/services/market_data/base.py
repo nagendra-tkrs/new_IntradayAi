@@ -17,6 +17,11 @@ class MarketDataProvider(ABC):
     async def get_intraday_bars(self, symbol: str, timeframe: str = "5m") -> pd.DataFrame:
         pass
 
+    async def get_quote_and_bars(self, symbol: str, timeframe: str = "5m") -> dict:
+        quote = await self.get_quote(symbol)
+        df = await self.get_intraday_bars(symbol, timeframe)
+        return {"quote": quote, "df": df}
+
     @abstractmethod
     async def get_market_status(self) -> dict:
         pass

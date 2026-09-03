@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from typing import Optional
+from datetime import datetime
 from app.models.schemas import (
     SignalDirection, SignalScore, TradeSetup,
     SignalExplanation, DataSource
@@ -303,6 +304,7 @@ def evaluate_signal(
     market_context: dict | None = None,
     data_age_seconds: int | None = None,
     data_status: str = "UNKNOWN",
+    market_data_timestamp: datetime | None = None,
 ) -> Optional[dict]:
     # Data quality checks
     if data_status in ("STALE", "UNAVAILABLE", "DELAYED"):
@@ -446,10 +448,24 @@ def evaluate_signal(
             indicator_values[col] = round(float(val), 2)
         else:
             indicator_values[col] = None
+
+    signal_generated_at = now_ist()
+    entry_ts = signal_generated_at
+    sl_ts = signal_generated_at
+    target_ts = signal_generated_at
+
+    if market_data_timestamp is not None:
+        if isinstance(market_data_timestamp, str):
+            market_data_ts_str = market_data_timestamp
+        else:
+            market_data_ts_str = market_data_timestamp.isoformat()
+    else:
+        market_data_ts_str = None
+
     return {
         "id": uuid.uuid4().hex[:16],
         "symbol": symbol,
-        "timestamp": now_ist().isoformat(),
+        "timestamp": signal_generated_at.isoformat(),
         "direction": direction.value,
         "confidence": confidence,
         "signal_score": signal_score.model_dump(),
@@ -458,4 +474,10 @@ def evaluate_signal(
         "strategy": strategy,
         "data_source": data_source,
         "indicator_values": indicator_values,
+        "market_data_timestamp": market_data_ts_str,
+        "signal_generated_at": signal_generated_at.isoformat(),
+        "entry_updated_at": entry_ts.isoformat(),
+        "stop_loss_updated_at": sl_ts.isoformat(),
+        "target_updated_at": target_ts.isoformat(),
+        "last_updated_at": signal_generated_at.isoformat(),
     }

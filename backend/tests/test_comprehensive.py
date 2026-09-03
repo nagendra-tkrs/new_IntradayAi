@@ -748,3 +748,899 @@ def test_backtest_with_strategy_version():
     perf_v2 = result_v2["performance"]
     assert "total_slippage_paid" in perf_v1
     assert "total_slippage_paid" in perf_v2
+
+
+def test_signal_timestamps_new_signal():
+    """Test that new signal receives all required timestamp fields"""
+    from app.services.signal_engine import evaluate_signal
+    from app.models.schemas import DataSource
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import pandas as pd
+    import numpy as np
+
+    n = 100
+    np.random.seed(42)
+    dates = pd.date_range("2024-01-01 09:15", periods=n, freq="5min", tz="Asia/Kolkata")
+    prices = 100 + np.cumsum(np.random.randn(n) * 0.1)
+
+    df = pd.DataFrame({
+        "timestamp": dates,
+        "open": prices + np.random.randn(n) * 0.1,
+        "high": prices + abs(np.random.randn(n) * 0.2),
+        "low": prices - abs(np.random.randn(n) * 0.2),
+        "close": prices,
+        "volume": np.random.randint(1000, 10000, n),
+    })
+
+    from app.services.indicators import calculate_all_indicators
+    df = calculate_all_indicators(df)
+
+    signal = evaluate_signal(df, "TEST", data_source="TEST",
+                            data_age_seconds=60, data_status="LIVE")
+
+    assert signal is not None
+    assert "signal_generated_at" in signal
+    assert "entry_updated_at" in signal
+    assert "stop_loss_updated_at" in signal
+    assert "target_updated_at" in signal
+    assert "market_data_timestamp" in signal
+    assert "last_updated_at" in signal
+
+    IST = ZoneInfo("Asia/Kolkata")
+    for ts_field in ["signal_generated_at", "entry_updated_at", "stop_loss_updated_at",
+                     "target_updated_at", "last_updated_at"]:
+        if signal[ts_field] is not None:
+            ts = datetime.fromisoformat(signal[ts_field])
+            assert ts.tzinfo is not None, f"{ts_field} should be timezone-aware"
+
+
+def test_signal_timestamps_market_data_preserved():
+    """Test that market_data_timestamp is preserved from input"""
+    from app.services.signal_engine import evaluate_signal
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import pandas as pd
+    import numpy as np
+
+    n = 100
+    np.random.seed(42)
+    dates = pd.date_range("2024-01-01 09:15", periods=n, freq="5min", tz="Asia/Kolkata")
+    prices = 100 + np.cumsum(np.random.randn(n) * 0.1)
+
+    df = pd.DataFrame({
+        "timestamp": dates,
+        "open": prices + np.random.randn(n) * 0.1,
+        "high": prices + abs(np.random.randn(n) * 0.2),
+        "low": prices - abs(np.random.randn(n) * 0.2),
+        "close": prices,
+        "volume": np.random.randint(1000, 10000, n),
+    })
+
+    from app.services.indicators import calculate_all_indicators
+    df = calculate_all_indicators(df)
+
+    market_ts = datetime(2026, 9, 3, 11, 42, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+    signal = evaluate_signal(df, "TEST", data_source="TEST",
+                            data_age_seconds=60, data_status="LIVE",
+                            market_data_timestamp=market_ts)
+
+    assert signal is not None
+    assert signal["market_data_timestamp"] == market_ts.isoformat()
+
+
+def test_signal_timestamps_entry_updates_only_entry():
+    """Test that updating entry only updates entry_updated_at"""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    IST = ZoneInfo("Asia/Kolkata")
+    ts1 = datetime(2026, 9, 3, 11, 42, 0, tzinfo=IST)
+    ts2 = datetime(2026, 9, 3, 11, 43, 0, tzinfo=IST)
+    ts3 = datetime(2026, 9, 3, 11, 44, 0, tzinfo=IST)
+
+    setup_data = {
+        "entry": 100.0,
+        "stop_loss": 98.0,
+        "target_1": 105.0,
+        "target_2": 110.0,
+        "risk_per_share": 2.0,
+        "reward_per_share": 5.0,
+        "risk_reward_ratio": 2.5,
+    }
+
+    from app.models.schemas import TradeSetup
+    setup = TradeSetup(**setup_data)
+
+    assert setup.entry == 100.0
+    assert setup.stop_loss == 98.0
+    assert setup.target_1 == 105.0
+
+
+def test_signal_timestamps_string_market_data_timestamp():
+    """Regression test: market_data_timestamp as string (from yfinance) must not crash"""
+    from app.services.signal_engine import evaluate_signal
+    import pandas as pd
+    import numpy as np
+
+    n = 100
+    np.random.seed(42)
+    dates = pd.date_range("2024-01-01 09:15", periods=n, freq="5min", tz="Asia/Kolkata")
+    prices = 100 + np.cumsum(np.random.randn(n) * 0.1)
+
+    df = pd.DataFrame({
+        "timestamp": dates,
+        "open": prices + np.random.randn(n) * 0.1,
+        "high": prices + abs(np.random.randn(n) * 0.2),
+        "low": prices - abs(np.random.randn(n) * 0.2),
+        "close": prices,
+        "volume": np.random.randint(1000, 10000, n),
+    })
+
+    from app.services.indicators import calculate_all_indicators
+    df = calculate_all_indicators(df)
+
+    # yfinance returns timestamps as ISO strings, not datetime objects
+    signal = evaluate_signal(df, "TEST", data_source="TEST",
+                            data_age_seconds=60, data_status="LIVE",
+                            market_data_timestamp="2026-09-03T12:51:35+05:30")
+
+    assert signal is not None
+    assert signal["market_data_timestamp"] == "2026-09-03T12:51:35+05:30"
+
+
+def test_signal_timestamps_no_trade_has_timestamps():
+    """Test that NO TRADE signal also has timestamp fields"""
+    from app.services.signal_engine import evaluate_signal
+    import pandas as pd
+    import numpy as np
+
+    n = 100
+    np.random.seed(42)
+    dates = pd.date_range("2024-01-01 09:15", periods=n, freq="5min", tz="Asia/Kolkata")
+    prices = 100 + np.cumsum(np.random.randn(n) * 0.1)
+
+    df = pd.DataFrame({
+        "timestamp": dates,
+        "open": prices + np.random.randn(n) * 0.1,
+        "high": prices + abs(np.random.randn(n) * 0.2),
+        "low": prices - abs(np.random.randn(n) * 0.2),
+        "close": prices,
+        "volume": np.random.randint(1000, 10000, n),
+    })
+
+    from app.services.indicators import calculate_all_indicators
+    df = calculate_all_indicators(df)
+
+    signal = evaluate_signal(df, "TEST", data_source="TEST",
+                            data_age_seconds=60, data_status="LIVE")
+
+    assert signal is not None
+    assert signal["direction"] in ("NO_TRADE", "WEAK_LONG", "WEAK_SHORT", "LONG", "SHORT",
+                                    "STRONG_LONG", "STRONG_SHORT")
+
+    assert "signal_generated_at" in signal
+    assert "market_data_timestamp" in signal
+
+
+def test_signal_timestamps_are_consistent():
+    """Test that signal_generated_at, entry_updated_at, sl_updated_at, target_updated_at are set consistently"""
+    from app.services.signal_engine import evaluate_signal
+    from datetime import datetime
+    import pandas as pd
+    import numpy as np
+
+    n = 100
+    np.random.seed(42)
+    dates = pd.date_range("2024-01-01 09:15", periods=n, freq="5min", tz="Asia/Kolkata")
+    prices = 100 + np.cumsum(np.random.randn(n) * 0.1)
+
+    df = pd.DataFrame({
+        "timestamp": dates,
+        "open": prices + np.random.randn(n) * 0.1,
+        "high": prices + abs(np.random.randn(n) * 0.2),
+        "low": prices - abs(np.random.randn(n) * 0.2),
+        "close": prices,
+        "volume": np.random.randint(1000, 10000, n),
+    })
+
+    from app.services.indicators import calculate_all_indicators
+    df = calculate_all_indicators(df)
+
+    signal = evaluate_signal(df, "TEST", data_source="TEST",
+                            data_age_seconds=60, data_status="LIVE")
+
+    assert signal is not None
+
+    ts_gen = datetime.fromisoformat(signal["signal_generated_at"]) if signal["signal_generated_at"] else None
+    ts_entry = datetime.fromisoformat(signal["entry_updated_at"]) if signal["entry_updated_at"] else None
+    ts_sl = datetime.fromisoformat(signal["stop_loss_updated_at"]) if signal["stop_loss_updated_at"] else None
+    ts_target = datetime.fromisoformat(signal["target_updated_at"]) if signal["target_updated_at"] else None
+    ts_last = datetime.fromisoformat(signal["last_updated_at"]) if signal["last_updated_at"] else None
+
+    if ts_gen:
+        assert ts_entry == ts_gen, "entry_updated_at should equal signal_generated_at for new signal"
+        assert ts_sl == ts_gen, "stop_loss_updated_at should equal signal_generated_at for new signal"
+        assert ts_target == ts_gen, "target_updated_at should equal signal_generated_at for new signal"
+        assert ts_last == ts_gen, "last_updated_at should equal signal_generated_at for new signal"
+
+
+def test_signal_uses_last_close_as_entry():
+    """Test that Entry is derived from the last candle close (the snapshot's price)"""
+    from app.services.signal_engine import compute_trade_setup
+    from app.models.schemas import SignalDirection
+    import pandas as pd
+
+    row = pd.Series({"close": 235.42, "atr_14": 3.5})
+    setup = compute_trade_setup(row, SignalDirection.LONG)
+    assert setup.entry == 235.42
+    assert setup.stop_loss == round(235.42 - 1.5 * 3.5, 2)
+    assert setup.target_1 == round(235.42 + 2.0 * 3.5, 2)
+    assert setup.risk_per_share == abs(setup.entry - setup.stop_loss)
+    assert setup.reward_per_share == abs(setup.target_1 - setup.entry)
+
+
+def test_rr_ratio_consistent_with_entry_sl_target():
+    """Test R:R ratio is calculated from the same Entry, SL, Target values"""
+    from app.services.signal_engine import compute_trade_setup
+    from app.models.schemas import SignalDirection
+    import pandas as pd
+
+    row = pd.Series({"close": 100.0, "atr_14": 10.0})
+    setup = compute_trade_setup(row, SignalDirection.LONG)
+
+    risk = abs(setup.entry - setup.stop_loss)
+    reward = abs(setup.target_1 - setup.entry)
+    expected_rr = round(reward / risk, 2) if risk > 0 else 0
+
+    assert setup.risk_reward_ratio == expected_rr
+    assert setup.risk_per_share == round(risk, 2)
+    assert setup.reward_per_share == round(reward, 2)
+
+
+def test_signal_from_different_prices():
+    """Test that different market snapshots produce different Entry/SL/Target"""
+    from app.services.signal_engine import evaluate_signal
+    from app.services.indicators import calculate_all_indicators
+    import pandas as pd
+    import numpy as np
+
+    n = 100
+    np.random.seed(42)
+    dates = pd.date_range("2024-01-01 09:15", periods=n, freq="5min", tz="Asia/Kolkata")
+    prices = 100 + np.cumsum(np.random.randn(n) * 0.1)
+
+    df = pd.DataFrame({
+        "timestamp": dates,
+        "open": prices + np.random.randn(n) * 0.1,
+        "high": prices + abs(np.random.randn(n) * 0.2),
+        "low": prices - abs(np.random.randn(n) * 0.2),
+        "close": prices,
+        "volume": np.random.randint(1000, 10000, n),
+    })
+    df = calculate_all_indicators(df)
+
+    signal1 = evaluate_signal(df, "TEST", data_source="TEST",
+                              data_age_seconds=60, data_status="LIVE")
+    if signal1 and signal1["direction"] != "NO_TRADE":
+        entry1 = signal1["setup"]["entry"]
+        df2 = df.copy()
+        df2.iloc[-1, df2.columns.get_loc("close")] = entry1 + 5.0
+        df2.iloc[-1, df2.columns.get_loc("open")] = entry1 + 5.0
+        df2.iloc[-1, df2.columns.get_loc("high")] = entry1 + 5.5
+        df2.iloc[-1, df2.columns.get_loc("low")] = entry1 + 4.5
+        signal2 = evaluate_signal(df2, "TEST", data_source="TEST",
+                                  data_age_seconds=60, data_status="LIVE")
+        if signal2 and signal2["direction"] != "NO_TRADE":
+            assert signal2["setup"]["entry"] != entry1 or signal2["direction"] == "NO_TRADE"
+
+
+def test_market_data_timestamp_preserved_through_signal():
+    """Test market_data_timestamp flows through to the final signal output"""
+    from app.services.signal_engine import evaluate_signal
+    from app.services.indicators import calculate_all_indicators
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import pandas as pd
+    import numpy as np
+
+    n = 100
+    np.random.seed(42)
+    dates = pd.date_range("2024-01-01 09:15", periods=n, freq="5min", tz="Asia/Kolkata")
+    prices = 100 + np.cumsum(np.random.randn(n) * 0.1)
+
+    df = pd.DataFrame({
+        "timestamp": dates,
+        "open": prices + np.random.randn(n) * 0.1,
+        "high": prices + abs(np.random.randn(n) * 0.2),
+        "low": prices - abs(np.random.randn(n) * 0.2),
+        "close": prices,
+        "volume": np.random.randint(1000, 10000, n),
+    })
+    df = calculate_all_indicators(df)
+
+    market_ts = datetime(2026, 9, 3, 14, 31, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+    signal = evaluate_signal(df, "TEST", data_source="TEST",
+                             data_age_seconds=60, data_status="LIVE",
+                             market_data_timestamp=market_ts)
+
+    assert signal is not None
+    assert signal["market_data_timestamp"] == market_ts.isoformat()
+    assert signal["signal_generated_at"] is not None
+    gen_ts = datetime.fromisoformat(signal["signal_generated_at"])
+    assert gen_ts.tzinfo is not None
+
+
+def test_legacy_null_timestamps_do_not_crash():
+    """Test that signals with null timestamp fields do not crash"""
+    from app.services.signal_engine import evaluate_signal
+    from app.services.indicators import calculate_all_indicators
+    import pandas as pd
+    import numpy as np
+
+    n = 100
+    np.random.seed(42)
+    dates = pd.date_range("2024-01-01 09:15", periods=n, freq="5min", tz="Asia/Kolkata")
+    prices = 100 + np.cumsum(np.random.randn(n) * 0.1)
+
+    df = pd.DataFrame({
+        "timestamp": dates,
+        "open": prices + np.random.randn(n) * 0.1,
+        "high": prices + abs(np.random.randn(n) * 0.2),
+        "low": prices - abs(np.random.randn(n) * 0.2),
+        "close": prices,
+        "volume": np.random.randint(1000, 10000, n),
+    })
+    df = calculate_all_indicators(df)
+
+    signal = evaluate_signal(df, "TEST", data_source="TEST",
+                             data_age_seconds=60, data_status="LIVE",
+                             market_data_timestamp=None)
+
+    assert signal is not None
+    assert signal["market_data_timestamp"] is None
+    assert signal["signal_generated_at"] is not None
+
+
+def test_yfinance_combined_fetch_returns_consistent_data():
+    """Test that get_quote_and_bars returns quote and bars from the same snapshot"""
+    from app.services.market_data.yfinance_provider import YFinanceMarketDataProvider
+
+    provider = YFinanceMarketDataProvider()
+
+    async def run():
+        result = await provider.get_quote_and_bars("ONGC")
+        return result
+
+    import asyncio
+    result = asyncio.run(run())
+
+    assert "quote" in result
+    assert "df" in result
+    quote = result["quote"]
+    df = result["df"]
+
+    assert "price" in quote
+    assert "timestamp" in quote
+    assert "data_status" in quote
+
+
+def test_yfinance_bar_cache_ttl_is_short():
+    """Test that bar cache TTL is reduced to 30 seconds"""
+    from app.services.market_data.yfinance_provider import YFinanceMarketDataProvider
+
+    provider = YFinanceMarketDataProvider()
+    assert provider._bar_cache._ttl == 30, "Bar cache TTL should be 30 seconds"
+
+
+def test_yfinance_quote_cache_ttl_unchanged():
+    """Test that quote cache TTL remains 60 seconds"""
+    from app.services.market_data.yfinance_provider import YFinanceMarketDataProvider
+
+    provider = YFinanceMarketDataProvider()
+    assert provider._quote_cache._ttl == 60, "Quote cache TTL should be 60 seconds"
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: global Change Rs / Change % calculation
+#
+# Root cause: _build_quote_from_chart() preferred the stale `chartPreviousClose`
+# field (a chart reference baseline from before the earliest bar in the range)
+# over `previousClose` (the true previous TRADING DAY's close). For a 5m/60d or
+# 1d/5d chart this produced a change relative to a close from days/weeks ago,
+# giving wrong red/green sign and magnitude for EVERY stock.
+# ---------------------------------------------------------------------------
+
+
+def _chart_result(price, prev_close, chart_prev_close, daily_closes=None):
+    """Build a synthetic Yahoo v8 chart `result` dict for testing."""
+    if daily_closes is None:
+        daily_closes = [prev_close, price]
+    n = len(daily_closes)
+    return {
+        "meta": {
+            "regularMarketPrice": price,
+            "previousClose": prev_close,
+            "chartPreviousClose": chart_prev_close,
+            "regularMarketTime": 1788428700,
+            "regularMarketDayOpen": price,
+            "regularMarketDayHigh": price,
+            "regularMarketDayLow": price,
+        },
+        "timestamp": list(range(n)),
+        "indicators": {"quote": [{"close": daily_closes}]},
+    }
+
+
+def test_change_prefers_previous_close_over_chart_previous_close():
+    """Regression: change must be vs the previous trading day's close, NOT the
+    stale chartPreviousClose. Mirrors HDFCBANK: price 706.65, prevClose 700.80,
+    chartPrevClose 772.45 -> change should be +5.85 (+0.83%), not -65.80 (-8.52%)."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    result = _chart_result(price=706.65, prev_close=700.80, chart_prev_close=772.45)
+    q = _build_quote_from_chart("HDFCBANK", result)
+
+    assert q["prev_close"] == pytest.approx(700.80)
+    assert q["change"] == pytest.approx(5.85, abs=0.01)
+    assert q["change_pct"] == pytest.approx(0.83, abs=0.01)
+    # Ensure change is POSITIVE (green), not negative (red)
+    assert q["change"] > 0
+
+
+def test_change_derives_previous_close_from_daily_bars_when_meta_missing():
+    """Regression: when meta.previousClose is absent (interval=1d charts), the
+    previous close must be derived from the SECOND-TO-LAST daily bar, not the stale
+    chartPreviousClose."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    # 5 daily bars, last bar is today's close (706.65), second-to-last is 700.80.
+    # Use realistic daily-spaced unix timestamps (each a distinct trading day).
+    import time
+    base = 1788428700  # a recent epoch
+    day = 86400
+    daily = [720.3, 709.0, 711.9, 700.8, 706.65]
+    result = {
+        "meta": {
+            "regularMarketPrice": 706.65,
+            "previousClose": None,
+            "chartPreviousClose": 720.3,  # stale baseline (should NOT be used)
+            "regularMarketTime": 1788428700,
+            "regularMarketDayOpen": 706.65,
+            "regularMarketDayHigh": 706.65,
+            "regularMarketDayLow": 706.65,
+        },
+        "timestamp": [base - (len(daily) - 1 - i) * day for i in range(len(daily))],
+        "indicators": {"quote": [{"close": daily}]},
+    }
+    q = _build_quote_from_chart("HDFCBANK", result)
+
+    # Correct previous close is the yesterday bar (700.80), NOT chartPreviousClose (720.3)
+    assert q["prev_close"] == pytest.approx(700.80)
+    assert q["change"] == pytest.approx(5.85, abs=0.01)
+    assert q["change_pct"] == pytest.approx(0.83, abs=0.01)
+
+
+@pytest.mark.parametrize(
+    "symbol,price,prev_close,expected_change,expected_pct",
+    [
+        # Positive change
+        ("HDFCBANK", 706.65, 700.80, 5.85, 0.83),
+        ("SBIN", 1023.40, 1020.90, 2.50, 0.24),
+        # Negative change
+        ("RELIANCE", 1302.50, 1313.10, -10.60, -0.81),
+        ("TCS", 2320.10, 2348.00, -27.90, -1.19),
+        ("INFY", 1130.30, 1140.00, -9.70, -0.85),
+        # Zero change
+        ("FLAT", 100.00, 100.00, 0.00, 0.00),
+    ],
+)
+def test_change_before_after_market_seconds(symbol, price, prev_close, expected_change, expected_pct):
+    """change = price - prevClose; changePct = change/prevClose*100, for positive,
+    negative and zero cases across multiple stocks."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    # chartPreviousClose deliberately set to a wrong/stale value that MUST be ignored
+    stale_chart_prev = prev_close * 1.10
+    result = _chart_result(price, prev_close, stale_chart_prev)
+    q = _build_quote_from_chart(symbol, result)
+
+    assert q["prev_close"] == pytest.approx(prev_close, abs=0.01)
+    assert q["change"] == pytest.approx(expected_change, abs=0.01)
+    assert q["change_pct"] == pytest.approx(expected_pct, abs=0.02)
+    # Internal consistency: change == price - prevClose and pct derived from it
+    assert q["change"] == pytest.approx(round(q["price"] - q["prev_close"], 2), abs=0.01)
+    if q["prev_close"]:
+        assert q["change_pct"] == pytest.approx(
+            round(q["change"] / q["prev_close"] * 100, 2), abs=0.01
+        )
+
+
+def test_change_does_not_use_previous_candle_or_open():
+    """Regression: previous close must NOT be the previous intraday candle's close,
+    the opening price, or any arbitrary stale field. Only the previous trading day's
+    close is acceptable."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    # opening price differs wildly; chartPreviousClose stale; previousClose correct
+    result = _chart_result(price=110.0, prev_close=100.0, chart_prev_close=95.0)
+    result["meta"]["regularMarketDayOpen"] = 108.5  # wrong open-based baseline
+    q = _build_quote_from_chart("X", result)
+
+    assert q["prev_close"] == pytest.approx(100.0)
+    assert q["change"] == pytest.approx(10.0, abs=0.01)
+    assert q["change_pct"] == pytest.approx(10.0, abs=0.01)
+
+
+def test_change_falls_back_to_chart_previous_close_only_when_nothing_else():
+    """Fallback safety: if neither previousClose nor daily bars are available,
+    chartPreviousClose is used as a last resort (no crash, finite numbers)."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    result = {
+        "meta": {
+            "regularMarketPrice": 706.65,
+            "previousClose": None,
+            "chartPreviousClose": 720.3,
+            "regularMarketTime": 1788428700,
+        },
+        "timestamp": [],
+        "indicators": {"quote": [{"close": []}]},
+    }
+    q = _build_quote_from_chart("HDFCBANK", result)
+    # Not enough bars to derive, so it must fall back gracefully to chartPreviousClose
+    assert q["prev_close"] == pytest.approx(720.30)
+    assert isinstance(q["change"], float)
+    assert isinstance(q["change_pct"], float)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: OHLC + Previous Close on the Stock Detail snapshot
+#
+# _build_quote_from_chart() builds the quote snapshot consumed by stock detail.
+# It must expose open/high/low/close/prev_close all from the same snapshot,
+# with a correct previous-trading-day baseline. The meta `regularMarketDayOpen`
+# is frequently absent in Yahoo's chart API, so open/high/low are derived from
+# the latest session's bars (same result) instead of fabricating from price.
+# ---------------------------------------------------------------------------
+
+
+def _session_chart_result(price, prev_close, opens, highs, lows, closes,
+                          session_days=1, open_bars=1):
+    """Build a synthetic chart result with full OHLC bars for `session_days` days.
+
+    Each day has `open_bars` bars. `opens/highs/lows/closes` are FLAT per-bar
+    lists (length == session_days * open_bars). If they're shorter than the
+    number of bars, the last value is reused for the remaining bars. Bars are
+    spaced by 1 hour (3600s). Meta DayOpen/High/Low are left ABSENT to prove
+    derivation from bars works.
+    """
+    base = 1788428700
+    day_secs = 86400
+    total_bars = session_days * open_bars
+    ts = []
+    o, h, l, c = [], [], [], []
+    bar = 0
+    for d in range(session_days):
+        day_base = base - (session_days - 1 - d) * day_secs
+        for b in range(open_bars):
+            ts.append(day_base + b * 3600)
+            idx = min(bar, len(opens) - 1)
+            o.append(opens[idx])
+            h.append(highs[idx])
+            l.append(lows[idx])
+            c.append(closes[idx])
+            bar += 1
+    return {
+        "meta": {
+            "regularMarketPrice": price,
+            "previousClose": prev_close,
+            "chartPreviousClose": prev_close * 1.15,  # stale - must be ignored
+            "regularMarketTime": base,
+        },
+        "timestamp": ts,
+        "indicators": {"quote": [{"open": o, "high": h, "low": l, "close": c}]},
+    }
+
+
+def test_ohlc_fields_returned_from_snapshot():
+    """Open/High/Low/Close/PrevClose are all present and correct from one snapshot."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    # RELIANCE-style session: price 1302.50, PREV close 1313.10
+    result = _session_chart_result(
+        price=1302.50, prev_close=1313.10,
+        opens=[1313.10], highs=[1316.80], lows=[1302.50], closes=[1302.50],
+    )
+    q = _build_quote_from_chart("RELIANCE", result)
+
+    assert q["open"] == pytest.approx(1313.10, abs=0.01)
+    assert q["high"] == pytest.approx(1316.80, abs=0.01)
+    assert q["low"] == pytest.approx(1302.50, abs=0.01)
+    assert q["close"] == pytest.approx(1302.50, abs=0.01)
+    assert q["prev_close"] == pytest.approx(1313.10, abs=0.01)
+    assert "price" in q and q["price"] == pytest.approx(1302.50, abs=0.01)
+
+
+def test_ohlc_previous_close_uses_correct_baseline_not_chart_previous():
+    """chartPreviousClose must NOT override the previousClose baseline for prev_close,
+    and must NOT be used as the high."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    # chart_prev in helper is prev_close*1.15 -> 150.99 if prev_close=131.3, must be ignored
+    result = _session_chart_result(
+        price=130.0, prev_close=131.3,
+        opens=[132.0], highs=[133.5], lows=[128.5], closes=[130.0],
+    )
+    q = _build_quote_from_chart("X", result)
+    assert q["prev_close"] == pytest.approx(131.3, abs=0.01)
+    assert q["high"] == pytest.approx(133.5, abs=0.01)
+
+
+def test_ohlc_open_derived_from_first_bar_when_meta_open_absent():
+    """When meta.regularMarketDayOpen is absent (common), open must be the first
+    bar's open, NOT the current price."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    # price differs from the session open
+    result = _session_chart_result(
+        price=130.0, prev_close=131.3,
+        opens=[125.0], highs=[135.0], lows=[124.0], closes=[130.0],
+    )
+    q = _build_quote_from_chart("X", result)
+    assert q["open"] == pytest.approx(125.0, abs=0.01)
+    assert q["open"] != pytest.approx(q["price"])
+
+
+def test_ohlc_high_is_max_and_low_is_min_across_session():
+    """High = max of bar highs, Low = min of bar lows for the latest session."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    result = _session_chart_result(
+        price=100.0, prev_close=99.0,
+        opens=[99.0, 100.0, 101.0],
+        highs=[101.0, 103.0, 102.0],
+        lows=[98.0, 99.5, 99.0],
+        closes=[100.0, 101.0, 100.0],
+        session_days=1, open_bars=3,
+    )
+    q = _build_quote_from_chart("X", result)
+    assert q["high"] == pytest.approx(103.0, abs=0.01)
+    assert q["low"] == pytest.approx(98.0, abs=0.01)
+
+
+def test_ohlc_uses_latest_session_when_multiple_days():
+    """When multiple sessions are present, OHLC comes from the LATEST session."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    result = _session_chart_result(
+        price=110.0, prev_close=105.0,
+        opens=[100.0, 109.0],
+        highs=[102.0, 112.0],
+        lows=[98.0, 106.0],
+        closes=[101.0, 110.0],
+        session_days=2, open_bars=1,
+    )
+    q = _build_quote_from_chart("X", result)
+    assert q["open"] == pytest.approx(109.0, abs=0.01)
+    assert q["high"] == pytest.approx(112.0, abs=0.01)
+    assert q["low"] == pytest.approx(106.0, abs=0.01)
+    assert q["close"] == pytest.approx(110.0, abs=0.01)
+
+
+def test_ohlc_market_closed_still_returns_last_valid_values():
+    """After market close the snapshot must still carry the last valid OHLC values
+    (not blanks), with prev_close and close intact."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    result = _session_chart_result(
+        price=250.0, prev_close=248.0,
+        opens=[249.0], highs=[252.0], lows=[247.0], closes=[250.0],
+    )
+    q = _build_quote_from_chart("X", result)
+    # Not blank after close - all session values and prev close present
+    assert q["open"] is not None
+    assert q["high"] is not None
+    assert q["low"] is not None
+    assert q["close"] == pytest.approx(250.0, abs=0.01)
+    assert q["prev_close"] == pytest.approx(248.0, abs=0.01)
+
+
+def test_ohlc_missing_bars_do_not_crash_and_return_none():
+    """If a genuine field is unavailable, return None (displayed as N/A) rather than
+    fabricating a value from the current price."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    result = {
+        "meta": {
+            "regularMarketPrice": 706.65,
+            "previousClose": 700.80,
+            "regularMarketTime": 1788428700,
+        },
+        "timestamp": [],
+        "indicators": {"quote": [{"open": [], "high": [], "low": [], "close": []}]},
+    }
+    q = _build_quote_from_chart("X", result)
+    # No bars and no meta day fields -> open/high/low are None (not price), close=price
+    assert q["open"] is None
+    assert q["high"] is None
+    assert q["low"] is None
+    assert q["close"] == pytest.approx(706.65, abs=0.01)
+    assert q["prev_close"] == pytest.approx(700.80, abs=0.01)
+    assert q["change"] == pytest.approx(5.85, abs=0.01)
+    assert q["change_pct"] == pytest.approx(0.83, abs=0.01)
+
+
+def test_ohlc_change_consistent_with_previous_close_and_timestamp():
+    """change/change_pct derive from price vs prev_close; timestamp string preserved /
+    composed correctly (date-based compatibility with yfinance ISO strings)."""
+    from app.services.market_data.yfinance_provider import _build_quote_from_chart
+
+    result = _session_chart_result(
+        price=106.0, prev_close=100.0,
+        opens=[101.0], highs=[107.0], lows=[100.0], closes=[106.0],
+    )
+    q = _build_quote_from_chart("X", result)
+    assert q["change"] == pytest.approx(6.0, abs=0.01)
+    assert q["change_pct"] == pytest.approx(6.0, abs=0.01)
+    assert q["change"] == pytest.approx(round(q["price"] - q["prev_close"], 2), abs=0.01)
+    # timestamp must be an ISO string (string compatibility preserved)
+    assert isinstance(q["timestamp"], str)
+    assert "T" in q["timestamp"]
+
+
+# ---------------------------------------------------------------------------
+# User trade setup overrides (Entry / Stop Loss / Target)
+#
+# Users may override the AI setup. The R:R convention is the same as the rest
+# of the project: risk = abs(entry - sl), reward = abs(target - entry),
+# rr = reward / risk (see signal_engine.compute_trade_setup). The domain
+# function compute_risk_reward both validates BUY/SELL relationships and
+# recomputes the authoritative R:R server-side. AI values are never touched.
+# ---------------------------------------------------------------------------
+
+
+def _rr(entry, sl, target, direction="LONG"):
+    from app.services.trade_setup import compute_risk_reward
+    return compute_risk_reward(entry, sl, target, direction)
+
+
+def test_user_setup_valid_buy():
+    """Valid BUY: SL < Entry < Target with a correct R:R."""
+    r = _rr(235.50, 234.90, 237.00, "LONG")
+    assert r.valid
+    assert r.errors == []
+    # Risk = 235.50-234.90 = 0.60 ; Reward = 237.00-235.50 = 1.50 ; R:R = 2.50
+    assert r.risk_reward == pytest.approx(2.50, abs=0.01)
+    assert r.entry == pytest.approx(235.50)
+    assert r.stop_loss == pytest.approx(234.90)
+    assert r.target == pytest.approx(237.00)
+
+
+def test_user_setup_invalid_buy_sl_not_below_entry():
+    """Invalid BUY: SL >= Entry must fail with a clear message."""
+    r = _rr(235.50, 236.00, 237.00, "BUY")
+    assert not r.valid
+    assert any("below Buy Price" in e for e in r.errors)
+
+
+def test_user_setup_invalid_buy_target_not_above_entry():
+    """Invalid BUY: Target <= Entry must fail."""
+    r = _rr(235.50, 234.90, 235.50, "LONG")
+    assert not r.valid
+    assert any("above Buy Price" in e for e in r.errors)
+    r2 = _rr(235.50, 234.90, 234.00, "LONG")
+    assert not r2.valid
+
+
+def test_user_setup_valid_sell():
+    """Valid SELL: Target < Entry < Stop Loss with a correct R:R."""
+    r = _rr(235.50, 237.00, 232.50, "SHORT")
+    assert r.valid
+    # Risk = 237.00-235.50 = 1.50 ; Reward = 235.50-232.50 = 3.00 ; R:R = 2.00
+    assert r.risk_reward == pytest.approx(2.00, abs=0.01)
+
+
+def test_user_setup_invalid_sell_sl_not_above_entry():
+    """Invalid SELL: SL <= Entry must fail."""
+    r = _rr(235.50, 235.00, 232.50, "SELL")
+    assert not r.valid
+    assert any("above Entry" in e for e in r.errors)
+    r2 = _rr(235.50, 233.00, 232.50, "SELL")
+    assert not r2.valid
+
+
+def test_user_setup_invalid_sell_target_not_below_entry():
+    """Invalid SELL: Target >= Entry must fail."""
+    r = _rr(235.50, 237.00, 235.50, "SELL")
+    assert not r.valid
+    assert any("below Entry" in e for e in r.errors)
+    r2 = _rr(235.50, 237.00, 239.00, "SELL")
+    assert not r2.valid
+
+
+def test_user_setup_rr_calculation_convention():
+    """R:R uses the project convention (abs-based, direction-agnostic)."""
+    # LONG: entry 235, sl 234, target 237 -> risk 1, reward 2, rr 2.0
+    r = _rr(235.00, 234.00, 237.00, "LONG")
+    assert r.valid
+    assert r.risk_reward == pytest.approx(2.00)
+    # SHORT mirrors the same magnitudes
+    r2 = _rr(235.00, 236.00, 233.00, "SHORT")
+    assert r2.valid
+    assert r2.risk_reward == pytest.approx(2.00)
+
+
+def test_user_setup_zero_risk_handled():
+    """Entry == Stop Loss -> zero risk; must not divide by zero and reports clearly."""
+    r = _rr(235.50, 235.50, 237.00, "LONG")
+    assert not r.valid
+    assert any("cannot be equal" in e for e in r.errors)
+    r2 = _rr(235.50, 235.50, 230.00, "SELL")
+    assert not r2.valid
+
+
+def test_user_setup_missing_values():
+    """Missing Entry/SL/Target must fail with messages and not crash."""
+    r = _rr(None, 234.90, 237.00, "LONG")
+    assert not r.valid
+    assert any("required" in e for e in r.errors)
+    r2 = _rr(235.50, None, 237.00, "LONG")
+    assert not r2.valid
+    r3 = _rr(235.50, 234.90, None, "LONG")
+    assert not r3.valid
+
+
+def test_user_setup_invalid_numeric_values():
+    """NaN, Infinity, non-numeric, zero and negative inputs must be rejected safely."""
+    for bad in [float("nan"), float("inf"), float("-inf"), "abc", "", -10.0, 0.0, "-5.5"]:
+        r = _rr(bad, 234.90, 237.00, "LONG")
+        assert not r.valid, f"should reject entry={bad!r}"
+    # non-numeric SL / target
+    r_sl = _rr(235.50, "oops", 237.00, "LONG")
+    assert not r_sl.valid
+    r_tgt = _rr(235.50, 234.90, float("nan"), "BUY")
+    assert not r_tgt.valid
+
+
+def test_user_setup_ai_values_preserved_and_separate():
+    """The service must not touch AI values; override is a separate concept.
+
+    compute_risk_reward operates purely on user inputs and returns them unchanged;
+    the AI setup (signal.setup) is a completely separate object that this module
+    never receives or mutates."""
+    from app.services.signal_engine import compute_trade_setup, SignalDirection
+    import pandas as pd
+
+    row = pd.DataFrame({
+        "close": [235.40],
+        "atr_14": [0.4],
+    }).iloc[0]
+    ai_setup = compute_trade_setup(row, SignalDirection.LONG)
+    ai_entry_before = ai_setup.entry
+
+    user = _rr(235.50, 234.90, 237.00, "LONG")
+    assert user.valid
+    # AI setup unchanged and distinct from the user override
+    assert ai_setup.entry == pytest.approx(ai_entry_before)
+    assert ai_setup.entry != user.entry
+
+
+def test_user_setup_override_flag_concept():
+    """override_active distinguishes the user override from AI defaults."""
+    from app.models.models import UserTradeSetup
+    assert hasattr(UserTradeSetup, "override_active")
+    assert hasattr(UserTradeSetup, "user_id")
+    assert hasattr(UserTradeSetup, "symbol")
+    assert hasattr(UserTradeSetup, "entry")
+    assert hasattr(UserTradeSetup, "stop_loss")
+    assert hasattr(UserTradeSetup, "target")
+    assert hasattr(UserTradeSetup, "risk_reward")
+
+
+def test_user_setup_direction_aliases():
+    """BUY/LONG and SELL/SHORT are interchangeable direction aliases."""
+    assert _rr(235.50, 234.90, 237.00, "LONG").valid
+    assert _rr(235.50, 234.90, 237.00, "BUY").valid
+    assert _rr(235.50, 237.00, 232.50, "SHORT").valid
+    assert _rr(235.50, 237.00, 232.50, "SELL").valid

@@ -163,13 +163,124 @@ def _parse_chart_to_df(result: dict) -> pd.DataFrame:
     return df
 
 
+def _infer_previous_close_from_bars(result: dict) -> Optional[float]:
+    """Derive the previous trading day's close from the daily bars in the chart result.
+
+    The daily bars are in chronological order. The LAST bar is the current trading
+    day's close; the SECOND-TO-LAST bar is the previous trading day's close. This is
+    the authoritative previous close when the chart meta does not expose
+    `previousClose` (as happens with interval=1d charts).
+    """
+    import math
+    timestamps = result.get("timestamp") or []
+    closes = (result.get("indicators") or {}).get("quote") or [{}]
+    closes = closes[0].get("close") or []
+    if len(closes) < 2:
+        return None
+    daily = []
+    for i, c in enumerate(closes):
+        if c is None or (isinstance(c, float) and math.isnan(c)):
+            continue
+        daily.append((timestamps[i] if i < len(timestamps) else None, c))
+    if len(daily) < 2:
+        return None
+    # The latest bar's close is today's close; the previous daily close is the bar
+    # immediately before it that represents a distinct earlier trading day.
+    last_ts = daily[-1][0]
+    for prev_ts, prev_c in reversed(daily[:-1]):
+        if last_ts is not None and prev_ts is not None:
+            last_dt = datetime.fromtimestamp(last_ts, tz=timezone.utc) if isinstance(last_ts, (int, float)) else None
+            prev_dt = datetime.fromtimestamp(prev_ts, tz=timezone.utc) if isinstance(prev_ts, (int, float)) else None
+            if last_dt is not None and prev_dt is not None and prev_dt.date() == last_dt.date():
+                continue
+        # Safe fallback: if we cannot compare dates, the second-to-last distinct bar is fine.
+        return float(prev_c)
+    # Degenerate: all bars share the same day; do not fabricate from chart baseline.
+    return None
+
+
+def _session_ohlc_from_bars(result: dict) -> Optional[dict]:
+    """Derive the latest trading session's Open/High/Low/Close from the chart bars.
+
+    Same snapshot as the quote (same `result`), so Open/High/Low are consistent with
+    the chart. The latest distinct IST trading date defines the session:
+      - open  = first bar's open
+      - high  = max of bar highs
+      - low   = min of bar lows
+      - close = last non-NaN bar close
+    Returns None when no usable bars are present.
+    """
+    import math
+    timestamps = result.get("timestamp") or []
+    bars = (result.get("indicators") or {}).get("quote") or [{}]
+    bars = bars[0]
+    opens = bars.get("open") or []
+    highs = bars.get("high") or []
+    lows = bars.get("low") or []
+    closes = bars.get("close") or []
+    if not timestamps:
+        return None
+    rows = []
+    for i, ts in enumerate(timestamps):
+        if not isinstance(ts, (int, float)):
+            continue
+        try:
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(IST)
+        except (ValueError, OverflowError, OSError):
+            continue
+        o = opens[i] if i < len(opens) else None
+        h = highs[i] if i < len(highs) else None
+        l = lows[i] if i < len(lows) else None
+        c = closes[i] if i < len(closes) else None
+        rows.append((dt.date(), o, h, l, c))
+    if not rows:
+        return None
+    latest_day = rows[-1][0]
+    day = [r for r in rows if r[0] == latest_day and r[1] is not None]
+    if not day:
+        return None
+
+    def clean(v):
+        return None if v is None or (isinstance(v, float) and math.isnan(v)) else float(v)
+
+    open_v = None
+    high_v = None
+    low_v = None
+    close_v = None
+    for i, (_, o, h, l, c) in enumerate(day):
+        if open_v is None and clean(o) is not None:
+            open_v = clean(o)
+        if clean(h) is not None:
+            high_v = max(high_v, clean(h)) if high_v is not None else clean(h)
+        if clean(l) is not None:
+            low_v = min(low_v, clean(l)) if low_v is not None else clean(l)
+        if clean(c) is not None:
+            close_v = clean(c)
+    if open_v is None or high_v is None or low_v is None:
+        return None
+    return {"open": open_v, "high": high_v, "low": low_v, "close": close_v}
+
+
 def _build_quote_from_chart(symbol: str, result: dict) -> dict:
     now = now_ist()
     meta = result.get("meta", {})
     price = float(meta.get("regularMarketPrice", 0))
-    prev_close = float(meta.get("chartPreviousClose") or meta.get("previousClose") or price)
+    # `previousClose` is the previous TRADING DAY's close (correct baseline for change).
+    # `chartPreviousClose` is only a chart reference baseline (close before the earliest
+    # bar in the requested range) and can be many days stale for large ranges - it must NOT
+    # be used first. When `previousClose` is absent (common for interval=1d charts), derive
+    # it from the second-to-last daily bar instead of the stale chart baseline.
+    prev_close = float(meta.get("previousClose") or _infer_previous_close_from_bars(result) or meta.get("chartPreviousClose") or price)
     change = price - prev_close if price and prev_close else 0
     change_pct = (change / prev_close * 100) if prev_close else 0
+    session = _session_ohlc_from_bars(result) or {}
+    # Open/High/Low: use the authoritative meta values when present, otherwise derive
+    # them from the latest session bars (same snapshot). Never fabricate from price.
+    open_v = meta.get("regularMarketDayOpen") or session.get("open")
+    high_v = meta.get("regularMarketDayHigh") or session.get("high")
+    low_v = meta.get("regularMarketDayLow") or session.get("low")
+    # Close is the latest available session close (the current/last traded price).
+    close_v = price
     regular_market_time = meta.get("regularMarketTime")
     last_ts = now
     if regular_market_time:
@@ -179,9 +290,10 @@ def _build_quote_from_chart(symbol: str, result: dict) -> dict:
         "price": round(price, 2),
         "change": round(change, 2),
         "change_pct": round(change_pct, 2),
-        "open": round(float(meta.get("regularMarketDayOpen", price)), 2),
-        "high": round(float(meta.get("regularMarketDayHigh", price)), 2),
-        "low": round(float(meta.get("regularMarketDayLow", price)), 2),
+        "open": round(float(open_v), 2) if open_v else None,
+        "high": round(float(high_v), 2) if high_v else None,
+        "low": round(float(low_v), 2) if low_v else None,
+        "close": round(float(close_v), 2) if close_v else None,
         "prev_close": round(prev_close, 2),
         "volume": int(meta.get("regularMarketVolume", 0)),
         "fifty_two_week_high": round(float(meta.get("fiftyTwoWeekHigh", 0)), 2),
@@ -226,7 +338,7 @@ class YFinanceMarketDataProvider(MarketDataProvider):
     def __init__(self):
         self._rate_limiter = RateLimiter(max_requests=10, window_seconds=1.0)
         self._quote_cache = TTLCache(max_size=200, ttl_seconds=60)
-        self._bar_cache = TTLCache(max_size=200, ttl_seconds=300)
+        self._bar_cache = TTLCache(max_size=200, ttl_seconds=30)
         self._instruments_cache: Optional[list[dict]] = None
         self._instruments_ts: Optional[float] = None
         self._last_data_times: dict[str, datetime] = {}
@@ -321,6 +433,46 @@ class YFinanceMarketDataProvider(MarketDataProvider):
         except Exception as e:
             logger.error(f"yfinance intraday failed for {ns_sym}: {e}")
             return pd.DataFrame()
+
+    async def get_quote_and_bars(self, symbol: str, timeframe: str = "5m") -> dict:
+        ns_sym = self._ns_symbol(symbol)
+        quote_cache_key = f"quote:{ns_sym}"
+        bar_cache_key = f"intraday:{ns_sym}:{timeframe}"
+
+        cached_quote = self._quote_cache.get(quote_cache_key)
+        cached_bars = self._bar_cache.get(bar_cache_key)
+        if cached_quote is not None and cached_bars is not None:
+            return {"quote": cached_quote, "df": cached_bars}
+
+        tf_config = TIMEFRAME_MAP.get(timeframe)
+        if tf_config is None:
+            tf_config = ("5m", "60d")
+        yf_interval, yf_period = tf_config
+
+        try:
+            await self._rate_limiter.acquire()
+            raw = await asyncio.to_thread(_fetch_chart_sync, ns_sym, yf_interval, yf_period)
+            quote = _build_quote_from_chart(symbol, raw)
+            quote["data_status"] = _determine_freshness_from_ts(quote.get("timestamp"))
+            df = _parse_chart_to_df(raw)
+
+            self._quote_cache.set(quote_cache_key, quote)
+            self._bar_cache.set(bar_cache_key, df)
+            self._last_data_times[symbol] = datetime.fromisoformat(quote["timestamp"]) if quote.get("timestamp") else now_ist()
+            self._data_status[symbol] = quote.get("data_status", "UNKNOWN")
+
+            return {"quote": quote, "df": df}
+        except Exception as e:
+            logger.error(f"yfinance combined fetch failed for {ns_sym}: {e}")
+            now = now_ist()
+            fallback_quote = {
+                "symbol": symbol, "price": 0, "change": 0, "change_pct": 0,
+                "open": 0, "high": 0, "low": 0, "prev_close": 0, "volume": 0,
+                "timestamp": None, "received_at": now.isoformat(),
+                "source": "yfinance", "data_age_seconds": None,
+                "data_status": "UNAVAILABLE", "error": str(e),
+            }
+            return {"quote": fallback_quote, "df": pd.DataFrame()}
 
     async def get_ohlcv(self, symbol: str, timeframe: str = "1d", days: int = 5) -> pd.DataFrame:
         ns_sym = self._ns_symbol(symbol)

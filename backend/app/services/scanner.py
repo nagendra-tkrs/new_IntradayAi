@@ -53,9 +53,8 @@ class MarketScanner:
             "sector": inst.get("sector", "Unknown"),
         }
         try:
-            df = await self.provider.get_intraday_bars(symbol, timeframe="5m")
-            quote = await self.provider.get_quote(symbol)
-            return {**base, "_df": df, "_quote": quote, "_error": None}
+            combined = await self.provider.get_quote_and_bars(symbol, timeframe="5m")
+            return {**base, "_df": combined["df"], "_quote": combined["quote"], "_error": None}
         except Exception as e:
             return {**base, "_df": None, "_quote": None, "_error": str(e)}
 
@@ -114,6 +113,7 @@ class MarketScanner:
             market_context=market_ctx,
             data_age_seconds=data_age,
             data_status=data_status_val,
+            market_data_timestamp=quote.get("timestamp"),
         )
         if signal:
             result["signal"] = signal["direction"]
@@ -151,12 +151,14 @@ class MarketScanner:
     async def scan_symbol(self, symbol: str) -> Optional[dict]:
         try:
             market_ctx = await self._get_market_context()
-            df = await self.provider.get_intraday_bars(symbol, timeframe="5m")
+            combined = await self.provider.get_quote_and_bars(symbol, timeframe="5m")
+            df = combined["df"]
+            quote = combined["quote"]
+
             if df is None or len(df) < 55:
                 return None
 
             df = calculate_all_indicators(df)
-            quote = await self.provider.get_quote(symbol)
             row = df.iloc[-1]
 
             data_status_val = quote.get("data_status", "UNKNOWN")
@@ -164,11 +166,12 @@ class MarketScanner:
             should_trade, trade_reason = data_status.should_trade(symbol)
 
             signal = evaluate_signal(
-                df, symbol, 
-                data_source=self.provider.data_source_label, 
+                df, symbol,
+                data_source=self.provider.data_source_label,
                 market_context=market_ctx,
                 data_age_seconds=data_age,
                 data_status=data_status_val,
+                market_data_timestamp=quote.get("timestamp"),
             )
 
             return {
