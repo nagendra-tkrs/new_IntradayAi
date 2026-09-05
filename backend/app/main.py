@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
+from sqlalchemy import select
 from app.core.config import settings
 from app.core.database import init_db
 from app.api.auth import router as auth_router, verify_token
@@ -32,6 +33,35 @@ class AuthMiddleware(BaseHTTPMiddleware):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    # Best-effort: ensure a default user exists so authenticated endpoints work
+    # even when Google OAuth is not configured or used.
+    try:
+        from app.core.database import async_session
+        from app.models.models import User
+        from sqlalchemy import select
+        async with async_session() as db:
+            result = await db.execute(select(User).where(User.email == "default@intradayai.local"))
+            user = result.scalar_one_or_none()
+            if not user:
+                user = User(
+                    email="default@intradayai.local",
+                    name="Default User",
+                    auth_provider="system",
+                )
+                db.add(user)
+                await db.commit()
+                await db.refresh(user)
+    except Exception:
+        pass
+    # Best-effort: seed/backfill known company sectors into the instruments table
+    # so existing companies display a real sector. Never blocks startup, never
+    # overwrites a valid existing sector.
+    try:
+        from app.services.instrument_service import backfill_known_sectors, backfill_missing_sectors
+        await backfill_known_sectors()
+        await backfill_missing_sectors()
+    except Exception:
+        pass
     yield
 
 

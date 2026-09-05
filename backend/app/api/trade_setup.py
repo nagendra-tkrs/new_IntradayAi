@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
 from app.core.market_session import now_ist
@@ -155,4 +156,23 @@ async def clear_trade_setup(
         "direction": None,
         "override_active": False,
         "user_setup_updated_at": None,
+    }
+
+
+@router.get("/trade-setups")
+async def get_all_user_setups(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return all of the authenticated user's custom trade setups keyed by symbol.
+
+    This batch endpoint is used by the Scanner page so the frontend can load
+    every override in a single request and merge them with scan results
+    without N+1 per-symbol calls."""
+    result = await db.execute(
+        select(UserTradeSetup).where(UserTradeSetup.user_id == user.id)
+    )
+    setups = result.scalars().all()
+    return {
+        "setups": {s.symbol: _serialize(s) for s in setups}
     }

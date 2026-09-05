@@ -619,7 +619,7 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
             <IndicatorPanel indicators={indicators} />
           </div>
           <div>
-            {signal && signal.direction !== "NO TRADE" ? (
+            {signal && signal.direction !== "NO_TRADE" ? (
               <SignalCard signal={signal} />
             ) : (
               <div className="card">

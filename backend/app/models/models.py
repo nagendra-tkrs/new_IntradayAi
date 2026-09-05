@@ -77,6 +77,7 @@ class Signal(Base):
 class Trade(Base):
     __tablename__ = "trades"
     id = Column(String(16), primary_key=True, default=gen_id)
+    user_id = Column(String(16), ForeignKey("users.id"), nullable=False)
     signal_id = Column(String(16), ForeignKey("signals.id"))
     symbol = Column(String(50), nullable=False, index=True)
     direction = Column(String(10), nullable=False)
@@ -88,7 +89,7 @@ class Trade(Base):
     target_2 = Column(Float)
     entry_time = Column(DateTime, nullable=False)
     exit_time = Column(DateTime)
-    status = Column(String(20), default="open")
+    status = Column(String(20), default="closed")
     pnl = Column(Float, default=0.0)
     fees = Column(Float, default=0.0)
     slippage = Column(Float, default=0.0)

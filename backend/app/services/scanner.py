@@ -6,6 +6,9 @@ from typing import Optional
 from app.services.market_data.base import MarketDataProvider
 from app.services.indicators import calculate_all_indicators
 from app.services.signal_engine import evaluate_signal
+from app.services.signal_snapshot import set_signal, get_signal, invalidate_symbol
+from app.services.signal_snapshot import set_signal, get_signal
+from app.models.schemas import SignalDirection
 from app.core.market_session import now_ist, is_market_hours
 from app.services.data_validation import data_status
 
@@ -76,7 +79,7 @@ class MarketScanner:
 
         if df is None or len(df) < 55:
             return {**base, "price": 0, "change_pct": 0, "volume": 0,
-                    "signal": "NO TRADE", "confidence": 0,
+                    "signal": SignalDirection.NO_TRADE.value, "confidence": 0,
                     "data_status": "UNAVAILABLE", "reason": "Insufficient candle history"}
 
         df = calculate_all_indicators(df)
@@ -88,9 +91,9 @@ class MarketScanner:
 
         if not should_trade:
             return {**base, "price": quote["price"], "change_pct": quote["change_pct"],
-                    "volume": quote["volume"], "signal": "NO TRADE", "confidence": 0,
-                    "data_status": data_status_val, "data_age_seconds": data_age,
-                    "reason": trade_reason}
+                    "volume": quote["volume"], "signal": SignalDirection.NO_TRADE.value,
+                    "confidence": 0, "data_status": data_status_val,
+                    "data_age_seconds": data_age, "reason": trade_reason}
 
         result = {**base, "price": quote["price"], "change_pct": quote["change_pct"],
                   "volume": quote["volume"], "data_status": data_status_val,
@@ -119,10 +122,33 @@ class MarketScanner:
             result["signal"] = signal["direction"]
             result["confidence"] = signal["confidence"]
             result["signal_data"] = signal
+            # Store signal snapshot in shared store for stock_detail to use
+            set_signal(symbol, {
+                "direction": signal["direction"],
+                "confidence": signal["confidence"],
+                "signal_data": signal,
+                "signal_generated_at": signal.get("signal_generated_at"),
+                "data_timestamp": signal.get("market_data_timestamp"),
+                "data_age_seconds": data_age,
+                "data_status": data_status_val,
+                "timeframe": "5m",
+                "snapshot_id": f"{symbol}_{int(time.time())}",
+            })
         else:
-            result["signal"] = "NO TRADE"
+            result["signal"] = SignalDirection.NO_TRADE.value
             result["confidence"] = 0
             result["signal_data"] = None
+            # Clear any stale snapshot for this symbol
+            invalidate_symbol(symbol)
+            result["signal_snapshot"] = {
+                "signal_generated_at": None,
+                "data_timestamp": None,
+                "candle_timestamp": None,
+                "data_status": data_status_val,
+                "data_age_seconds": data_age,
+                "timeframe": "5m",
+                "snapshot_id": f"{symbol}_{int(time.time())}",
+            }
 
         return result
 

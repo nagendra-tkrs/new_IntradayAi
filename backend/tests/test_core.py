@@ -87,8 +87,8 @@ def test_signal_engine():
     assert "explanation" in signal
     assert "signal_score" in signal
     assert signal["direction"] in [
-        "STRONG LONG", "LONG", "WEAK LONG", "NO TRADE",
-        "WEAK SHORT", "SHORT", "STRONG SHORT"
+        "STRONG_LONG", "LONG", "WEAK_LONG", "NO_TRADE",
+        "WEAK_SHORT", "SHORT", "STRONG_SHORT"
     ]
 
 
@@ -114,7 +114,9 @@ def test_paper_trading():
     pt = PaperTradingEngine()
     initial = pt.get_portfolio_summary()["cash"]
     result = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
-    assert result["status"] == "filled"
+    assert result["status"] == "pending"
+    assert pt.get_portfolio_summary()["positions_count"] == 0
+    assert pt.fill_order(result["order_id"])["status"] == "filled"
     assert pt.get_portfolio_summary()["positions_count"] == 1
     close_result = pt.close_position(result["order_id"], 2500.0)
     assert close_result["pnl"] > 0

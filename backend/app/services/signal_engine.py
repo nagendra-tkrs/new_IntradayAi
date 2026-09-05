@@ -8,7 +8,10 @@ from app.models.schemas import (
 )
 from app.services.indicators import calculate_all_indicators
 from app.core.market_session import now_ist
+from app.services.strategy_config import get_strategy
 import uuid
+
+CRITICAL_INDICATORS = ["atr_14", "adx_14", "vwap", "rsi_14", "relative_volume"]
 
 
 def _normalize(value: float, min_val: float, max_val: float) -> float:
@@ -296,57 +299,67 @@ def compute_confidence(score: SignalScore, direction: SignalDirection) -> float:
     return round(confidence, 1)
 
 
-def evaluate_signal(
-    df: pd.DataFrame,
-    symbol: str,
-    strategy: str = "multi_factor",
-    data_source: DataSource = DataSource.MOCK,
+def evaluate_row_signal(
+    row: pd.Series,
     market_context: dict | None = None,
-    data_age_seconds: int | None = None,
-    data_status: str = "UNKNOWN",
-    market_data_timestamp: datetime | None = None,
+    strategy_version=None,
 ) -> Optional[dict]:
-    # Data quality checks
-    if data_status in ("STALE", "UNAVAILABLE", "DELAYED"):
-        return {"direction": SignalDirection.NO_TRADE, "confidence": 0.0,
-                "reasons": [f"Data quality: {data_status} (age: {data_age_seconds}s)"],
-                "risks": ["Stale or delayed data"]}
-    
-    if data_age_seconds is not None and data_age_seconds > 1800:  # 30 min
-        return {"direction": SignalDirection.NO_TRADE, "confidence": 0.0,
-                "reasons": [f"Data too old: {data_age_seconds}s"],
-                "risks": ["Excessive data age"]}
-    
-    if len(df) < 55:
-        return {"direction": SignalDirection.NO_TRADE, "confidence": 0.0,
-                "reasons": ["Insufficient candle history"],
-                "risks": ["Insufficient data"]}
-    
+    """Pure per-row signal decision — the single source of truth for direction,
+    confidence, trade setup, and explanation.
+
+    Used by BOTH `evaluate_signal` (live/scanner/stock detail) and the backtest
+    engine so every consumer derives identical signals from the same candle.
+
+    Returns a dict with keys:
+        direction, confidence, signal_score, setup, reasons, risks
+    or None when critical indicator / OHLC data is missing.
+    """
     # Check critical indicators
-    row = df.iloc[-1]
-    critical_indicators = ["atr_14", "adx_14", "vwap", "rsi_14", "relative_volume"]
-    for ind in critical_indicators:
+    for ind in CRITICAL_INDICATORS:
         val = row.get(ind, np.nan)
         if pd.isna(val) or (isinstance(val, float) and np.isnan(val)):
-            return {"direction": SignalDirection.NO_TRADE, "confidence": 0.0,
-                    "reasons": [f"Missing critical indicator: {ind}"],
-                    "risks": ["Incomplete indicator data"]}
-    
+            return {
+                "direction": SignalDirection.NO_TRADE,
+                "confidence": 0.0,
+                "signal_score": SignalScore(),
+                "setup": TradeSetup(),
+                "reasons": [f"Missing critical indicator: {ind}"],
+                "risks": ["Incomplete indicator data"],
+            }
+
     # Check OHLC validity
-    o, h, l, c = row.get("open", np.nan), row.get("high", np.nan), row.get("low", np.nan), row.get("close", np.nan)
+    o = row.get("open", np.nan)
+    h = row.get("high", np.nan)
+    l = row.get("low", np.nan)
+    c = row.get("close", np.nan)
     if pd.isna(o) or pd.isna(h) or pd.isna(l) or pd.isna(c):
-        return {"direction": SignalDirection.NO_TRADE, "confidence": 0.0,
-                "reasons": ["Invalid OHLC data"],
-                "risks": ["Invalid price data"]}
+        return {
+            "direction": SignalDirection.NO_TRADE,
+            "confidence": 0.0,
+            "signal_score": SignalScore(),
+            "setup": TradeSetup(),
+            "reasons": ["Invalid OHLC data"],
+            "risks": ["Invalid price data"],
+        }
     if not (o > 0 and h > 0 and l > 0 and c > 0):
-        return {"direction": SignalDirection.NO_TRADE, "confidence": 0.0,
-                "reasons": ["Non-positive price"],
-                "risks": ["Invalid price data"]}
+        return {
+            "direction": SignalDirection.NO_TRADE,
+            "confidence": 0.0,
+            "signal_score": SignalScore(),
+            "setup": TradeSetup(),
+            "reasons": ["Non-positive price"],
+            "risks": ["Invalid price data"],
+        }
     if not (h >= max(o, c) and l <= min(o, c)):
-        return {"direction": SignalDirection.NO_TRADE, "confidence": 0.0,
-                "reasons": ["Invalid OHLC relationship"],
-                "risks": ["Invalid price data"]}
-    
+        return {
+            "direction": SignalDirection.NO_TRADE,
+            "confidence": 0.0,
+            "signal_score": SignalScore(),
+            "setup": TradeSetup(),
+            "reasons": ["Invalid OHLC relationship"],
+            "risks": ["Invalid price data"],
+        }
+
     trend_score, trend_reasons = score_trend(row)
     momentum_score, momentum_reasons = score_momentum(row)
     volume_score, volume_reasons = score_volume(row)
@@ -365,80 +378,150 @@ def evaluate_signal(
         risk_quality_score=risk_score,
         total=total,
     )
-    direction = determine_direction(total)
-    if direction == SignalDirection.NO_TRADE:
-        confidence = 0.0
-        setup = TradeSetup()
-        all_reasons = ["No clear signal - multiple confirmations not met"]
-        all_risks = ["Insufficient confluence for a quality setup"]
+
+    if strategy_version is not None:
+        direction = strategy_version.determine_direction(total)
     else:
-        # Try STRONG signal quality checks first
-        is_strong = direction in (SignalDirection.STRONG_LONG, SignalDirection.STRONG_SHORT)
-        
-        confidence = compute_confidence(signal_score, direction)
-        setup = compute_trade_setup(row, direction)
-        
-        adx_val = row.get("adx_14", np.nan)
-        rel_vol = row.get("relative_volume", np.nan)
-        vwap = row.get("vwap", np.nan)
-        price = row.get("close", np.nan)
-        rsi_val = row.get("rsi_14", np.nan)
-        
-        # Check R:R first
+        direction = determine_direction(total)
+
+    if direction == SignalDirection.NO_TRADE:
+        return {
+            "direction": direction,
+            "confidence": 0.0,
+            "signal_score": signal_score,
+            "setup": TradeSetup(),
+            "reasons": ["No clear signal - multiple confirmations not met"],
+            "risks": ["Insufficient confluence for a quality setup"],
+        }
+
+    is_strong = direction in (SignalDirection.STRONG_LONG, SignalDirection.STRONG_SHORT)
+
+    confidence = compute_confidence(signal_score, direction)
+    setup = compute_trade_setup(row, direction, strategy_version)
+
+    adx_val = row.get("adx_14", np.nan)
+    rel_vol = row.get("relative_volume", np.nan)
+    vwap = row.get("vwap", np.nan)
+    price = row.get("close", np.nan)
+    rsi_val = row.get("rsi_14", np.nan)
+
+    if strategy_version is not None:
+        min_rr_strong = strategy_version.min_rr_strong
+        min_rr_normal = strategy_version.min_rr_normal
+    else:
         min_rr_strong = 2.0
         min_rr_normal = 1.2
-        rr_ok_strong = setup.risk_reward_ratio >= min_rr_strong
-        rr_ok_normal = setup.risk_reward_ratio >= min_rr_normal
-        
-        # Check STRONG quality filters
-        strong_rejections = []
+
+    rr_ok_strong = setup.risk_reward_ratio >= min_rr_strong
+    rr_ok_normal = setup.risk_reward_ratio >= min_rr_normal
+
+    strong_rejections = []
+    if is_strong:
+        if pd.isna(adx_val) or adx_val < (strategy_version.strong_min_adx if strategy_version else 25):
+            strong_rejections.append("ADX < 25")
+        if pd.isna(rel_vol) or rel_vol < (strategy_version.strong_min_rel_vol if strategy_version else 1.0):
+            strong_rejections.append("RelVol < 1.0")
+        if not pd.isna(vwap) and not pd.isna(price):
+            if direction == SignalDirection.STRONG_LONG and price <= vwap:
+                strong_rejections.append("Price <= VWAP")
+            if direction == SignalDirection.STRONG_SHORT and price >= vwap:
+                strong_rejections.append("Price >= VWAP")
+        if not pd.isna(rsi_val):
+            if direction == SignalDirection.STRONG_LONG and rsi_val > (strategy_version.strong_max_rsi_long if strategy_version else 75):
+                strong_rejections.append("RSI > 75")
+            if direction == SignalDirection.STRONG_SHORT and rsi_val < (strategy_version.strong_max_rsi_short if strategy_version else 25):
+                strong_rejections.append("RSI < 25")
+
+    strong_quality_ok = is_strong and rr_ok_strong and not strong_rejections
+    normal_quality_ok = rr_ok_normal
+
+    all_reasons = trend_reasons + momentum_reasons + volume_reasons + vwap_reasons + pa_reasons
+    all_risks = list(risk_reasons)
+
+    if strong_quality_ok:
+        if confidence < 60:
+            all_risks.append("Low confidence score")
+    elif normal_quality_ok:
+        # Fall back to normal LONG/SHORT, preserving the original direction's
+        # polarity (fixes the previous inversion bug where LONG/WEAK_LONG leaked
+        # into the SHORT branch).
         if is_strong:
-            if pd.isna(adx_val) or adx_val < 25:
-                strong_rejections.append("ADX < 25")
-            if pd.isna(rel_vol) or rel_vol < 1.0:
-                strong_rejections.append("RelVol < 1.0")
-            if not pd.isna(vwap) and not pd.isna(price):
-                if direction == SignalDirection.STRONG_LONG and price <= vwap:
-                    strong_rejections.append("Price <= VWAP")
-                if direction == SignalDirection.STRONG_SHORT and price >= vwap:
-                    strong_rejections.append("Price >= VWAP")
-            if not pd.isna(rsi_val):
-                if direction == SignalDirection.STRONG_LONG and rsi_val > 75:
-                    strong_rejections.append("RSI > 75")
-                if direction == SignalDirection.STRONG_SHORT and rsi_val < 25:
-                    strong_rejections.append("RSI < 25")
-        
-        # Determine final direction
-        strong_quality_ok = is_strong and rr_ok_strong and not strong_rejections
-        normal_quality_ok = rr_ok_normal
-        
-        if strong_quality_ok:
-            # Keep STRONG signal
-            all_reasons = trend_reasons + momentum_reasons + volume_reasons + vwap_reasons + pa_reasons
-            all_risks = risk_reasons
-            if confidence < 60:
-                all_risks.append("Low confidence score")
-        elif normal_quality_ok:
-            # Fall back to normal LONG/SHORT
-            direction = SignalDirection.LONG if direction == SignalDirection.STRONG_LONG else SignalDirection.SHORT
-            confidence = compute_confidence(signal_score, direction)
-            setup = compute_trade_setup(row, direction)
-            all_reasons = trend_reasons + momentum_reasons + volume_reasons + vwap_reasons + pa_reasons
-            all_risks = risk_reasons
-            if confidence < 60:
-                all_risks.append("Low confidence score (downgraded from STRONG)")
+            direction = (
+                SignalDirection.LONG
+                if direction == SignalDirection.STRONG_LONG
+                else SignalDirection.SHORT
+            )
+        confidence = compute_confidence(signal_score, direction)
+        setup = compute_trade_setup(row, direction, strategy_version)
+        if confidence < 60:
+            all_risks.append("Low confidence score (downgraded from STRONG)")
+    else:
+        direction = SignalDirection.NO_TRADE
+        confidence = 0.0
+        setup = TradeSetup()
+        if is_strong and not rr_ok_strong:
+            all_reasons = [f"Setup rejected: risk/reward below STRONG threshold ({min_rr_strong})"]
+        elif is_strong and strong_rejections:
+            all_reasons = ["Strong signal rejected: " + "; ".join(strong_rejections)]
         else:
-            direction = SignalDirection.NO_TRADE
-            confidence = 0.0
-            setup = TradeSetup()
-            if is_strong and not rr_ok_strong:
-                all_reasons = [f"Setup rejected: risk/reward below STRONG threshold (2.0)"]
-            elif is_strong and strong_rejections:
-                all_reasons = ["Strong signal rejected: " + "; ".join(strong_rejections)]
-            else:
-                all_reasons = [f"Setup rejected: risk/reward below minimum threshold (1.2)"]
-            all_risks = ["Poor risk/reward ratio"]
-    explanation = SignalExplanation(reasons=all_reasons, risks=all_risks)
+            all_reasons = [f"Setup rejected: risk/reward below minimum threshold ({min_rr_normal})"]
+        all_risks = ["Poor risk/reward ratio"]
+
+    return {
+        "direction": direction,
+        "confidence": confidence,
+        "signal_score": signal_score,
+        "setup": setup,
+        "reasons": all_reasons,
+        "risks": all_risks,
+    }
+
+
+def evaluate_signal(
+    df: pd.DataFrame,
+    symbol: str,
+    strategy: str = "multi_factor",
+    data_source: DataSource = DataSource.MOCK,
+    market_context: dict | None = None,
+    data_age_seconds: int | None = None,
+    data_status: str = "UNKNOWN",
+    market_data_timestamp: datetime | None = None,
+    strategy_version=None,
+) -> Optional[dict]:
+    # Data quality checks
+    if data_status in ("STALE", "UNAVAILABLE", "DELAYED"):
+        return {"direction": SignalDirection.NO_TRADE, "confidence": 0.0,
+                "reasons": [f"Data quality: {data_status} (age: {data_age_seconds}s)"],
+                "risks": ["Stale or delayed data"]}
+    
+    if data_age_seconds is not None and data_age_seconds > 1800:  # 30 min
+        return {"direction": SignalDirection.NO_TRADE, "confidence": 0.0,
+                "reasons": [f"Data too old: {data_age_seconds}s"],
+                "risks": ["Excessive data age"]}
+    
+    if len(df) < 55:
+        return {"direction": SignalDirection.NO_TRADE, "confidence": 0.0,
+                "reasons": ["Insufficient candle history"],
+                "risks": ["Insufficient data"]}
+    
+    row = df.iloc[-1]
+    sv = get_strategy(strategy_version) if strategy_version is not None else None
+    decision = evaluate_row_signal(row, market_context=market_context, strategy_version=sv)
+
+    if decision is None:
+        return {
+            "direction": SignalDirection.NO_TRADE,
+            "confidence": 0.0,
+            "reasons": ["Insufficient data for signal"],
+            "risks": ["Insufficient data"],
+        }
+
+    direction = decision["direction"]
+    confidence = decision["confidence"]
+    signal_score = decision["signal_score"]
+    setup = decision["setup"]
+    explanation = SignalExplanation(reasons=decision["reasons"], risks=decision["risks"])
+
     indicator_values = {}
     for col in ["ema_9", "ema_20", "ema_50", "rsi_14", "macd", "macd_signal",
                 "macd_histogram", "atr_14", "adx_14", "vwap", "bb_upper", "bb_lower",
@@ -471,6 +554,8 @@ def evaluate_signal(
         "signal_score": signal_score.model_dump(),
         "setup": setup.model_dump(),
         "explanation": explanation.model_dump(),
+        "reasons": explanation.reasons,
+        "risks": explanation.risks,
         "strategy": strategy,
         "data_source": data_source,
         "indicator_values": indicator_values,

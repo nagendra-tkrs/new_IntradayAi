@@ -535,20 +535,44 @@ class YFinanceMarketDataProvider(MarketDataProvider):
         if self._instruments_cache is not None and self._instruments_ts and (now - self._instruments_ts) < 3600:
             return self._instruments_cache
 
+        from app.services.market_data.sector_map import get_sector, get_name
         symbols = NSE_UNIVERSES.get(universe, NSE_UNIVERSES["NIFTY50"])
         instruments = []
         for sym in symbols:
             clean = self._strip_ns(sym)
             instruments.append({
                 "symbol": clean,
-                "name": clean,
+                "name": get_name(clean),
                 "exchange": "NSE",
-                "sector": "Unknown",
+                "sector": get_sector(clean),
                 "yfinance_symbol": sym,
             })
 
+        # Enrich with live sector metadata when available. We never overwrite a
+        # reliable static/known sector with "Unknown", so this only upgrades the
+        # value with data from the live provider.
+        try:
+            from app.services.sector_resolver import sector_resolver
+            clean_symbols = [self._strip_ns(s) for s in symbols]
+            sectors = await sector_resolver.resolve_batch(clean_symbols)
+            for inst in instruments:
+                sector = sectors.get(inst["symbol"])
+                if sector and sector != "Unknown":
+                    inst["sector"] = sector
+        except Exception:
+            logger.debug("Sector enrichment skipped; using static fallback")
+
         self._instruments_cache = instruments
         self._instruments_ts = now
+
+        # Persist resolved sectors best-effort (never blocks the response). This
+        # writes into the instruments table so sectors are stored and reused.
+        try:
+            from app.services.instrument_service import persist_sectors
+            asyncio.create_task(persist_sectors(instruments))
+        except Exception:
+            pass
+
         return instruments
 
     async def get_market_index(self, index_name: str = "NIFTY50") -> dict:

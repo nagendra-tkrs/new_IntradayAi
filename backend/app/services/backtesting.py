@@ -3,7 +3,7 @@ import numpy as np
 from datetime import datetime
 from typing import Optional
 from app.services.indicators import calculate_all_indicators
-from app.services.signal_engine import evaluate_signal, compute_trade_setup
+from app.services.signal_engine import evaluate_row_signal
 from app.models.schemas import SignalDirection
 from app.core.market_session import IST
 from app.services.strategy_config import get_strategy, StrategyVersion
@@ -236,7 +236,7 @@ class BacktestEngine:
                         'signal_bar': entry_time,
                         'entry_time': entry_time,
                         'exit_time': exit_ts,
-                        'direction': str(direction),
+                        'direction': pos['signal_info'].get('direction'),
                         'signal_score': signal_info.get('score', 0),
                         'confidence': signal_info.get('confidence', 0),
                         'entry': round(actual_entry, 2),
@@ -266,190 +266,34 @@ class BacktestEngine:
             if open_position is None and i + 1 < len(df_reset):
                 next_idx = i + 1
                 current_row_eval = df_reset.iloc[i]
-                
-                # Fast inline signal evaluation (avoids DataFrame copy per bar)
-                row = current_row_eval
-                critical_indicators = ["atr_14", "adx_14", "vwap", "rsi_14", "relative_volume"]
-                skip_signal = False
-                for ind in critical_indicators:
-                    val = row.get(ind, np.nan)
-                    if pd.isna(val) or (isinstance(val, float) and np.isnan(val)):
-                        skip_signal = True
-                        break
-                if skip_signal:
+
+                # Row-level signal decision — single source of truth shared with
+                # live signal generation (scanner / stock detail / dashboard).
+                # This centralizes scoring, direction, strong-quality checks,
+                # STRONG->normal downgrade and R:R enforcement in one place so the
+                # backtest can never diverge from the live signal engine.
+                decision = evaluate_row_signal(
+                    current_row_eval,
+                    market_context=None,
+                    strategy_version=sv,
+                )
+                if decision is None:
                     continue
-                
-                o = row.get("open", np.nan)
-                h = row.get("high", np.nan)
-                l = row.get("low", np.nan)
-                c = row.get("close", np.nan)
-                if pd.isna(o) or pd.isna(h) or pd.isna(l) or pd.isna(c):
+
+                direction_enum = decision["direction"]
+                if direction_enum == SignalDirection.NO_TRADE:
                     continue
-                if not (o > 0 and h > 0 and l > 0 and c > 0):
-                    continue
-                if not (h >= max(o, c) and l <= min(o, c)):
-                    continue
-                
-                # Score components
-                ema_9 = row.get("ema_9", np.nan)
-                ema_20 = row.get("ema_20", np.nan)
-                ema_50 = row.get("ema_50", np.nan)
-                adx = row.get("adx_14", np.nan)
-                rsi = row.get("rsi_14", 50)
-                macd_hist = row.get("macd_histogram", 0)
-                roc = row.get("roc_5", 0)
-                rel_vol = row.get("relative_volume", 1.0)
-                vwap_val = row.get("vwap", np.nan)
-                price = c
-                dist = row.get("distance_from_vwap", 0)
-                or_high = row.get("opening_range_high", np.nan)
-                or_low = row.get("opening_range_low", np.nan)
-                prev_high = row.get("prev_high", np.nan)
-                prev_low = row.get("prev_low", np.nan)
-                bb_upper = row.get("bb_upper", np.nan)
-                bb_lower = row.get("bb_lower", np.nan)
-                vol_20 = row.get("volatility_20", np.nan)
-                
-                # Trend score (max 20)
-                trend_score = 0.0
-                if not pd.isna(ema_9) and not pd.isna(ema_20) and not pd.isna(ema_50):
-                    if ema_9 > ema_20 > ema_50:
-                        trend_score = 20
-                    elif ema_9 > ema_20:
-                        trend_score = 12
-                    elif ema_9 < ema_20 < ema_50:
-                        trend_score = 0
-                    elif ema_9 < ema_20:
-                        trend_score = 6
-                if not pd.isna(adx):
-                    if adx > 25:
-                        trend_score = min(20, trend_score + 2)
-                    elif adx < 15:
-                        trend_score = max(0, trend_score - 3)
-                
-                # Momentum score (max 15)
-                momentum_score = 0.0
-                if not pd.isna(rsi):
-                    if 40 <= rsi <= 60:
-                        momentum_score += 5
-                    elif 30 <= rsi < 40:
-                        momentum_score += 8
-                    elif rsi < 30:
-                        momentum_score += 3
-                    elif 60 < rsi <= 70:
-                        momentum_score += 8
-                    elif rsi > 70:
-                        momentum_score += 3
-                if not pd.isna(macd_hist):
-                    if macd_hist > 0:
-                        momentum_score += 5
-                    else:
-                        momentum_score += 1
-                if not pd.isna(roc):
-                    if abs(roc) > 1:
-                        momentum_score += 2
-                momentum_score = min(15, momentum_score)
-                
-                # Volume score (max 15)
-                volume_score = 0.0
-                if pd.isna(rel_vol):
-                    volume_score = 0.0
-                elif rel_vol > 2.0:
-                    volume_score = 15
-                elif rel_vol > 1.5:
-                    volume_score = 12
-                elif rel_vol > 1.0:
-                    volume_score = 8
-                elif rel_vol > 0.5:
-                    volume_score = 4
-                else:
-                    volume_score = 1
-                
-                # VWAP score (max 15)
-                vwap_score = 0.0
-                if pd.isna(dist) or pd.isna(vwap_val) or vwap_val == 0:
-                    vwap_score = 0.0
-                elif dist > 0:
-                    vwap_score = min(15, 12 + min(3, dist * 2))
-                else:
-                    vwap_score = min(15, max(0, 12 + dist * 2))
-                
-                # Price action score (max 15)
-                pa_score = 0.0
-                if pd.isna(or_high) or pd.isna(or_low):
-                    pa_score = 7.5
-                else:
-                    if price > or_high:
-                        pa_score += 8
-                    elif price < or_low:
-                        pa_score += 8
-                    else:
-                        pa_score += 4
-                if not pd.isna(prev_high) and price > prev_high:
-                    pa_score += 4
-                if not pd.isna(prev_low) and price < prev_low:
-                    pa_score += 4
-                if not pd.isna(bb_upper) and price > bb_upper:
-                    pa_score += 3
-                elif not pd.isna(bb_lower) and price < bb_lower:
-                    pa_score += 3
-                pa_score = min(15, pa_score)
-                
-                # Market context score (max 10)
-                ctx_score = 5.0
-                
-                # Risk quality score (max 10)
-                risk_score = 0.0
-                if pd.isna(row.get("atr_14", np.nan)) or pd.isna(price) or price == 0:
-                    risk_score = 5.0
-                else:
-                    atr_val = row.get("atr_14", np.nan)
-                    atr_pct = (atr_val / price) * 100
-                    if 0.3 < atr_pct < 2.0:
-                        risk_score = 10
-                    elif atr_pct <= 0.3:
-                        risk_score = 3
-                    elif atr_pct >= 2.0:
-                        risk_score = 5
-                
-                total = trend_score + momentum_score + volume_score + vwap_score + pa_score + ctx_score + risk_score
-                
-                classified = sv.determine_direction(total)
-                if classified == SignalDirection.NO_TRADE:
-                    continue
-                if classified.is_weak:
-                    continue
-                if total < sv.min_score:
-                    continue
-                
-                direction_enum = classified
+
+                setup = decision["setup"]
+                confidence = decision["confidence"]
+                score_total = decision["signal_score"].total
                 direction_str = direction_enum.value
-                score_total = total
 
                 entry_row = df_reset.iloc[next_idx]
                 entry_price = entry_row['open']
                 signal_row = current_row
 
-                row_for_setup = signal_row.copy()
-                setup = compute_trade_setup(row_for_setup, direction_enum, sv)
-
-                min_rr = sv.get_min_rr(direction_enum)
-                if setup.risk_reward_ratio < min_rr:
-                    continue
-
                 is_long_signal = direction_enum.is_long
-
-                is_strong = direction_enum.is_strong
-                if is_strong:
-                    adx_val = signal_row.get('adx_14', 0)
-                    rel_vol = signal_row.get('relative_volume', 0)
-                    rsi_val = signal_row.get('rsi_14', 50)
-                    vwap_val = signal_row.get('vwap', 0)
-                    ok, rejections = sv.should_accept_strong(
-                        adx_val, rel_vol, rsi_val, entry_price, vwap_val, direction_enum
-                    )
-                    if not ok:
-                        continue
 
                 risk = abs(entry_price - setup.stop_loss)
                 if risk <= 0:
@@ -475,7 +319,7 @@ class BacktestEngine:
 
                 signal_info = {
                     'score': score_total,
-                    'confidence': round(min(100, score_total * 0.7 + 10), 1),
+                    'confidence': confidence,
                     'direction': direction_str,
                 }
                 setup_info = {

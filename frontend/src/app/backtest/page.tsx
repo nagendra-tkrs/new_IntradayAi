@@ -122,13 +122,13 @@ export default function BacktestPage() {
                     <tbody>
                       {result.trades.map((t: any, i: number) => (
                         <tr key={i}>
-                          <td><span className={`text-xs font-bold ${t.direction === "LONG" ? "text-green-400" : "text-red-400"}`}>{t.direction}</span></td>
+                          <td><span className={`text-xs font-bold ${String(t.direction).includes("LONG") ? "text-green-400" : "text-red-400"}`}>{String(t.direction).replace("SignalDirection.", "")}</span></td>
                           <td className="num">₹{t.entry?.toLocaleString()}</td>
                           <td className="num">₹{t.exit?.toLocaleString()}</td>
                           <td className="num">{t.quantity}</td>
                           <td className="num text-xs text-gray-400">₹{t.cost?.toFixed(2)}</td>
-                          <td className={`num font-semibold ${(t.pnl || 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
-                            ₹{t.pnl?.toLocaleString()}
+                          <td className={`num font-semibold ${(t.net_pnl || 0) >= 0 ? "text-green-400" : "text-red-400"}`}>
+                            ₹{t.net_pnl?.toLocaleString()}
                           </td>
                         </tr>
                       ))}

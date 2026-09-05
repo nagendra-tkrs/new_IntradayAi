@@ -129,3 +129,48 @@ export async function runBacktest(params: {
     body: JSON.stringify(params),
   });
 }
+
+export async function getAllUserSetups(): Promise<{
+  setups: Record<string, {
+    symbol: string;
+    entry: number | null;
+    stop_loss: number | null;
+    target: number | null;
+    risk_reward: number | null;
+    direction: string | null;
+    override_active: boolean;
+    user_setup_updated_at: string | null;
+  }>;
+}> {
+  return fetchAPI("/trade-setups");
+}
+
+export async function getPendingOrders() {
+  return fetchAPI("/paper/pending");
+}
+
+export async function editPendingOrder(orderId: string, payload: {
+  entry_price?: number;
+  stop_loss?: number;
+  target_1?: number;
+  target_2?: number;
+  quantity?: number;
+}) {
+  return fetchAPI(`/paper/orders/${orderId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function fillPendingOrder(orderId: string, fillPrice?: number) {
+  return fetchAPI(`/paper/orders/${orderId}/fill`, {
+    method: "POST",
+    body: JSON.stringify({ fill_price: fillPrice }),
+  });
+}
+
+export async function cancelPendingOrder(orderId: string) {
+  return fetchAPI(`/paper/orders/${orderId}`, {
+    method: "DELETE",
+  });
+}

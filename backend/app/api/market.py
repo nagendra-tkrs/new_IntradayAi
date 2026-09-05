@@ -131,8 +131,25 @@ async def stock_detail(
         chart_data = []
 
     from app.services.signal_engine import evaluate_signal
+    from app.services.signal_snapshot import get_signal, invalidate_symbol
     signal = None
-    if df is not None and len(df) >= 55 and should_trade:
+    # Check for a valid shared signal snapshot first
+    snapshot = get_signal(symbol)
+    if snapshot is not None:
+        # Snapshot is valid (within 5 min freshness window per SCAN_CACHE_TTL)
+        # Use the snapshot's signal if data quality is acceptable
+        data_status_val = quote.get("data_status", "UNKNOWN")
+        data_age = quote.get("data_age_seconds")
+        should_trade, _ = data_status.should_trade(symbol)
+        if should_trade and snapshot.get("data_age_seconds", 999) <= 300:
+            # Use the cached snapshot signal — signal stays tied to its originating data
+            direction = snapshot["direction"]
+            confidence = snapshot["confidence"]
+            signal = type('SignalObj', (object,), {"direction": direction, "confidence": confidence})()
+        else:
+            # Snapshot expired or data quality failed — fall through to recalculate
+            signal = None
+    if signal is None and df is not None and len(df) >= 55 and should_trade:
         market_ctx = await scanner._get_market_context()
         signal = evaluate_signal(
             df, symbol,
@@ -241,7 +258,7 @@ async def run_scanner(universe: str = "NIFTY50"):
     provider = _get_provider()
     scanner = _get_scanner()
     results = await scanner.scan_universe(universe)
-    top_signals = [r for r in results if r.get("signal") not in ("NO TRADE", "ERROR", None)]
+    top_signals = [r for r in results if r.get("signal") not in ("NO_TRADE", "ERROR", None)]
     top_signals.sort(key=lambda x: x.get("confidence", 0), reverse=True)
     ds = get_data_status()
     return {
