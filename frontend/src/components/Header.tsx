@@ -5,12 +5,13 @@ import { getMarketStatus, getMarketIndex, getDataStatus } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import type { DataStatus, MarketIndex, MarketStatus } from "@/lib/types";
 
 export default function Header() {
-  const [status, setStatus] = useState<any>(null);
-  const [nifty, setNifty] = useState<any>(null);
-  const [bankNifty, setBankNifty] = useState<any>(null);
-  const [dataStatus, setDataStatus] = useState<any>(null);
+  const [status, setStatus] = useState<MarketStatus | null>(null);
+  const [nifty, setNifty] = useState<MarketIndex | null>(null);
+  const [bankNifty, setBankNifty] = useState<MarketIndex | null>(null);
+  const [dataStatus, setDataStatus] = useState<DataStatus | null>(null);
   const pathname = usePathname();
   const { user, logout } = useAuth();
 
@@ -42,7 +43,7 @@ export default function Header() {
     { href: "/backtest", label: "Backtest" },
   ];
 
-  const getDataStatusColor = (s: any) => {
+  const getDataStatusColor = (s: DataStatus | null | undefined) => {
     if (!s) return "text-gray-500";
     const src = s.data_source || s.mode;
     if (src === "yfinance") {
@@ -55,7 +56,7 @@ export default function Header() {
     return "text-red-400";
   };
 
-  const getDataStatusText = (s: any) => {
+  const getDataStatusText = (s: DataStatus | null | undefined) => {
     if (!s) return "UNKNOWN";
     const src = s.data_source || s.mode;
     if (src === "yfinance") return "yfinance DATA";
@@ -64,7 +65,7 @@ export default function Header() {
     return src?.toUpperCase() || "UNKNOWN";
   };
 
-  const getDataStatusDot = (s: any) => {
+  const getDataStatusDot = (s: DataStatus | null | undefined) => {
     if (!s) return "bg-gray-500";
     const src = s.data_source || s.mode;
     if (src === "yfinance") {

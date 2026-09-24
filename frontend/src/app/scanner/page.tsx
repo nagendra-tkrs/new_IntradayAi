@@ -11,8 +11,11 @@ import {
   placePaperOrder,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import type { ScannerResponse, ScannerResult, SignalSetup, TradeSetup } from "@/lib/types";
 
 type FilterType = "all" | "long" | "short" | "strong" | "high_volume" | "no_trade";
+
+type SortKey = "symbol" | "price" | "change_pct" | "volume" | "relative_volume" | "rsi" | "adx" | "distance_from_vwap" | "confidence";
 
 const SCANNER_REFRESH_INTERVAL = 120000;
 
@@ -56,10 +59,10 @@ function validateSetup(
 }
 
 export default function ScannerPage() {
-  const [scanner, setScanner] = useState<any>(null);
+  const [scanner, setScanner] = useState<ScannerResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<FilterType>("all");
-  const [sortBy, setSortBy] = useState<string>("confidence");
+  const [sortBy, setSortBy] = useState<SortKey>("confidence");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   const { user, loading: authLoading } = useAuth();
@@ -68,7 +71,7 @@ export default function ScannerPage() {
   const isMountedRef = useRef(true);
 
   const [expandedSymbol, setExpandedSymbol] = useState<string | null>(null);
-  const [userSetups, setUserSetups] = useState<Record<string, any>>({});
+  const [userSetups, setUserSetups] = useState<Record<string, TradeSetup>>({});
   const [editingFields, setEditingFields] = useState<Record<string, { entry: string; stopLoss: string; target: string }>>({});
   const [orderQty, setOrderQty] = useState<Record<string, number>>({});
   const [orderMsg, setOrderMsg] = useState<Record<string, { type: "success" | "error"; text: string }>>({});
@@ -127,20 +130,19 @@ export default function ScannerPage() {
     };
   }, [authLoading, user]);
 
-  function getSignalDir(stock: any): string {
-    const sig = stock.signal || "";
+  function getSignalDir(stock: ScannerResult): string {
+    const sig = stock.signal as string | { direction?: string } | null | undefined;
     if (typeof sig === "string") return sig;
     if (sig?.direction) return sig.direction;
     return "NO_TRADE";
   }
 
-  function isLong(stock: any): boolean {
+  function isLong(stock: ScannerResult): boolean {
     return getSignalDir(stock).toUpperCase().includes("LONG");
   }
 
-  function getAiSetup(stock: any) {
-    const sd = stock.signal_data || stock.signal;
-    const setup = sd?.setup || {};
+  function getAiSetup(stock: ScannerResult) {
+    const setup: Partial<SignalSetup> = stock.signal_data?.setup || {};
     return {
       entry: setup.entry != null ? Number(setup.entry) : null,
       stopLoss: setup.stop_loss != null ? Number(setup.stop_loss) : null,
@@ -149,7 +151,7 @@ export default function ScannerPage() {
     };
   }
 
-  function getActiveSetup(stock: any) {
+  function getActiveSetup(stock: ScannerResult) {
     const sym = stock.symbol;
     const userSetup = userSetups[sym];
     const aiSetup = getAiSetup(stock);
@@ -165,7 +167,7 @@ export default function ScannerPage() {
     return { ...aiSetup, isCustom: false };
   }
 
-  function getEditingFields(stock: any) {
+  function getEditingFields(stock: ScannerResult) {
     const sym = stock.symbol;
     if (editingFields[sym]) return editingFields[sym];
     const active = getActiveSetup(stock);
@@ -176,20 +178,27 @@ export default function ScannerPage() {
     };
   }
 
-  function handleFieldChange(sym: string, field: "entry" | "stopLoss" | "target", value: string) {
-    setEditingFields((prev) => ({
-      ...prev,
-      [sym]: {
-        entry: prev[sym]?.entry ?? "",
-        stopLoss: prev[sym]?.stopLoss ?? "",
-        target: prev[sym]?.target ?? "",
-        [field]: value,
-      },
-    }));
+  function handleFieldChange(stock: ScannerResult, field: "entry" | "stopLoss" | "target", value: string) {
+    const sym = stock.symbol;
+    setEditingFields((prev) => {
+      if (prev[sym]) {
+        return { ...prev, [sym]: { ...prev[sym], [field]: value } };
+      }
+      const active = getActiveSetup(stock);
+      return {
+        ...prev,
+        [sym]: {
+          entry: active.entry != null ? String(active.entry) : "",
+          stopLoss: active.stopLoss != null ? String(active.stopLoss) : "",
+          target: active.target != null ? String(active.target) : "",
+          [field]: value,
+        },
+      };
+    });
     setOrderMsg((prev) => { const n = { ...prev }; delete n[sym]; return n; });
   }
 
-  function computeLiveRR(stock: any, fields: { entry: string; stopLoss: string; target: string }) {
+  function computeLiveRR(stock: ScannerResult, fields: { entry: string; stopLoss: string; target: string }) {
     const e = parseFloat(fields.entry);
     const sl = parseFloat(fields.stopLoss);
     const tgt = parseFloat(fields.target);
@@ -197,7 +206,7 @@ export default function ScannerPage() {
     return computeRiskReward(e, sl, tgt, isLong(stock));
   }
 
-  async function applySetup(stock: any) {
+  async function applySetup(stock: ScannerResult) {
     const sym = stock.symbol;
     const fields = getEditingFields(stock);
     const entryNum = parseFloat(fields.entry);
@@ -224,14 +233,14 @@ export default function ScannerPage() {
       });
       setUserSetups((prev) => ({ ...prev, [sym]: saved }));
       setOrderMsg((prev) => ({ ...prev, [sym]: { type: "success", text: "Setup saved." } }));
-    } catch (e: any) {
-      setOrderMsg((prev) => ({ ...prev, [sym]: { type: "error", text: e.message || "Failed to save." } }));
+    } catch (e) {
+      setOrderMsg((prev) => ({ ...prev, [sym]: { type: "error", text: e instanceof Error && e.message ? e.message : "Failed to save." } }));
     } finally {
       setSaving((prev) => ({ ...prev, [sym]: false }));
     }
   }
 
-  async function resetSetup(stock: any) {
+  async function resetSetup(stock: ScannerResult) {
     const sym = stock.symbol;
     setSaving((prev) => ({ ...prev, [sym]: true }));
     try {
@@ -248,14 +257,14 @@ export default function ScannerPage() {
         },
       }));
       setOrderMsg((prev) => ({ ...prev, [sym]: { type: "success", text: "Reset to AI values." } }));
-    } catch (e: any) {
-      setOrderMsg((prev) => ({ ...prev, [sym]: { type: "error", text: e.message || "Failed to reset." } }));
+    } catch (e) {
+      setOrderMsg((prev) => ({ ...prev, [sym]: { type: "error", text: e instanceof Error && e.message ? e.message : "Failed to reset." } }));
     } finally {
       setSaving((prev) => ({ ...prev, [sym]: false }));
     }
   }
 
-  async function handleOrder(stock: any, direction: "LONG" | "SHORT") {
+  async function handleOrder(stock: ScannerResult, direction: "LONG" | "SHORT") {
     const sym = stock.symbol;
     const fields = getEditingFields(stock);
     const entryNum = parseFloat(fields.entry);
@@ -289,8 +298,8 @@ export default function ScannerPage() {
         ...prev,
         [sym]: { type: "success", text: `${direction} order placed: ${qty} qty @ ₹${entryNum}` },
       }));
-    } catch (e: any) {
-      setOrderMsg((prev) => ({ ...prev, [sym]: { type: "error", text: e.message || "Order failed." } }));
+    } catch (e) {
+      setOrderMsg((prev) => ({ ...prev, [sym]: { type: "error", text: e instanceof Error && e.message ? e.message : "Order failed." } }));
     } finally {
       setSaving((prev) => ({ ...prev, [sym]: false }));
     }
@@ -300,21 +309,21 @@ export default function ScannerPage() {
     if (!scanner?.results) return [];
     let results = [...scanner.results];
     switch (filter) {
-      case "long": results = results.filter((r: any) => getSignalDir(r).includes("LONG")); break;
-      case "short": results = results.filter((r: any) => getSignalDir(r).includes("SHORT")); break;
-      case "strong": results = results.filter((r: any) => r.confidence >= 75); break;
-      case "high_volume": results = results.filter((r: any) => r.relative_volume >= 1.5); break;
-      case "no_trade": results = results.filter((r: any) => getSignalDir(r) === "NO_TRADE"); break;
+      case "long": results = results.filter((r) => getSignalDir(r).includes("LONG")); break;
+      case "short": results = results.filter((r) => getSignalDir(r).includes("SHORT")); break;
+      case "strong": results = results.filter((r) => r.confidence >= 75); break;
+      case "high_volume": results = results.filter((r) => r.relative_volume >= 1.5); break;
+      case "no_trade": results = results.filter((r) => getSignalDir(r) === "NO_TRADE"); break;
     }
-    results.sort((a: any, b: any) => {
+    results.sort((a, b) => {
       const aVal = a[sortBy] || 0;
       const bVal = b[sortBy] || 0;
-      return sortDir === "desc" ? bVal - aVal : aVal - bVal;
+      return sortDir === "desc" ? Number(bVal) - Number(aVal) : Number(aVal) - Number(bVal);
     });
     return results;
   }
 
-  function toggleSort(col: string) {
+  function toggleSort(col: SortKey) {
     if (sortBy === col) setSortDir(sortDir === "desc" ? "asc" : "desc");
     else { setSortBy(col); setSortDir("desc"); }
   }
@@ -390,7 +399,7 @@ export default function ScannerPage() {
                 </tr>
               </thead>
               <tbody>
-                {getFilteredResults().map((stock: any) => {
+                {getFilteredResults().map((stock) => {
                   const sym = stock.symbol;
                   const sigDir = getSignalDir(stock);
                   const active = getActiveSetup(stock);
@@ -463,7 +472,7 @@ export default function ScannerPage() {
         )}
 
         {expandedSymbol && (() => {
-          const stock = scanner?.results?.find((r: any) => r.symbol === expandedSymbol);
+          const stock = scanner?.results?.find((r) => r.symbol === expandedSymbol);
           if (!stock) return null;
           const sym = stock.symbol;
           const sigDir = getSignalDir(stock);
@@ -524,7 +533,7 @@ export default function ScannerPage() {
                             step="0.01"
                             inputMode="decimal"
                             value={fields.entry}
-                            onChange={(e) => handleFieldChange(sym, "entry", e.target.value)}
+                            onChange={(e) => handleFieldChange(stock, "entry", e.target.value)}
                             className="w-full pl-7 pr-2 py-1.5 bg-[#111827] border border-[#2d3548] rounded text-white text-sm"
                           />
                         </div>
@@ -538,7 +547,7 @@ export default function ScannerPage() {
                             step="0.01"
                             inputMode="decimal"
                             value={fields.stopLoss}
-                            onChange={(e) => handleFieldChange(sym, "stopLoss", e.target.value)}
+                            onChange={(e) => handleFieldChange(stock, "stopLoss", e.target.value)}
                             className="w-full pl-7 pr-2 py-1.5 bg-[#111827] border border-[#2d3548] rounded text-white text-sm"
                           />
                         </div>
@@ -552,7 +561,7 @@ export default function ScannerPage() {
                             step="0.01"
                             inputMode="decimal"
                             value={fields.target}
-                            onChange={(e) => handleFieldChange(sym, "target", e.target.value)}
+                            onChange={(e) => handleFieldChange(stock, "target", e.target.value)}
                             className="w-full pl-7 pr-2 py-1.5 bg-[#111827] border border-[#2d3548] rounded text-white text-sm"
                           />
                         </div>

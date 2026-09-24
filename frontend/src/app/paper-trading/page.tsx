@@ -7,15 +7,16 @@ import {
   editPendingOrder, fillPendingOrder, cancelPendingOrder,
   closePosition, getStocks, getPerformance,
 } from "@/lib/api";
+import type { Instrument, PaperPosition, PaperTrade, PendingOrder, Performance, Portfolio } from "@/lib/types";
 
 export default function PaperTradingPage() {
-  const [portfolio, setPortfolio] = useState<any>(null);
-  const [positions, setPositions] = useState<any[]>([]);
-  const [pendingOrders, setPendingOrders] = useState<any[]>([]);
-  const [trades, setTrades] = useState<any[]>([]);
-  const [stocks, setStocks] = useState<any[]>([]);
+  const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
+  const [positions, setPositions] = useState<PaperPosition[]>([]);
+  const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
+  const [trades, setTrades] = useState<PaperTrade[]>([]);
+  const [stocks, setStocks] = useState<Instrument[]>([]);
   const [loading, setLoading] = useState(true);
-  const [performance, setPerformance] = useState<any>(null);
+  const [performance, setPerformance] = useState<Performance | null>(null);
   const [editId, setEditId] = useState<string | null>(null);
   const [editFields, setEditFields] = useState<{ entry_price: string; stop_loss: string; target_1: string; quantity: string }>({
     entry_price: "", stop_loss: "", target_1: "", quantity: "",
@@ -61,7 +62,7 @@ export default function PaperTradingPage() {
     };
   }, []);
 
-  function startEdit(order: any) {
+  function startEdit(order: PendingOrder) {
     setEditId(order.id);
     setEditFields({
       entry_price: String(order.entry_price || ""),
@@ -99,9 +100,9 @@ export default function PaperTradingPage() {
       setEditMsg({ id: orderId, type: "success", text: "Order updated." });
       setEditId(null);
       loadData();
-    } catch (e: any) {
-      const msg = typeof e?.message === "string" ? e.message : "Update failed";
-      setEditMsg({ id: orderId, type: "error", text: Array.isArray(e?.message) ? e.message.join("; ") : msg });
+    } catch (e) {
+      const msg = e instanceof Error && typeof e.message === "string" ? e.message : "Update failed";
+      setEditMsg({ id: orderId, type: "error", text: msg });
     } finally {
       setSaving(null);
     }
@@ -112,8 +113,8 @@ export default function PaperTradingPage() {
     try {
       await fillPendingOrder(orderId);
       loadData();
-    } catch (e: any) {
-      setEditMsg({ id: orderId, type: "error", text: e?.message || "Fill failed" });
+    } catch (e) {
+      setEditMsg({ id: orderId, type: "error", text: e instanceof Error && e.message ? e.message : "Fill failed" });
     } finally {
       setSaving(null);
     }
@@ -124,8 +125,8 @@ export default function PaperTradingPage() {
     try {
       await cancelPendingOrder(orderId);
       loadData();
-    } catch (e: any) {
-      setEditMsg({ id: orderId, type: "error", text: e?.message || "Cancel failed" });
+    } catch (e) {
+      setEditMsg({ id: orderId, type: "error", text: e instanceof Error && e.message ? e.message : "Cancel failed" });
     } finally {
       setSaving(null);
     }
@@ -135,7 +136,7 @@ export default function PaperTradingPage() {
     try {
       await closePosition(posId);
       loadData();
-    } catch (e: any) {
+    } catch (e) {
       console.error(e);
     }
   }
@@ -162,14 +163,18 @@ export default function PaperTradingPage() {
         </div>
 
         {portfolio && (
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-6">
+          <div className="grid grid-cols-2 sm:grid-cols-6 gap-3 mb-6">
             <div className="card">
               <div className="text-[10px] text-gray-500 uppercase tracking-wider">Total Value</div>
               <div className="text-xl font-bold text-white mt-1">₹{portfolio.total_value?.toLocaleString()}</div>
             </div>
             <div className="card">
-              <div className="text-[10px] text-gray-500 uppercase tracking-wider">Cash</div>
-              <div className="text-xl font-bold text-blue-400 mt-1">₹{portfolio.cash?.toLocaleString()}</div>
+              <div className="text-[10px] text-gray-500 uppercase tracking-wider">Available Cash</div>
+              <div className="text-xl font-bold text-blue-400 mt-1">₹{portfolio.available_cash?.toLocaleString()}</div>
+            </div>
+            <div className="card">
+              <div className="text-[10px] text-gray-500 uppercase tracking-wider">Reserved Margin</div>
+              <div className="text-xl font-bold text-purple-400 mt-1">₹{portfolio.reserved_margin?.toLocaleString()}</div>
             </div>
             <div className="card">
               <div className="text-[10px] text-gray-500 uppercase tracking-wider">Total P&L</div>
@@ -397,7 +402,7 @@ export default function PaperTradingPage() {
                 </tr>
               </thead>
               <tbody>
-                {trades.map((t: any, i: number) => (
+                {trades.map((t, i) => (
                   <tr key={i}>
                     <td className="font-semibold text-white">{t.symbol}</td>
                     <td>

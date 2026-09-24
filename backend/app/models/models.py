@@ -174,3 +174,53 @@ class UserTradeSetup(Base):
     direction = Column(String(20))
     override_active = Column(Boolean, default=True)
     updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class PaperPosition(Base):
+    """Persistent record of an OPEN paper-trading position.
+
+    Source of truth for open positions across server restarts (the in-memory
+    PaperAccount is a cache rebuilt from this table + the ``trades`` ledger on
+    startup). One row per open position, owned by ``user_id``."""
+    __tablename__ = "paper_positions"
+    __table_args__ = (
+        Index("ix_paper_positions_user", "user_id"),
+    )
+    id = Column(String(16), primary_key=True)
+    user_id = Column(String(16), nullable=False)
+    symbol = Column(String(50), nullable=False)
+    direction = Column(String(10), nullable=False)
+    quantity = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)
+    current_price = Column(Float, default=0.0)
+    stop_loss = Column(Float, default=0.0)
+    target_1 = Column(Float, default=0.0)
+    target_2 = Column(Float, default=0.0)
+    unrealized_pnl = Column(Float, default=0.0)
+    opened_at = Column(String(40), nullable=False)
+    status = Column(String(20), default="open")
+    filled_at = Column(String(40), nullable=True)
+
+
+class PaperPendingOrder(Base):
+    """Persistent record of a PENDING paper-trading order.
+
+    Source of truth for pending orders across server restarts. Pending orders
+    reserve capital, so they must be restored before any reservation math runs."""
+    __tablename__ = "paper_pending_orders"
+    __table_args__ = (
+        Index("ix_paper_pending_orders_user", "user_id"),
+    )
+    id = Column(String(16), primary_key=True)
+    user_id = Column(String(16), nullable=False)
+    symbol = Column(String(50), nullable=False)
+    direction = Column(String(10), nullable=False)
+    quantity = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)
+    current_price = Column(Float, default=0.0)
+    stop_loss = Column(Float, default=0.0)
+    target_1 = Column(Float, default=0.0)
+    target_2 = Column(Float, default=0.0)
+    opened_at = Column(String(40), nullable=False)
+    status = Column(String(20), default="pending")
+    filled_at = Column(String(40), nullable=True)

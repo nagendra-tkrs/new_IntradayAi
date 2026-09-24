@@ -142,10 +142,17 @@ async def stock_detail(
         data_age = quote.get("data_age_seconds")
         should_trade, _ = data_status.should_trade(symbol)
         if should_trade and snapshot.get("data_age_seconds", 999) <= 300:
-            # Use the cached snapshot signal — signal stays tied to its originating data
-            direction = snapshot["direction"]
-            confidence = snapshot["confidence"]
-            signal = type('SignalObj', (object,), {"direction": direction, "confidence": confidence})()
+            # Use the cached snapshot signal — signal stays tied to its originating data.
+            # Prefer the full signal_data dict (preserves setup/direction/confidence/
+            # explanation) so the frontend AI Recommended Setup is shown. Falling back to
+            # a plain dict is only a safety net and must not drop the AI setup.
+            if snapshot.get("signal_data") is not None:
+                signal = snapshot["signal_data"]
+            else:
+                signal = {
+                    "direction": snapshot.get("direction"),
+                    "confidence": snapshot.get("confidence"),
+                }
         else:
             # Snapshot expired or data quality failed — fall through to recalculate
             signal = None

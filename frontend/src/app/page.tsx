@@ -7,11 +7,12 @@ import SignalCard from "@/components/SignalCard";
 import { runScanner, getMarketStatus } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import Link from "next/link";
+import type { ScannerResponse } from "@/lib/types";
 
 const REFRESH_INTERVAL = 60000;
 
 export default function Dashboard() {
-  const [scanner, setScanner] = useState<any>(null);
+  const [scanner, setScanner] = useState<ScannerResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
@@ -40,9 +41,9 @@ export default function Dashboard() {
         setScanner(data);
         setLastRefresh(new Date());
       }
-    } catch (e: any) {
+    } catch (e) {
       if (isMountedRef.current) {
-        setError(e.message);
+        setError(e instanceof Error ? e.message : "Failed to load scanner data");
       }
     } finally {
       if (isMountedRef.current) {
@@ -118,7 +119,7 @@ export default function Dashboard() {
               <div className="card">
                 <div className="text-xs text-gray-500 uppercase tracking-wider">Strong Signals</div>
                 <div className="text-xl font-bold text-green-400 mt-1">
-                  {scanner.top_signals?.filter((s: any) => s.confidence >= 70).length || 0}
+                  {scanner.top_signals?.filter((s) => s.confidence >= 70).length || 0}
                 </div>
               </div>
             </div>
@@ -132,7 +133,7 @@ export default function Dashboard() {
 
             {scanner.top_signals && scanner.top_signals.length > 0 ? (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
-                {scanner.top_signals.map((signal: any) => (
+                {scanner.top_signals.map((signal) => (
                   <SignalCard
                     key={signal.symbol}
                     signal={signal.signal_data}
@@ -167,7 +168,7 @@ export default function Dashboard() {
                   </tr>
                 </thead>
                 <tbody>
-                  {scanner.results?.map((stock: any) => (
+                  {scanner.results?.map((stock) => (
                     <tr key={stock.symbol} className="cursor-pointer" onClick={() => window.location.href = `/stock/${stock.symbol}`}>
                       <td>
                         <div className="font-semibold text-white">{stock.symbol}</div>

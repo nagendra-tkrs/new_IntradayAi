@@ -1,7 +1,20 @@
 "use client";
 
+import type { SignalInfo, SignalSetup } from "@/lib/types";
+
+const EMPTY_SETUP: SignalSetup = {
+  entry: 0,
+  stop_loss: 0,
+  target_1: 0,
+  target_2: 0,
+  risk_per_share: 0,
+  reward_per_share: 0,
+  risk_reward_ratio: 0,
+  trailing_stop: null,
+};
+
 interface SignalCardProps {
-  signal: any;
+  signal: SignalInfo | null | undefined;
   onClick?: () => void;
 }
 
@@ -53,7 +66,7 @@ function TimeIcon() {
 export default function SignalCard({ signal, onClick }: SignalCardProps) {
   if (!signal) return null;
   const confidence = signal.confidence || 0;
-  const setup = signal.setup || {};
+  const setup = signal.setup || EMPTY_SETUP;
 
   return (
     <div

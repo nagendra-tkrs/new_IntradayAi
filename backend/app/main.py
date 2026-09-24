@@ -13,6 +13,11 @@ from app.api.trading import router as trading_router
 from app.api.backtest_api import router as backtest_router
 from app.api.trade_setup import router as trade_setup_router
 
+# Phase 3 (Universe Manager persistence): import the additive ORM models so
+# Base.metadata.create_all() (via init_db() in lifespan) creates the new tables
+# on startup. Additive only — no existing table is touched, no behavior change.
+import app.models.universe_models  # noqa: F401
+
 PUBLIC_PATHS = {"/api/auth/google/config", "/api/auth/google/callback", "/api/health"}
 
 
@@ -62,7 +67,14 @@ async def lifespan(app: FastAPI):
         await backfill_missing_sectors()
     except Exception:
         pass
-    yield
+    # Background paper-trading SL/Target monitor: marks open positions from live
+    # quotes and closes them automatically when stop-loss or target_1 is hit.
+    from app.services.paper_monitor import start_monitor, stop_monitor
+    start_monitor()
+    try:
+        yield
+    finally:
+        stop_monitor()
 
 
 app = FastAPI(

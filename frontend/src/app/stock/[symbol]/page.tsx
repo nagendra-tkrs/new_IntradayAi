@@ -8,6 +8,7 @@ import IndicatorPanel from "@/components/IndicatorPanel";
 import SignalCard from "@/components/SignalCard";
 import { getStockDetail, getStockChart, placePaperOrder, saveTradeSetup, clearTradeSetup } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import type { ChartPoint, Quote, SignalSetup, StockDetailResponse } from "@/lib/types";
 
 const DATE_RANGES = [
   { value: 1, label: "1D" },
@@ -89,8 +90,8 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
   const { symbol } = use(params);
   const { user, loading: authLoading } = useAuth();
   const router = useRouter();
-  const [detail, setDetail] = useState<any>(null);
-  const [chartData, setChartData] = useState<any[]>([]);
+  const [detail, setDetail] = useState<StockDetailResponse | null>(null);
+  const [chartData, setChartData] = useState<ChartPoint[]>([]);
   const [loading, setLoading] = useState(true);
   const [days, setDays] = useState(1);
   const [interval, setInterval] = useState("5m");
@@ -109,6 +110,8 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
   const [setupErrors, setSetupErrors] = useState<string[]>([]);
   const [savingSetup, setSavingSetup] = useState(false);
   const [setupMsg, setSetupMsg] = useState<string | null>(null);
+  const [setupDirty, setSetupDirty] = useState(false);
+  const lastSetupSymbolRef = useRef<string | null>(null);
 
   const loadData = useCallback(async (isAutoRefresh = false) => {
     try {
@@ -151,7 +154,7 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
   }, [authLoading, user, symbol, days, interval]);
 
   const aiSetup = useMemo(() => {
-    const s = detail?.signal?.setup || {};
+    const s: Partial<SignalSetup> = detail?.signal?.setup || {};
     return {
       entry: s.entry != null ? Number(s.entry) : null,
       stopLoss: s.stop_loss != null ? Number(s.stop_loss) : null,
@@ -167,31 +170,48 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
 
   useEffect(() => {
     if (!detail) return;
+    // Only (re)initialize the setup UI on first load or when navigating to a
+    // different symbol. Refresh/poll updates for the same symbol must never
+    // overwrite an actively edited setup, and nothing may reset it to AI here.
+    const symbolChanged = lastSetupSymbolRef.current !== symbol;
+    lastSetupSymbolRef.current = symbol;
+    if (!symbolChanged) {
+      if (setupDirty) return;
+      // Same symbol, not dirty: editing already mirrors the active setup.
+      return;
+    }
+    setSetupDirty(false);
     const ust = detail.user_trade_setup;
-    if (ust && ust.override_active && ust.entry != null && ust.stop_loss != null && ust.target != null) {
+    if (ust && ust.override_active) {
       const us = {
-        entry: Number(ust.entry),
-        stopLoss: Number(ust.stop_loss),
-        target: Number(ust.target),
+        entry: ust.entry != null ? Number(ust.entry) : null,
+        stopLoss: ust.stop_loss != null ? Number(ust.stop_loss) : null,
+        target: ust.target != null ? Number(ust.target) : null,
         riskReward: ust.risk_reward != null ? Number(ust.risk_reward) : null,
       };
       setUserSetup(us);
       setOverrideActive(true);
-      setEditing({ entry: String(us.entry), stopLoss: String(us.stopLoss), target: String(us.target) });
+      setEditing({
+        entry: us.entry != null ? String(us.entry) : "",
+        stopLoss: us.stopLoss != null ? String(us.stopLoss) : "",
+        target: us.target != null ? String(us.target) : "",
+      });
     } else {
       setOverrideActive(false);
       setUserSetup(null);
-      const ai = aiSetup;
       setEditing({
-        entry: ai.entry != null ? String(ai.entry) : "",
-        stopLoss: ai.stopLoss != null ? String(ai.stopLoss) : "",
-        target: ai.target != null ? String(ai.target) : "",
+        entry: aiSetup.entry != null ? String(aiSetup.entry) : "",
+        stopLoss: aiSetup.stopLoss != null ? String(aiSetup.stopLoss) : "",
+        target: aiSetup.target != null ? String(aiSetup.target) : "",
       });
-      setSetupErrors([]);
     }
-  }, [detail, symbol]);
+    setSetupErrors([]);
+    setSetupMsg(null);
+  }, [detail, symbol, setupDirty]);
 
   function handleSetupField(field: "entry" | "stopLoss" | "target", value: string) {
+    setSetupDirty(true);
+    setSetupMsg(null);
     setEditing((prev) => ({ ...(prev || { entry: "", stopLoss: "", target: "" }), [field]: value }));
   }
 
@@ -237,10 +257,12 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
       };
       setUserSetup(us);
       setOverrideActive(true);
+      setSetupDirty(false);
       setSetupMsg("Trade setup applied. Chart and paper trade now use your custom values.");
-    } catch (e: any) {
-      const errs = Array.isArray(e?.message) ? e.message : [e?.message || "Failed to save trade setup."];
-      setSetupErrors(errs.filter((x: any) => typeof x === "string"));
+    } catch (e) {
+      const msg = e instanceof Error && e.message ? e.message : "Failed to save trade setup.";
+      const errs = [msg];
+      setSetupErrors(errs.filter((x): x is string => typeof x === "string"));
     } finally {
       setSavingSetup(false);
     }
@@ -253,11 +275,12 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
       await clearTradeSetup(symbol);
       setOverrideActive(false);
       setUserSetup(null);
+      setSetupDirty(false);
       setEditing(null);
       setSetupErrors([]);
       setSetupMsg("Reset to AI values. User override removed.");
-    } catch (e: any) {
-      setSetupErrors([e?.message || "Failed to reset trade setup."]);
+    } catch (e) {
+      setSetupErrors([e instanceof Error && e.message ? e.message : "Failed to reset trade setup."]);
     } finally {
       setSavingSetup(false);
     }
@@ -278,7 +301,7 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
       if (!customFrom || !customTo) return chartData;
       const from = new Date(customFrom).getTime();
       const to = new Date(customTo).getTime();
-      return chartData.filter((d: any) => {
+      return chartData.filter((d) => {
         const t = new Date(d.timestamp).getTime();
         return t >= from && t <= to;
       });
@@ -294,37 +317,45 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
     else if (quickRange === "2d") cutoffMs = 2 * 24 * 60 * 60 * 1000;
     else if (quickRange === "3d") cutoffMs = 3 * 24 * 60 * 60 * 1000;
     const cutoff = new Date(now.getTime() - cutoffMs);
-    return chartData.filter((d: any) => new Date(d.timestamp) >= cutoff);
+    return chartData.filter((d) => new Date(d.timestamp) >= cutoff);
   }, [chartData, quickRange, customFrom, customTo]);
 
   async function handlePaperOrder(direction: string) {
     try {
       setOrderMsg(null);
+      const isLong = direction === "LONG";
       const signal = detail?.signal;
-      const setup = signal?.setup || {};
-      if (overrideActive && activeSetup.entry != null) {
-        await placePaperOrder({
-          symbol,
-          direction,
-          quantity: orderQty,
-          entry_price: activeSetup.entry,
-          stop_loss: activeSetup.stopLoss ?? undefined,
-          target_1: activeSetup.target ?? undefined,
-        });
-      } else {
-        await placePaperOrder({
-          symbol,
-          direction,
-          quantity: orderQty,
-          entry_price: setup.entry || detail?.quote?.price,
-          stop_loss: setup.stop_loss,
-          target_1: setup.target_1,
-          target_2: setup.target_2,
-        });
+      const setup: Partial<SignalSetup> = signal?.setup || {};
+      const useEntry = overrideActive && activeSetup.entry != null ? activeSetup.entry : (setup.entry || detail?.quote?.price);
+      const useSL = overrideActive && activeSetup.entry != null ? activeSetup.stopLoss ?? undefined : setup.stop_loss;
+      const useTarget = overrideActive && activeSetup.entry != null ? activeSetup.target ?? undefined : setup.target_1;
+      const useTarget2 = overrideActive && activeSetup.entry != null ? undefined : setup.target_2;
+
+      // Validate against the ACTUAL clicked direction (BUY/LONG vs SELL/SHORT),
+      // not the AI signal direction. Reject invalid orders before calling the API.
+      const errors = validateUserSetup(
+        useEntry != null && isFinitePositive(useEntry) ? useEntry : null,
+        useSL != null && isFinitePositive(useSL) ? useSL : null,
+        useTarget != null && isFinitePositive(useTarget) ? useTarget : null,
+        isLong,
+      );
+      if (errors.length > 0) {
+        setOrderMsg(`Error: ${errors.join(" ")}`);
+        return;
       }
+
+      await placePaperOrder({
+        symbol,
+        direction,
+        quantity: orderQty,
+        entry_price: useEntry,
+        stop_loss: useSL,
+        target_1: useTarget,
+        target_2: useTarget2,
+      });
       setOrderMsg(`${direction} order placed for ${orderQty} shares of ${symbol}`);
-    } catch (e: any) {
-      setOrderMsg(`Error: ${e.message}`);
+    } catch (e) {
+      setOrderMsg(`Error: ${e instanceof Error ? e.message : "Order failed"}`);
     }
   }
 
@@ -339,10 +370,10 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
     );
   }
 
-  const quote = detail?.quote || {};
+  const quote = detail?.quote || ({} as Quote);
   const signal = detail?.signal;
   const indicators = detail?.indicators || {};
-  const setup = signal?.setup || {};
+  const setup: Partial<SignalSetup> = signal?.setup || {};
 
   return (
     <div className="min-h-screen bg-[#0a0e17]">
@@ -395,7 +426,7 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
         <div className="card mb-4">
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">Trade Setup</h3>
-            {overrideActive && (
+            {(overrideActive || setupDirty) && (
               <span className="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/15 border border-amber-500/30 text-amber-400">
                 User Override Active
               </span>
@@ -419,7 +450,7 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
 
             <div className="bg-[#0d1220] rounded-lg p-3">
               <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-2">
-                {overrideActive ? "User Custom Setup" : isLongSignal ? "Planned Buy / Entry" : "Planned Entry"}
+                {overrideActive || setupDirty ? "User Custom Setup" : isLongSignal ? "Planned Buy / Entry" : "Planned Entry"}
                 {quote.price != null && <span className="text-gray-600 normal-case font-normal ml-1">(Current Mkt ₹{quote.price.toLocaleString()})</span>}
               </p>
               <div className="space-y-2">

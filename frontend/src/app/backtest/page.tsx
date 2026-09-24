@@ -5,14 +5,15 @@ import Header from "@/components/Header";
 import { runBacktest, getStocks } from "@/lib/api";
 import { useEffect } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+import type { BacktestResult, Instrument } from "@/lib/types";
 
 export default function BacktestPage() {
-  const [stocks, setStocks] = useState<any[]>([]);
+  const [stocks, setStocks] = useState<Instrument[]>([]);
   const [symbol, setSymbol] = useState("RELIANCE");
   const [days, setDays] = useState(30);
   const [capital, setCapital] = useState(1000000);
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<any>(null);
+  const [result, setResult] = useState<BacktestResult | null>(null);
 
   useEffect(() => {
     getStocks().then(setStocks).catch(() => {});
@@ -24,8 +25,8 @@ export default function BacktestPage() {
       setResult(null);
       const r = await runBacktest({ symbol, days, initial_capital: capital });
       setResult(r);
-    } catch (e: any) {
-      alert("Error: " + e.message);
+    } catch (e) {
+      alert("Error: " + (e instanceof Error ? e.message : e));
     } finally {
       setLoading(false);
     }
@@ -43,7 +44,7 @@ export default function BacktestPage() {
         <div className="card mb-6">
           <div className="flex items-center gap-4 flex-wrap">
             <select value={symbol} onChange={(e) => setSymbol(e.target.value)} className="px-3 py-2 bg-[#111827] border border-[#2d3548] rounded-lg text-white text-sm min-w-[150px]">
-              {stocks.map((s: any) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
+              {stocks.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
             </select>
             <div className="flex items-center gap-2">
               <label className="text-xs text-gray-500">Days:</label>
@@ -120,7 +121,7 @@ export default function BacktestPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {result.trades.map((t: any, i: number) => (
+                      {result.trades.map((t, i) => (
                         <tr key={i}>
                           <td><span className={`text-xs font-bold ${String(t.direction).includes("LONG") ? "text-green-400" : "text-red-400"}`}>{String(t.direction).replace("SignalDirection.", "")}</span></td>
                           <td className="num">₹{t.entry?.toLocaleString()}</td>

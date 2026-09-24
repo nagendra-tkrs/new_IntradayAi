@@ -81,6 +81,42 @@ class SignalScore(BaseModel):
     total: float = 0.0
 
 
+class DirectionalEvidence(BaseModel):
+    """Explicit LONG / SHORT evidence per component (Signal Engine V2).
+
+    Each component exposes symmetric directional evidence on [0, 1]:
+      *_long  = evidence supporting a LONG (bullish) read
+      *_short = evidence supporting a SHORT (bearish) read
+    A component with no usable evidence reports 0.0 on BOTH sides — missing
+    data never fabricates a direction. When both sides are simultaneously
+    non-trivial the symbol carries contradictory evidence, surfaced through
+    `conflict` and handled as NO_TRADE by the aggregation layer.
+
+    `risk_quality` is a direction-NEUTRAL quality value on [0, 1] (ATR
+    volatility health). `long_total` / `short_total` are the weighted
+    directional aggregates (range [0, 90]); `net` is their signed difference
+    (range [-90, +90], bullish positive).
+    """
+
+    trend_long: float = 0.0
+    trend_short: float = 0.0
+    momentum_long: float = 0.0
+    momentum_short: float = 0.0
+    volume_long: float = 0.0
+    volume_short: float = 0.0
+    vwap_long: float = 0.0
+    vwap_short: float = 0.0
+    price_action_long: float = 0.0
+    price_action_short: float = 0.0
+    market_context_long: float = 0.0
+    market_context_short: float = 0.0
+    risk_quality: float = 0.0
+    long_total: float = 0.0
+    short_total: float = 0.0
+    net: float = 0.0
+    conflict: bool = False
+
+
 class SignalExplanation(BaseModel):
     reasons: list[str] = []
     risks: list[str] = []

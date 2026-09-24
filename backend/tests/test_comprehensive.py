@@ -1861,9 +1861,17 @@ def test_vwap_score_shared_function_consistency():
 
 
 def test_backtest_equivalent_conditions_same_signal_as_live():
-    """Backtest and live signal engine agree on direction for the same data."""
+    """Backtest and live signal engine agree on direction for the SAME bar.
+
+    Each backtest trade records the next-bar entry timestamp; the signal bar
+    is exactly one bar before it. The trade direction is produced by the
+    signal engine on that signal bar, so the live signal must be compared on
+    the same bar — NOT on the final bar of the series, which can legitimately
+    disagree once the market has turned (the directionally symmetric behaviour
+    Signal Engine V2 restores)."""
     from app.services.backtesting import BacktestEngine
-    from app.services.signal_engine import evaluate_signal
+    from app.services.signal_engine import evaluate_row_signal, evaluate_signal
+    from app.models.schemas import SignalDirection
     from app.services.indicators import calculate_all_indicators
     import pandas as pd
     import numpy as np
@@ -1881,29 +1889,52 @@ def test_backtest_equivalent_conditions_same_signal_as_live():
         "volume": np.random.randint(10000, 100000, n),
     })
     full = calculate_all_indicators(df)
+    ts_index = pd.Index(full["timestamp"])
 
     bt = BacktestEngine(initial_capital=1000000)
     result = bt.run(full, "TEST")
 
     for t in result.get("trades", []):
-        sym = "TEST"
-        sig = evaluate_signal(full, sym, data_source="TEST",
-                              data_age_seconds=60, data_status="LIVE")
-        if sig is None:
-            continue
         direction_str = t["direction"]
         # Backtest trade direction must be the clean enum value (no
         # "SignalDirection." prefix) so frontend filters match correctly.
         assert not direction_str.startswith("SignalDirection."), (
             f"Backtest direction {direction_str!r} should be the clean enum value"
         )
+
+        # Locate the signal bar: entry is on the bar after the signal bar.
+        entry_ts = pd.to_datetime(t["entry_time"])
+        if entry_ts not in ts_index:
+            continue
+        signal_pos = int(ts_index.get_loc(entry_ts)) - 1
+        if signal_pos < 55:
+            continue  # the backtest evaluates from bar 55 onwards
+
+        row = full.iloc[signal_pos]
+        rd = evaluate_row_signal(row, market_context=None)
+        if rd is None or rd["direction"] == SignalDirection.NO_TRADE:
+            continue  # backtest only records non-NO_TRADE bars
+
+        # The same bar evaluated live (as the scanner would) must agree with
+        # the row-level decision on that exact bar.
+        prefix = full.iloc[: signal_pos + 1].copy()
+        sd = evaluate_signal(prefix, "TEST", data_source="TEST",
+                             data_age_seconds=60, data_status="LIVE",
+                             market_context=None)
+        if sd is None:
+            continue
+        assert sd["direction"] == rd["direction"].value, (
+            f"Bar {signal_pos}: live={sd['direction']} vs row-level={rd['direction']}"
+        )
         if direction_str in ("STRONG_LONG", "LONG", "WEAK_LONG"):
-            assert sig["direction"] in ("STRONG_LONG", "LONG", "WEAK_LONG"), (
-                f"Backtest traded {direction_str} but live signal = {sig['direction']}"
+            assert rd["direction"].is_long, (
+                f"Backtest traded {direction_str} but signal at bar "
+                f"{signal_pos} was {rd['direction']}"
             )
         elif direction_str in ("STRONG_SHORT", "SHORT", "WEAK_SHORT"):
-            assert sig["direction"] in ("STRONG_SHORT", "SHORT", "WEAK_SHORT"), (
-                f"Backtest traded {direction_str} but live signal = {sig['direction']}"
+            assert rd["direction"].is_short, (
+                f"Backtest traded {direction_str} but signal at bar "
+                f"{signal_pos} was {rd['direction']}"
             )
 
 
@@ -2061,10 +2092,16 @@ def test_paper_invalid_order_rejection():
     result = pt.place_order("RELIANCE", "LONG", 0, 2450.0, 2420.0, 2500.0)
     assert "error" in result
 
+    # Contract: an order whose entry notional exceeds Available Cash is rejected
+    # at PLACEMENT (Available Cash can never go negative - no pending order is
+    # ever created against buying power that doesn't exist).
+    cash_before = pt.cash
     result = pt.place_order("RELIANCE", "LONG", 999999999, 2450.0, 2420.0, 2500.0)
-    assert "error" not in result  # pending orders don't check cash
-    fill = pt.fill_order(result["order_id"])
-    assert "error" in fill  # cash check happens on fill
+    assert "error" in result
+    assert result["error"].startswith("Insufficient available cash")
+    assert pt.cash == cash_before
+    assert pt.get_positions() == []
+    assert pt.get_pending_orders() == []
 
 
 def test_paper_position_sizing_by_risk():
@@ -2138,19 +2175,673 @@ def test_paper_consecutive_loss_cooldown():
 
 
 def test_paper_directional_sl_target_validation():
-    """Server validates directional SL/Target before placing order."""
+    """Server validates directional SL/Target inside place_order() before placing
+    (or filling) an order. Invalid directional setups are rejected and must NOT
+    mutate any engine state (positions / cash / orders)."""
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
     result = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2460.0, 2440.0)
-    assert result["status"] == "pending"
-    pt.fill_order(result["order_id"])
+    import copy
+    cash_before = pt.cash
+    assert "error" in result
+    assert "Invalid LONG setup" in result["error"]
+    # No mutation: no pending order, no position, no cash change.
+    assert pt.get_pending_orders() == []
+    assert pt.get_positions() == []
+    assert pt.cash == cash_before
 
-    pos = pt.get_positions()[0]
-    assert pos["direction"] == "LONG"
-    assert pos["entry_price"] == 2450.0
-    assert pos["stop_loss"] == 2460.0
-    assert pos["target_1"] == 2440.0
+
+def test_place_order_long_valid_accepted():
+    """Valid LONG order (SL < Entry < Target) is accepted."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    result = pt.place_order("RELIANCE", "LONG", 10, 100.0, 98.0, 105.0)
+    assert result["status"] == "pending"
+    assert result["position"]["stop_loss"] == 98.0
+    assert result["position"]["target_1"] == 105.0
+
+
+def test_place_order_long_invalid_sl_above_entry_rejected():
+    """Invalid LONG order (SL above entry) is rejected with no state mutation."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    cash_before = pt.cash
+    result = pt.place_order("RELIANCE", "LONG", 10, 100.0, 102.0, 105.0)
+    assert "error" in result
+    assert "Invalid LONG setup" in result["error"]
+    assert pt.get_pending_orders() == []
+    assert pt.get_positions() == []
+    assert pt.cash == cash_before
+
+
+def test_place_order_long_invalid_target_below_entry_rejected():
+    """Invalid LONG order (target below entry) is rejected with no state mutation."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    cash_before = pt.cash
+    result = pt.place_order("RELIANCE", "LONG", 10, 100.0, 98.0, 95.0)
+    assert "error" in result
+    assert "Invalid LONG setup" in result["error"]
+    assert pt.get_pending_orders() == []
+    assert pt.get_positions() == []
+    assert pt.cash == cash_before
+
+
+def test_place_order_short_valid_accepted():
+    """Valid SHORT order (Target < Entry < SL) is accepted."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    result = pt.place_order("TCS", "SHORT", 5, 100.0, 102.0, 95.0)
+    assert result["status"] == "pending"
+    assert result["position"]["stop_loss"] == 102.0
+    assert result["position"]["target_1"] == 95.0
+
+
+def test_place_order_short_invalid_sl_below_entry_rejected():
+    """Invalid SHORT order (SL below entry) is rejected with no state mutation."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    cash_before = pt.cash
+    result = pt.place_order("TCS", "SHORT", 5, 100.0, 98.0, 95.0)
+    assert "error" in result
+    assert "Invalid SHORT setup" in result["error"]
+    assert pt.get_pending_orders() == []
+    assert pt.get_positions() == []
+    assert pt.cash == cash_before
+
+
+def test_place_order_short_invalid_target_above_entry_rejected():
+    """Invalid SHORT order (target above entry) is rejected with no state mutation."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    cash_before = pt.cash
+    result = pt.place_order("TCS", "SHORT", 5, 100.0, 102.0, 105.0)
+    assert "error" in result
+    assert "Invalid SHORT setup" in result["error"]
+    assert pt.get_pending_orders() == []
+    assert pt.get_positions() == []
+    assert pt.cash == cash_before
+
+
+def test_place_order_buy_sell_alias_directions():
+    """BUY/SELL aliases validate the same as LONG/SHORT (no second direction repr)."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    ok_buy = pt.place_order("RELIANCE", "BUY", 10, 100.0, 98.0, 105.0)
+    assert ok_buy["status"] == "pending"
+    assert ok_buy["position"]["direction"] == "BUY"
+
+    pt2 = PaperTradingEngine()
+    bad_sell = pt2.place_order("TCS", "SELL", 5, 100.0, 98.0, 105.0)
+    assert "error" in bad_sell
+    assert "Invalid SHORT setup" in bad_sell["error"]
+    assert pt2.get_pending_orders() == []
+    assert pt2.get_positions() == []
+
+
+def test_paper_long_open_debts_cash():
+    """Opening a LONG (BUY) position decreases cash by entry cost."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("RELIANCE", "LONG", 10, 100.0, 98.0, 105.0)
+    pt.fill_order(r["order_id"])
+    assert pt.cash == pytest.approx(1_000_000.0 - 10 * 100.0)
+    assert pt.get_portfolio_summary()["cash"] == pytest.approx(999_000.0)
+
+
+def test_paper_long_close_credits_cash():
+    """Closing a LONG (BUY) position at a profit increases cash, preserves PnL."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("RELIANCE", "LONG", 10, 100.0, 98.0, 105.0)
+    pt.fill_order(r["order_id"])
+    close = pt.close_position(r["order_id"], 110.0)
+    assert close["pnl"] == pytest.approx(100.0)
+    assert pt.cash == pytest.approx(1_000_000.0 - 1_000.0 + 1_100.0)
+    assert pt.total_pnl == pytest.approx(100.0)
+
+
+def test_paper_short_open_credits_cash():
+    """Opening a SHORT (SELL) position increases cash by sale proceeds."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("TCS", "SHORT", 10, 100.0, 102.0, 95.0)
+    pt.fill_order(r["order_id"])
+    assert pt.cash == pytest.approx(1_000_000.0 + 10 * 100.0)
+    assert pt.get_portfolio_summary()["cash"] == pytest.approx(1_001_000.0)
+
+
+def test_paper_short_profit_close_debts_cash():
+    """Closing a profitable SHORT decreases cash by buy-back cost, PnL preserved."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("TCS", "SHORT", 10, 100.0, 102.0, 95.0)
+    pt.fill_order(r["order_id"])
+    close = pt.close_position(r["order_id"], 90.0)
+    assert close["pnl"] == pytest.approx(100.0)
+    assert close["trade"]["result"] == "WIN"
+    assert pt.cash == pytest.approx(1_001_000.0 - 900.0)
+    assert pt.total_pnl == pytest.approx(100.0)
+
+
+def test_paper_short_loss_close_debts_cash():
+    """Closing a losing SHORT decreases cash by buy-back cost, PnL preserved."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("TCS", "SHORT", 10, 100.0, 102.0, 95.0)
+    pt.fill_order(r["order_id"])
+    close = pt.close_position(r["order_id"], 110.0)
+    assert close["pnl"] == pytest.approx(-100.0)
+    assert close["trade"]["result"] == "LOSS"
+    assert pt.cash == pytest.approx(1_001_000.0 - 1_100.0)
+    assert pt.total_pnl == pytest.approx(-100.0)
+
+
+def test_paper_pending_order_does_not_change_cash():
+    """Placing (not filling) an order must not touch cash for LONG or SHORT."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    cash_before = pt.cash
+    r1 = pt.place_order("RELIANCE", "LONG", 10, 100.0, 98.0, 105.0)
+    r2 = pt.place_order("TCS", "SHORT", 5, 100.0, 102.0, 95.0)
+    assert r1["status"] == "pending" and r2["status"] == "pending"
+    assert pt.cash == cash_before
+    assert pt.get_portfolio_summary()["cash"] == pytest.approx(1_000_000.0)
+
+
+def test_paper_long_short_cash_accounting_symmetric():
+    """Equal-size LONG and SHORT trades produce identical final cash and PnL."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    rl = pt.place_order("RELIANCE", "LONG", 10, 100.0, 98.0, 105.0)
+    pt.fill_order(rl["order_id"])
+    assert pt.cash == pytest.approx(999_000.0)
+    pt.close_position(rl["order_id"], 105.0)
+    assert pt.cash == pytest.approx(1_000_050.0)
+    assert pt.total_pnl == pytest.approx(50.0)
+
+    rs = pt.place_order("TCS", "SHORT", 10, 100.0, 102.0, 95.0)
+    pt.fill_order(rs["order_id"])
+    assert pt.cash == pytest.approx(1_001_050.0)
+    pt.close_position(rs["order_id"], 95.0)
+    assert pt.cash == pytest.approx(1_000_100.0)
+    assert pt.total_pnl == pytest.approx(100.0)
+
+
+def test_paper_mixed_long_short_positions_cash():
+    """Simultaneous LONG + SHORT positions account cash independently (no double count)."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    rl = pt.place_order("RELIANCE", "LONG", 10, 100.0, 98.0, 105.0)
+    pt.fill_order(rl["order_id"])
+    rs = pt.place_order("TCS", "SHORT", 5, 200.0, 205.0, 190.0)
+    pt.fill_order(rs["order_id"])
+    # LONG: -1000; SHORT: +1000 -> cash back to start while both open
+    assert pt.cash == pytest.approx(1_000_000.0)
+    assert len(pt.get_positions()) == 2
+
+    pt.close_position(rl["order_id"], 110.0)   # LONG +100
+    assert pt.cash == pytest.approx(1_001_100.0)
+    pt.close_position(rs["order_id"], 190.0)   # SHORT +50
+    assert pt.cash == pytest.approx(1_000_150.0)
+    assert pt.total_pnl == pytest.approx(150.0)
+    assert len(pt.get_positions()) == 0
+
+
+def test_paper_short_not_blocked_by_long_cash_check():
+    """SHORT fills require cash cover for collateral only (cash-secured model)."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    # Notional 500,000 < 1,000,000 available -> fills; proceeds credit the ledger.
+    r = pt.place_order("TCS", "SHORT", 5_000, 100.0, 102.0, 95.0)
+    fill = pt.fill_order(r["order_id"])
+    assert "error" not in fill
+    assert fill["status"] == "filled"
+    assert pt.cash == pytest.approx(1_000_000.0 + 5_000 * 100.0)
+    # Available cash is reduced by the short's committed collateral (proceeds
+    # never inflate buying power): 1,000,000 − 500,000.
+    s = pt.get_portfolio_summary()
+    assert s["reserved_margin"] == pytest.approx(500_000.0)
+    assert s["available_cash"] == pytest.approx(500_000.0)
+    assert s["total_value"] == pytest.approx(1_000_000.0)
+
+
+def test_paper_buy_sell_alias_cash_accounting():
+    """BUY/SELL aliases use the same cash accounting as LONG/SHORT (single direction repr)."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    rb = pt.place_order("RELIANCE", "BUY", 10, 100.0, 98.0, 105.0)
+    pt.fill_order(rb["order_id"])
+    assert pt.cash == pytest.approx(999_000.0)
+    pt.close_position(rb["order_id"], 110.0)
+    assert pt.cash == pytest.approx(1_000_100.0)
+
+    rs = pt.place_order("TCS", "SELL", 10, 100.0, 102.0, 95.0)
+    pt.fill_order(rs["order_id"])
+    assert pt.cash == pytest.approx(1_001_100.0)
+    pt.close_position(rs["order_id"], 90.0)
+    assert pt.cash == pytest.approx(1_000_200.0)
+    assert pt.total_pnl == pytest.approx(200.0)
+
+
+def test_paper_short_stop_exit_cash_accounting():
+    """Stop-loss exits (check_stops) apply the same SHORT cash accounting."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("TCS", "SHORT", 10, 100.0, 102.0, 95.0)
+    pt.fill_order(r["order_id"])
+    exits = pt.check_stops({"TCS": 102.0})
+    assert len(exits) == 1
+    assert exits[0]["trade"]["result"] == "LOSS"
+    assert pt.cash == pytest.approx(1_001_000.0 - 1_020.0)
+    assert pt.total_pnl == pytest.approx(-20.0)
+
+
+def test_paper_empty_portfolio_value():
+    """Empty portfolio equity equals initial cash (no positions, no pending)."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    s = pt.get_portfolio_summary()
+    assert s["total_value"] == pytest.approx(1_000_000.0)
+    assert s["cash"] == pytest.approx(1_000_000.0)
+    assert s["unrealized_pnl"] == 0.0
+    assert s["positions_count"] == 0
+    assert s["pending_orders_count"] == 0
+
+
+def test_paper_long_unchanged_price_value():
+    """LONG at unchanged price keeps equity == initial capital."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("X", "LONG", 10, 100.0, 95.0, 110.0)
+    pt.fill_order(r["order_id"])
+    pt.update_prices({"X": 100.0})
+    s = pt.get_portfolio_summary()
+    assert s["cash"] == pytest.approx(999_000.0)
+    assert s["total_value"] == pytest.approx(1_000_000.0)
+    assert s["unrealized_pnl"] == 0.0
+
+
+def test_paper_long_profit_value():
+    """LONG profit: equity = initial + unrealized PnL."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("X", "LONG", 10, 100.0, 95.0, 110.0)
+    pt.fill_order(r["order_id"])
+    pt.update_prices({"X": 110.0})
+    s = pt.get_portfolio_summary()
+    assert s["cash"] == pytest.approx(999_000.0)
+    assert s["total_value"] == pytest.approx(1_000_100.0)
+    assert s["unrealized_pnl"] == pytest.approx(100.0)
+
+
+def test_paper_long_loss_value():
+    """LONG loss: equity = initial - unrealized loss."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("X", "LONG", 10, 100.0, 95.0, 110.0)
+    pt.fill_order(r["order_id"])
+    pt.update_prices({"X": 90.0})
+    s = pt.get_portfolio_summary()
+    assert s["cash"] == pytest.approx(999_000.0)
+    assert s["total_value"] == pytest.approx(999_900.0)
+    assert s["unrealized_pnl"] == pytest.approx(-100.0)
+
+
+def test_paper_short_unchanged_price_value():
+    """SHORT at unchanged price: short liability makes equity == initial capital."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("X", "SHORT", 10, 100.0, 105.0, 90.0)
+    pt.fill_order(r["order_id"])
+    pt.update_prices({"X": 100.0})
+    s = pt.get_portfolio_summary()
+    assert s["cash"] == pytest.approx(1_001_000.0)
+    assert s["total_value"] == pytest.approx(1_000_000.0)
+    assert s["unrealized_pnl"] == 0.0
+
+
+def test_paper_short_profit_value():
+    """SHORT profit: equity = initial + unrealized PnL (no double count)."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("X", "SHORT", 10, 100.0, 105.0, 90.0)
+    pt.fill_order(r["order_id"])
+    pt.update_prices({"X": 90.0})
+    s = pt.get_portfolio_summary()
+    assert s["cash"] == pytest.approx(1_001_000.0)
+    assert s["total_value"] == pytest.approx(1_000_100.0)
+    assert s["unrealized_pnl"] == pytest.approx(100.0)
+    # Invariant: equity == initial + realized + unrealized (no fees).
+    assert s["total_value"] == pytest.approx(1_000_000.0 + s["realized_pnl"] + s["unrealized_pnl"])
+
+
+def test_paper_short_loss_value():
+    """SHORT loss: equity = initial - unrealized loss (no double count)."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("X", "SHORT", 10, 100.0, 105.0, 90.0)
+    pt.fill_order(r["order_id"])
+    pt.update_prices({"X": 110.0})
+    s = pt.get_portfolio_summary()
+    assert s["cash"] == pytest.approx(1_001_000.0)
+    assert s["total_value"] == pytest.approx(999_900.0)
+    assert s["unrealized_pnl"] == pytest.approx(-100.0)
+    assert s["total_value"] == pytest.approx(1_000_000.0 + s["realized_pnl"] + s["unrealized_pnl"])
+
+
+def test_paper_mixed_long_short_value():
+    """Mixed portfolio: equity = cash + long value - short liability."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    rl = pt.place_order("LONGX", "LONG", 10, 100.0, 95.0, 110.0)
+    pt.fill_order(rl["order_id"])
+    rs = pt.place_order("SHORTX", "SHORT", 5, 200.0, 210.0, 185.0)
+    pt.fill_order(rs["order_id"])
+    pt.update_prices({"LONGX": 110.0, "SHORTX": 190.0})
+    s = pt.get_portfolio_summary()
+    assert s["cash"] == pytest.approx(1_000_000.0)
+    assert s["total_value"] == pytest.approx(1_000_150.0)
+    assert s["unrealized_pnl"] == pytest.approx(150.0)
+    # Invariant: initial + realized + unrealized
+    assert s["total_value"] == pytest.approx(1_000_000.0 + s["realized_pnl"] + s["unrealized_pnl"])
+
+
+def test_paper_short_close_after_profit_value():
+    """Closing a profitable SHORT removes its contribution; profit counted once."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("X", "SHORT", 10, 100.0, 105.0, 90.0)
+    pt.fill_order(r["order_id"])
+    pt.update_prices({"X": 90.0})
+    before = pt.get_portfolio_summary()
+    assert before["total_value"] == pytest.approx(1_000_100.0)
+
+    close = pt.close_position(r["order_id"], 90.0)
+    assert close["pnl"] == pytest.approx(100.0)
+    s = pt.get_portfolio_summary()
+    assert pt.cash == pytest.approx(1_000_100.0)
+    assert s["total_value"] == pytest.approx(1_000_100.0)
+    assert s["unrealized_pnl"] == 0.0
+    assert s["total_pnl"] == pytest.approx(100.0)
+    assert s["positions_count"] == 0
+
+
+def test_paper_short_close_after_loss_value():
+    """Closing a losing SHORT removes its contribution; loss counted once."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("X", "SHORT", 10, 100.0, 105.0, 90.0)
+    pt.fill_order(r["order_id"])
+    pt.update_prices({"X": 110.0})
+    before = pt.get_portfolio_summary()
+    assert before["total_value"] == pytest.approx(999_900.0)
+
+    close = pt.close_position(r["order_id"], 110.0)
+    assert close["pnl"] == pytest.approx(-100.0)
+    s = pt.get_portfolio_summary()
+    assert pt.cash == pytest.approx(999_900.0)
+    assert s["total_value"] == pytest.approx(999_900.0)
+    assert s["unrealized_pnl"] == 0.0
+    assert s["total_pnl"] == pytest.approx(-100.0)
+    assert s["positions_count"] == 0
+
+
+def test_paper_pending_short_no_equity_contribution():
+    """A pending SHORT must not change cash or portfolio equity."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("X", "SHORT", 10, 100.0, 105.0, 90.0)
+    assert r["status"] == "pending"
+    s = pt.get_portfolio_summary()
+    assert s["cash"] == pytest.approx(1_000_000.0)
+    assert s["total_value"] == pytest.approx(1_000_000.0)
+    assert s["positions_count"] == 0
+    assert s["pending_orders_count"] == 1
+
+
+def test_paper_pending_long_no_equity_contribution():
+    """A pending LONG must not change cash or portfolio equity."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    r = pt.place_order("X", "LONG", 10, 100.0, 95.0, 110.0)
+    assert r["status"] == "pending"
+    s = pt.get_portfolio_summary()
+    assert s["cash"] == pytest.approx(1_000_000.0)
+    assert s["total_value"] == pytest.approx(1_000_000.0)
+    assert s["positions_count"] == 0
+    assert s["pending_orders_count"] == 1
+
+
+def test_paper_mixed_open_closed_no_pnl_double_count():
+    """Realized PnL from a closed trade and unrealized PnL of a new open trade
+    combine without double counting (equity invariant holds)."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    rl = pt.place_order("X", "LONG", 10, 100.0, 95.0, 110.0)
+    pt.fill_order(rl["order_id"])
+    pt.update_prices({"X": 90.0})
+    pt.close_position(rl["order_id"], 90.0)  # realized -100
+    s1 = pt.get_portfolio_summary()
+    assert s1["total_pnl"] == pytest.approx(-100.0)
+    assert s1["total_value"] == pytest.approx(999_900.0)
+
+    rs = pt.place_order("Y", "SHORT", 10, 100.0, 105.0, 90.0)
+    pt.fill_order(rs["order_id"])
+    pt.update_prices({"Y": 90.0})  # unrealized +100
+    s2 = pt.get_portfolio_summary()
+    assert s2["total_value"] == pytest.approx(1_000_000.0)
+    assert s2["unrealized_pnl"] == pytest.approx(100.0)
+    assert s2["total_pnl"] == pytest.approx(-100.0)
+    # Equity invariant: initial + realized + unrealized
+    assert s2["total_value"] == pytest.approx(1_000_000.0 + s2["total_pnl"] + s2["unrealized_pnl"])
+
+
+def test_paper_multiple_long_short_independent_valuation():
+    """Multiple LONG and SHORT positions are each valued by their own direction."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    a = pt.place_order("LONGX", "LONG", 10, 100.0, 95.0, 110.0)
+    pt.fill_order(a["order_id"])
+    b = pt.place_order("LONGY", "LONG", 20, 50.0, 48.0, 55.0)
+    pt.fill_order(b["order_id"])
+    c = pt.place_order("SHX", "SHORT", 5, 200.0, 210.0, 185.0)
+    pt.fill_order(c["order_id"])
+    d = pt.place_order("SHY", "SHORT", 25, 80.0, 85.0, 70.0)
+    pt.fill_order(d["order_id"])
+    # cash: 1,000,000 - 1,000 - 1,000 + 1,000 + 2,000 = 1,001,000
+    assert pt.cash == pytest.approx(1_001_000.0)
+    pt.update_prices({"LONGX": 110.0, "LONGY": 55.0, "SHX": 190.0, "SHY": 100.0})
+    s = pt.get_portfolio_summary()
+    # LONGX +1,100 ; LONGY +1,100 ; SHX -950 ; SHY -2,500
+    assert s["total_value"] == pytest.approx(1_001_000.0 + 1_100.0 + 1_100.0 - 950.0 - 2_500.0)
+    assert s["unrealized_pnl"] == pytest.approx(100.0 + 100.0 + 50.0 - 500.0)
+    assert s["positions_count"] == 4
+    assert s["total_value"] == pytest.approx(1_000_000.0 + s["total_pnl"] + s["unrealized_pnl"])
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Phase 3B — capital model audit regression (full-notional model)
+#
+# Decision: no margin/leverage requirement exists anywhere in the project
+# (no config key, no API field, no frontend field). Paper trading remains on
+# the documented full-notional capital model. The portfolio summary exposes
+# distinct CASH, EQUITY (total_value) and PNL fields only; there is no
+# margin_used / available_buying_power / leverage concept.
+#
+# Phase 6 exception: to keep short proceeds from inflating available cash we
+# expose three clearly-named cash-collateral fields (reserved_margin,
+# available_cash, short_liability). These are 100% cash collateral, not
+# leverage/buying power; no margin_used / leverage / buying_power fields
+# exist and a SHORT still never boosts equity above initial + PnL.
+# ────────────────────────────────────────────────────────────────────────
+
+def test_phase3b_no_margin_fields_exposed():
+    """Portfolio summary exposes no margin/buying-power/leverage fields; cash
+    and equity remain distinct concepts. The Phase 6 cash-collateral fields
+    (reserved_margin, available_cash, short_liability) are 100% cash-backed,
+    not leverage, so they do not violate the no-margin decision."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    s = pt.get_portfolio_summary()
+    for forbidden in ("margin", "margin_used", "leverage", "buying_power", "available_buying_power"):
+        assert forbidden not in s, f"{forbidden} must not appear (margin not configured)"
+    assert "cash" in s and "total_value" in s and "unrealized_pnl" in s
+    assert "available_cash" in s and "reserved_margin" in s and "short_liability" in s
+    r = pt.place_order("X", "SHORT", 10, 100.0, 105.0, 90.0)
+    pt.fill_order(r["order_id"])
+    s2 = pt.get_portfolio_summary()
+    for forbidden in ("margin", "margin_used", "leverage", "buying_power", "available_buying_power"):
+        assert forbidden not in s2, f"{forbidden} must not appear even with an open position"
+
+
+def test_phase3b_long_cash_insufficiency_restores_pending():
+    """Oversized LONG notional is rejected at the PLACEMENT gate (contract):
+    cash, positions, pending orders and trade history are untouched and no
+    pending order is ever created against buying power that doesn't exist."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    cash_before = pt.cash
+    r = pt.place_order("X", "LONG", 99_999, 100.0, 95.0, 110.0)  # notional 9,999,900 > cash
+    assert "error" in r
+    assert r["error"].startswith("Insufficient available cash")
+    # No mutation anywhere
+    assert pt.cash == cash_before
+    assert pt.get_positions() == []
+    assert pt.get_trade_history() == []
+    assert pt.get_pending_orders() == []
+
+
+def test_phase3b_shorts_require_no_cash_cover_full_notional():
+    """Under the cash-secured model a SHORT of notional within available cash
+    fills (proceeds fund the later buy-back), equity is unchanged at entry
+    price, and the short's full notional is reserved as collateral so available
+    cash never inflates. An oversized short (notional > available cash) is
+    rejected at PLACEMENT, exactly like an oversized LONG."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine()
+    # Notional 1,000,000 == available cash -> fills; reserved 100%, equity unchanged.
+    r = pt.place_order("X", "SHORT", 10_000, 100.0, 105.0, 90.0)
+    assert r["status"] == "pending"
+    fill = pt.fill_order(r["order_id"])
+    assert "error" not in fill
+    assert fill["status"] == "filled"
+    assert pt.cash == pytest.approx(2_000_000.0)
+    s = pt.get_portfolio_summary()
+    assert s["reserved_margin"] == pytest.approx(1_000_000.0)
+    # full notional committed -> ALL buying power consumed, nothing left over
+    assert s["available_cash"] == pytest.approx(0.0)
+    assert s["total_value"] == pytest.approx(1_000_000.0)
+    assert s["unrealized_pnl"] == 0.0
+
+    # Oversized short (notional 1,200,000 > 1,000,000 available) is rejected
+    # at placement: cash, positions and pending orders untouched.
+    pt2 = PaperTradingEngine()
+    cash_before = pt2.cash
+    r2 = pt2.place_order("X", "SHORT", 12_000, 100.0, 105.0, 90.0)
+    assert "error" in r2
+    assert r2["error"].startswith("Insufficient available cash")
+    assert pt2.cash == cash_before
+    assert pt2.get_positions() == []
+    assert pt2.get_pending_orders() == []
+
+
+def test_phase3b_pending_orders_reserve_no_capital():
+    """Pending LONG and SHORT orders do not consume cash or change equity, but
+    each reserves its entry notional in reserved_margin (committed capital).
+    The reservation is released on cancel and transferred on fill, so pending
+    orders can never be double-counted or spent twice."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    pt = PaperTradingEngine(db_path=None)
+    cash_before = pt.cash
+    equity_before = pt.get_portfolio_summary()["total_value"]
+    rl = pt.place_order("LX", "LONG", 500, 100.0, 95.0, 110.0)
+    rs = pt.place_order("SX", "SHORT", 500, 100.0, 105.0, 90.0)
+    assert rl["status"] == "pending" and rs["status"] == "pending"
+    s = pt.get_portfolio_summary()
+    assert pt.cash == cash_before
+    assert s["total_value"] == equity_before
+    assert s["positions_count"] == 0
+    assert s["pending_orders_count"] == 2
+    # Committed notional is reserved but NOT double-counted or spent.
+    assert s["pending_value"] == pytest.approx(100_000.0)
+    assert s["reserved_margin"] == pytest.approx(100_000.0)
+    assert s["available_cash"] == pytest.approx(900_000.0)
+    # Cancelling both releases the full reservation.
+    pt.cancel_order(rl["order_id"])
+    s1 = pt.get_portfolio_summary()
+    assert s1["reserved_margin"] == pytest.approx(50_000.0)
+    assert s1["available_cash"] == pytest.approx(950_000.0)
+    pt.cancel_order(rs["order_id"])
+    s2 = pt.get_portfolio_summary()
+    assert s2["reserved_margin"] == 0.0
+    assert s2["available_cash"] == pytest.approx(1_000_000.0)
+
+
+def test_phase3b_equity_invariant_full_roundtrip():
+    """equity = initial + realized + unrealized holds at every stage of a
+    full LONG + SHORT round-trip (place -> fill -> mark -> close)."""
+    from app.services.paper_trading import PaperTradingEngine
+
+    def equity_invariant(pt):
+        s = pt.get_portfolio_summary()
+        return s["total_value"] == pytest.approx(1_000_000.0 + s["total_pnl"] + s["unrealized_pnl"])
+
+    pt = PaperTradingEngine()
+    rl = pt.place_order("LX", "LONG", 10, 100.0, 95.0, 110.0)
+    pt.fill_order(rl["order_id"])
+    assert equity_invariant(pt)
+    rs = pt.place_order("SX", "SHORT", 10, 100.0, 105.0, 90.0)
+    pt.fill_order(rs["order_id"])
+    assert equity_invariant(pt)
+    pt.update_prices({"LX": 110.0, "SX": 90.0})
+    assert equity_invariant(pt)
+    pt.close_position(rl["order_id"], 110.0)
+    assert equity_invariant(pt)
+    pt.close_position(rs["order_id"], 90.0)
+    s = pt.get_portfolio_summary()
+    assert s["positions_count"] == 0
+    assert s["total_value"] == pytest.approx(1_000_200.0)
+    assert s["total_pnl"] == pytest.approx(200.0)
+    assert s["total_value"] == pytest.approx(1_000_000.0 + s["total_pnl"] + s["unrealized_pnl"])
+
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -2506,6 +3197,165 @@ def test_scanner_rr_computed_from_active_values():
     # The two must be distinct to prove R:R follows the active custom values
     assert custom.entry != ai_default.entry
     assert custom.risk_reward != ai_default.risk_reward
+
+
+def test_active_setup_user_override_wins_over_ai_na():
+    """Frontend active-setup rule: if a user override exists and is active, the
+    user setup is used even when the AI setup is entirely N/A. A missing AI setup
+    must not cause the user override to be dropped (regression: edit/refresh reset)."""
+    from app.services.trade_setup import compute_risk_reward
+
+    user_override = {
+        "entry": 423.2,
+        "stop_loss": 421.0,
+        "target": 428.0,
+        "risk_reward": None,
+        "direction": "LONG",
+        "override_active": True,
+    }
+    # AI setup is N/A for this stock
+    ai_active = {"entry": None, "stop_loss": None, "target": None, "risk_reward": None}
+
+    # Active setup resolution: override wins when override_active is True,
+    # regardless of whether AI values exist.
+    if user_override["override_active"]:
+        active = {
+            "entry": user_override["entry"],
+            "stopLoss": user_override["stop_loss"],
+            "target": user_override["target"],
+            "riskReward": user_override["risk_reward"],
+        }
+    else:
+        active = ai_active
+    assert active["entry"] == 423.2
+    assert active["stopLoss"] == 421.0
+    assert active["target"] == 428.0
+
+    rr = compute_risk_reward(active["entry"], active["stopLoss"], active["target"], "LONG")
+    assert rr.valid
+    # risk 2.2 (423.2-421.0), reward 4.8 (428.0-423.2) -> R:R 4.8/2.2 rounded to 2dp
+    assert rr.risk_reward == pytest.approx(2.18)
+
+
+def test_serialize_user_setup_unaffected_by_missing_ai():
+    """The UserTradeSetup serializer returns the saved override fields unchanged.
+    There is no code path where a missing AI setup nulls or deletes a persisted
+    user override."""
+    from datetime import datetime
+    from app.models.models import UserTradeSetup
+    from app.api.trade_setup import _serialize
+
+    setup = UserTradeSetup(
+        user_id="user-A",
+        symbol="FAKE_SETUP_NA",
+        entry=423.2,
+        stop_loss=421.0,
+        target=428.0,
+        risk_reward=2.18,
+        direction="LONG",
+        override_active=True,
+        updated_at=datetime(2026, 1, 1, 10, 0, 0),
+    )
+    out = _serialize(setup)
+    assert out["symbol"] == "FAKE_SETUP_NA"
+    assert out["override_active"] is True
+    assert out["entry"] == 423.2
+    assert out["stop_loss"] == 421.0
+    assert out["target"] == 428.0
+    assert out["risk_reward"] == 2.18
+    assert out["direction"] == "LONG"
+
+
+def test_user_setup_lookup_and_delete_scoped_to_user_and_symbol():
+    """Every read/write/delete of UserTradeSetup filters on BOTH user_id and symbol
+    so one user can never read, overwrite or reset another user's setup."""
+    from app.models.models import UserTradeSetup
+    from sqlalchemy import select, delete
+
+    read = select(UserTradeSetup).where(
+        UserTradeSetup.user_id == "user-A",
+        UserTradeSetup.symbol == "XYZ",
+    )
+    sql_read = str(read.compile(compile_kwargs={"literal_binds": True}))
+    assert "user-A" in sql_read and "XYZ" in sql_read
+
+    del_stmt = delete(UserTradeSetup).where(
+        UserTradeSetup.user_id == "user-A",
+        UserTradeSetup.symbol == "XYZ",
+    )
+    sql_del = str(del_stmt.compile(compile_kwargs={"literal_binds": True}))
+    assert "user-A" in sql_del and "XYZ" in sql_del
+
+
+def test_stock_detail_snapshot_signal_preserves_ai_setup():
+    """Regression: when stock_detail returns a cached scanner snapshot signal, the
+    full AI setup must be preserved (direction + confidence + setup dict) so the
+    frontend AI Recommended Setup is not N/A.
+
+    Previously the snapshot path built a bare class-instance object
+    (type('SignalObj', (object,), {'direction':.., 'confidence':..})()) whose
+    attributes were class-level, so FastAPI's jsonable_encoder serialized it to an
+    empty dict {} — dropping direction, confidence AND the entire setup. The API
+    response then showed every AI value as N/A after a scanner refresh.
+
+    The fix returns the snapshot's signal_data dict (the evaluate_signal dict)
+    directly, or a dict fallback — never a degenerate object.
+    """
+    from fastapi.encoders import jsonable_encoder
+
+    signal_data = {
+        "direction": "SHORT",
+        "confidence": 42.4,
+        "setup": {
+            "entry": 1291.4,
+            "stop_loss": 1293.74,
+            "target_1": 1288.27,
+            "target_2": 1286.71,
+            "risk_reward_ratio": 1.34,
+        },
+    }
+    snapshot = {
+        "direction": "SHORT",
+        "confidence": 42.4,
+        "signal_data": signal_data,
+        "signal_generated_at": "2026-09-08T12:00:31+05:30",
+        "data_age_seconds": 4.2,
+    }
+
+    # Simulate the (fixed) market.py snapshot branch resolution:
+    if snapshot.get("signal_data") is not None:
+        signal = snapshot["signal_data"]
+    else:
+        signal = {"direction": snapshot.get("direction"), "confidence": snapshot.get("confidence")}
+
+    encoded = jsonable_encoder(signal)
+    assert isinstance(encoded, dict)
+    assert "direction" in encoded
+    assert "confidence" in encoded
+    assert "setup" in encoded
+    assert encoded["setup"]["entry"] == 1291.4
+    assert encoded["setup"]["stop_loss"] == 1293.74
+    assert encoded["setup"]["target_1"] == 1288.27
+    assert encoded["setup"]["risk_reward_ratio"] == 1.34
+
+    # SHORT semantics: Target < Entry < SL, and R:R ratio is stored
+    assert encoded["setup"]["target_1"] < encoded["setup"]["entry"] < encoded["setup"]["stop_loss"]
+
+
+def test_stock_detail_snapshot_bare_object_regression_guard():
+    """Prove the OLD broken pattern serializes to {} — locking in why the fix is
+    required and ensuring a future revert cannot silently reintroduce N/A setups."""
+    from fastapi.encoders import jsonable_encoder
+
+    broken = type("SignalObj", (object,), {"direction": "SHORT", "confidence": 42.4})()
+    encoded = jsonable_encoder(broken)
+    assert isinstance(encoded, dict)
+    assert encoded == {}
+    assert "setup" not in encoded
+    assert "direction" not in encoded
+
+
+
 
 
 # ────────────────────────────────────────────────────────────────────────

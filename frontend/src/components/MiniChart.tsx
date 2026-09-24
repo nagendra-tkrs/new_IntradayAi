@@ -5,9 +5,11 @@ import {
   LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
   ReferenceLine, CartesianGrid, ComposedChart, Bar, Brush,
 } from "recharts";
+import type { CartesianTickItem, MouseHandlerDataParam, TooltipPayloadEntry } from "recharts";
+import type { ChartPoint } from "@/lib/types";
 
 interface MiniChartProps {
-  data: any[];
+  data: ChartPoint[];
   height?: number;
   showVolume?: boolean;
   entryLine?: number;
@@ -15,7 +17,7 @@ interface MiniChartProps {
   targetLine?: number;
 }
 
-function formatIST(isoString: string): string {
+function formatIST(isoString: string | null | undefined): string {
   if (!isoString) return "";
   try {
     return new Date(isoString).toLocaleTimeString("en-IN", {
@@ -29,7 +31,7 @@ function formatIST(isoString: string): string {
   }
 }
 
-function formatFullIST(isoString: string): string {
+function formatFullIST(isoString: string | null | undefined): string {
   if (!isoString) return "";
   try {
     const d = new Date(isoString);
@@ -58,9 +60,9 @@ function formatVolume(v: number): string {
   return v.toString();
 }
 
-function CustomTooltip({ active, payload, label }: any) {
+function CustomTooltip({ active, payload }: { active?: boolean; payload?: TooltipPayloadEntry[] }) {
   if (!active || !payload || !payload.length) return null;
-  const data = payload[0]?.payload;
+  const data = payload[0]?.payload as Partial<ChartPoint> | undefined;
   if (!data) return null;
   return (
     <div className="bg-[#1a1f2e] border border-[#2d3548] rounded-lg p-3 text-xs shadow-lg min-w-[180px]">
@@ -78,13 +80,14 @@ function CustomTooltip({ active, payload, label }: any) {
         </div>
       )}
       <div className="border-t border-[#2d3548] pt-2 space-y-1">
-        {payload.map((p: any, i: number) => {
+        {payload.map((p: TooltipPayloadEntry, i: number) => {
           if (p.dataKey === "volume" || p.dataKey === "open" || p.dataKey === "high" || p.dataKey === "low" || p.dataKey === "close") return null;
-          if (p.value === null || p.value === undefined) return null;
+          const pv = p.value as unknown as number | string | null | undefined;
+          if (pv === null || pv === undefined) return null;
           return (
             <div key={i} className="flex items-center justify-between text-[11px]">
-              <span style={{ color: p.color }}>{p.name || p.dataKey}</span>
-              <span className="text-white">₹{p.value?.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+              <span style={{ color: p.color }}>{p.name ?? String(p.dataKey ?? "")}</span>
+              <span className="text-white">₹{typeof pv === "number" ? pv.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : pv}</span>
             </div>
           );
         })}
@@ -99,11 +102,11 @@ function CustomTooltip({ active, payload, label }: any) {
   );
 }
 
-function CustomAxisTick({ x, y, payload }: any) {
+function CustomAxisTick({ x, y, payload }: { x?: number; y?: number; payload?: CartesianTickItem }) {
   if (!payload?.value) return null;
   const time = formatIST(payload.value);
   return (
-    <text x={x} y={y + 12} textAnchor="middle" fill="#6b7280" fontSize={10}>
+    <text x={x} y={typeof y === "number" ? y + 12 : y} textAnchor="middle" fill="#6b7280" fontSize={10}>
       {time}
     </text>
   );
@@ -128,9 +131,10 @@ export default function MiniChart({
     }));
   }, [data]);
 
-  const handleMouseMove = useCallback((state: any) => {
-    if (state?.activeTooltipIndex !== undefined) {
-      setActiveIndex(state.activeTooltipIndex);
+  const handleMouseMove = useCallback((state: MouseHandlerDataParam) => {
+    const idx = state.activeTooltipIndex;
+    if (typeof idx === "number") {
+      setActiveIndex(idx);
     }
   }, []);
 
@@ -147,7 +151,7 @@ export default function MiniChart({
   }
 
   const priceDataKey = "close";
-  const hasVolume = showVolume && chartData.some((d: any) => d.volume && d.volume > 0);
+  const hasVolume = showVolume && chartData.some((d) => d.volume && d.volume > 0);
   const chartHeight = hasVolume ? height - 60 : height;
   const volumeHeight = 60;
 

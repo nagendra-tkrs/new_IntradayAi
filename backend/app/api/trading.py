@@ -13,7 +13,7 @@ from app.models.models import User
 from app.api.auth import get_current_user
 
 router = APIRouter(prefix="/api", tags=["trading"])
-paper_engine = PaperTradingEngine()
+paper_engine = PaperTradingEngine(persist=True)
 risk_engine = RiskEngine()
 
 MAX_DUPLICATE_POSITIONS = 1
@@ -61,16 +61,54 @@ class ClosePositionRequest(BaseModel):
     exit_price: Optional[float] = None
 
 
+async def _finalize_paper_trade(result: dict, user_id: str):
+    """Shared close-finalization used by the manual close endpoint AND the
+    automatic SL/Target monitor: persists the closed trade to SQLite and updates
+    the shared risk engine (daily loss / consecutive-loss / position count)."""
+    try:
+        from app.core.database import async_session
+        from app.models.models import Trade
+        trade_dict = result.get("trade", {})
+        async with async_session() as db:
+            db_trade = Trade(
+                id=trade_dict.get("id", ""),
+                user_id=user_id,
+                symbol=trade_dict.get("symbol", ""),
+                direction=trade_dict.get("direction", ""),
+                entry_price=trade_dict.get("entry_price", 0.0),
+                exit_price=trade_dict.get("exit_price", 0.0),
+                quantity=trade_dict.get("quantity", 1),
+                stop_loss=trade_dict.get("stop_loss", 0.0),
+                target_1=trade_dict.get("target_1", 0.0),
+                target_2=trade_dict.get("target_2", 0.0),
+                entry_time=_parse_dt(trade_dict.get("opened_at", "")),
+                exit_time=_parse_dt(trade_dict.get("exit_time", "")),
+                status=trade_dict.get("status", "closed"),
+                pnl=trade_dict.get("pnl", 0.0),
+                fees=trade_dict.get("fees", 0.0),
+                slippage=trade_dict.get("slippage", 0.0),
+                signal_id=trade_dict.get("signal_id"),
+            )
+            db.add(db_trade)
+            await db.commit()
+    except Exception as e:
+        # Log but do not break the close flow; trade still in closed_trades
+        print(f"Failed to persist trade to SQLite: {e}")
+    pnl = result.get("pnl", 0)
+    risk_engine.record_trade_result(pnl)
+    risk_engine.state.open_positions = len(paper_engine.get_positions(user_id=user_id))
+
+
 @router.get("/portfolio")
-async def get_portfolio():
-    summary = paper_engine.get_portfolio_summary()
-    positions = paper_engine.get_positions()
+async def get_portfolio(user: User = Depends(get_current_user)):
+    summary = paper_engine.get_portfolio_summary(user_id=user.id)
+    positions = paper_engine.get_positions(user_id=user.id)
     return {**summary, "positions": positions}
 
 
 @router.post("/paper/orders")
 async def place_paper_order(order: OrderRequest, user: User = Depends(get_current_user)):
-    open_positions = paper_engine.get_positions()
+    open_positions = paper_engine.get_positions(user_id=user.id)
     if len(open_positions) >= risk_engine.config.max_simultaneous_positions:
         raise HTTPException(
             status_code=400,
@@ -78,7 +116,7 @@ async def place_paper_order(order: OrderRequest, user: User = Depends(get_curren
         )
 
     open_symbols = {p["symbol"] for p in open_positions}
-    pending_symbols = {p["symbol"] for p in paper_engine.get_pending_orders()}
+    pending_symbols = {p["symbol"] for p in paper_engine.get_pending_orders(user_id=user.id)}
     all_symbols = open_symbols | pending_symbols
     if order.symbol in all_symbols:
         raise HTTPException(
@@ -130,7 +168,7 @@ async def place_paper_order(order: OrderRequest, user: User = Depends(get_curren
 
 @router.patch("/paper/orders/{order_id}")
 async def edit_paper_order(order_id: str, payload: OrderEditRequest, user: User = Depends(get_current_user)):
-    order = paper_engine.pending_orders.get(order_id)
+    order = paper_engine.get_pending_order(order_id, user_id=user.id)
     if not order:
         raise HTTPException(status_code=404, detail="Pending order not found")
     if order.get("status") != "pending":
@@ -168,7 +206,7 @@ async def edit_paper_order(order_id: str, payload: OrderEditRequest, user: User 
 
 @router.post("/paper/orders/{order_id}/fill")
 async def fill_paper_order(order_id: str, req: FillOrderRequest = FillOrderRequest(), user: User = Depends(get_current_user)):
-    order = paper_engine.pending_orders.get(order_id)
+    order = paper_engine.get_pending_order(order_id, user_id=user.id)
     if not order:
         raise HTTPException(status_code=404, detail="Pending order not found")
     if order.get("status") != "pending":
@@ -184,21 +222,21 @@ async def fill_paper_order(order_id: str, req: FillOrderRequest = FillOrderReque
         except Exception:
             fill_price = order["entry_price"]
 
-    result = paper_engine.fill_order(order_id, fill_price=fill_price)
+    result = paper_engine.fill_order(order_id, fill_price=fill_price, user_id=user.id)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
-    risk_engine.state.open_positions = len(paper_engine.get_positions())
+    risk_engine.state.open_positions = len(paper_engine.get_positions(user_id=user.id))
     return result
 
 
 @router.delete("/paper/orders/{order_id}")
 async def cancel_paper_order(order_id: str, user: User = Depends(get_current_user)):
-    order = paper_engine.pending_orders.get(order_id)
+    order = paper_engine.get_pending_order(order_id, user_id=user.id)
     if not order:
         raise HTTPException(status_code=404, detail="Pending order not found")
     if order.get("user_id") and order["user_id"] != user.id:
         raise HTTPException(status_code=403, detail="Cannot cancel another user's order")
-    result = paper_engine.cancel_order(order_id)
+    result = paper_engine.cancel_order(order_id, user_id=user.id)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
@@ -206,16 +244,15 @@ async def cancel_paper_order(order_id: str, user: User = Depends(get_current_use
 
 @router.get("/paper/pending")
 async def get_pending_orders(user: User = Depends(get_current_user)):
-    orders = paper_engine.get_pending_orders()
-    my_orders = [o for o in orders if o.get("user_id") is None or o.get("user_id") == user.id]
-    return {"orders": my_orders}
+    orders = paper_engine.get_pending_orders(user_id=user.id)
+    return {"orders": orders}
 
 
 @router.post("/paper/close")
 async def close_paper_position(req: ClosePositionRequest, user: User = Depends(get_current_user)):
     exit_price = req.exit_price
     if exit_price is None:
-        pos = paper_engine.positions.get(req.position_id)
+        pos = paper_engine.get_position(req.position_id, user_id=user.id)
         if pos:
             quote = await _get_provider().get_quote(pos["symbol"])
             exit_price = quote["price"]
@@ -224,81 +261,58 @@ async def close_paper_position(req: ClosePositionRequest, user: User = Depends(g
     result = paper_engine.close_position(req.position_id, exit_price, user_id=user.id)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
-    # Persist the closed trade to SQLite for history/backward compatibility
-    try:
-        from app.core.database import async_session
-        from app.models.models import Trade
-        trade_dict = result.get("trade", {})
-        async with async_session() as db:
-            db_trade = Trade(
-                id=trade_dict.get("id", ""),
-                user_id=user.id,
-                symbol=trade_dict.get("symbol", ""),
-                direction=trade_dict.get("direction", ""),
-                entry_price=trade_dict.get("entry_price", 0.0),
-                exit_price=trade_dict.get("exit_price", 0.0),
-                quantity=trade_dict.get("quantity", 1),
-                stop_loss=trade_dict.get("stop_loss", 0.0),
-                target_1=trade_dict.get("target_1", 0.0),
-                target_2=trade_dict.get("target_2", 0.0),
-                entry_time=_parse_dt(trade_dict.get("opened_at", "")),
-                exit_time=_parse_dt(trade_dict.get("exit_time", "")),
-                status=trade_dict.get("status", "closed"),
-                pnl=trade_dict.get("pnl", 0.0),
-                fees=trade_dict.get("fees", 0.0),
-                slippage=trade_dict.get("slippage", 0.0),
-                signal_id=trade_dict.get("signal_id"),
-            )
-            db.add(db_trade)
-            await db.commit()
-    except Exception as e:
-        # Log but do not break the close flow; trade still in closed_trades
-        print(f"Failed to persist trade to SQLite: {e}")
-    pnl = result.get("pnl", 0)
-    risk_engine.record_trade_result(pnl)
-    risk_engine.state.open_positions = len(paper_engine.get_positions())
+    await _finalize_paper_trade(result, user.id)
     return result
 
 
 @router.get("/paper/positions")
-async def get_positions():
-    return {"positions": paper_engine.get_positions()}
+async def get_positions(user: User = Depends(get_current_user)):
+    return {"positions": paper_engine.get_positions(user_id=user.id)}
+
+
+def _trade_rows_to_dicts(db_trades) -> list[dict]:
+    """Serialize SQLAlchemy Trade rows to the paper-trade dict shape shared by
+    /paper/trades and /paper/performance so both use the same source of truth
+    (the persistent SQLite ledger)."""
+    trades = []
+    for t in db_trades:
+        trades.append({
+            "id": t.id,
+            "symbol": t.symbol,
+            "direction": t.direction,
+            "entry_price": t.entry_price,
+            "exit_price": t.exit_price,
+            "quantity": t.quantity,
+            "stop_loss": t.stop_loss,
+            "target_1": t.target_1,
+            "target_2": t.target_2,
+            "entry_time": str(t.entry_time) if t.entry_time else "",
+            "exit_time": str(t.exit_time) if t.exit_time else "",
+            "pnl": t.pnl,
+            "result": t.pnl > 0 and "WIN" or (t.pnl < 0 and "LOSS" or "BREAKEVEN"),
+            "status": t.status,
+        })
+    return trades
+
+
+async def _load_trades_from_db(user_id: str) -> list[dict]:
+    from app.core.database import async_session
+    from app.models.models import Trade
+    async with async_session() as db:
+        stmt = select(Trade).where(Trade.user_id == user_id).order_by(Trade.exit_time.desc())
+        result = await db.execute(stmt)
+        return _trade_rows_to_dicts(result.scalars().all())
 
 
 @router.get("/paper/trades")
 async def get_trade_history(limit: int = 50, user: User = Depends(get_current_user)):
-    from app.core.database import async_session
-    from app.models.models import Trade
-    async with async_session() as db:
-        stmt = select(Trade).where(Trade.user_id == user.id).order_by(Trade.exit_time.desc())
-        result = await db.execute(stmt)
-        db_trades = result.scalars().all()
-        trades = []
-        for t in db_trades:
-            trades.append({
-                "id": t.id,
-                "symbol": t.symbol,
-                "direction": t.direction,
-                "entry_price": t.entry_price,
-                "exit_price": t.exit_price,
-                "quantity": t.quantity,
-                "stop_loss": t.stop_loss,
-                "target_1": t.target_1,
-                "target_2": t.target_2,
-                "entry_time": str(t.entry_time) if t.entry_time else "",
-                "exit_time": str(t.exit_time) if t.exit_time else "",
-                "pnl": t.pnl,
-                "result": t.pnl > 0 and "WIN" or (t.pnl < 0 and "LOSS" or "BREAKEVEN"),
-                "status": t.status,
-            })
-        # Return up to limit trades, newest first
-        trades = trades[:limit]
-    return {"trades": trades}
+    trades = await _load_trades_from_db(user.id)
+    return {"trades": trades[:limit]}
 
 
 @router.get("/paper/performance")
-async def get_performance():
-    trades = paper_engine.closed_trades
+async def get_performance(user: User = Depends(get_current_user)):
+    trades = await _load_trades_from_db(user.id)
     now = now_ist()
     daily_trades = []
     weekly_trades = []

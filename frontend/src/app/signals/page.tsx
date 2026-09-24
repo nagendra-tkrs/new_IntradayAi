@@ -6,9 +6,10 @@ import Header from "@/components/Header";
 import SignalCard from "@/components/SignalCard";
 import { runScanner } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import type { ScannerResult } from "@/lib/types";
 
 export default function SignalsPage() {
-  const [signals, setSignals] = useState<any[]>([]);
+  const [signals, setSignals] = useState<ScannerResult[]>([]);
   const [loading, setLoading] = useState(true);
   const { user, loading: authLoading } = useAuth();
   const router = useRouter();
@@ -52,7 +53,7 @@ export default function SignalsPage() {
           </div>
         ) : signals.length > 0 ? (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {signals.map((signal: any) => (
+            {signals.map((signal) => (
               <SignalCard
                 key={signal.symbol}
                 signal={signal.signal_data}

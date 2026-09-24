@@ -10,7 +10,7 @@ class RiskConfig:
     max_risk_per_trade_pct: float = 2.0
     max_daily_loss_pct: float = 5.0
     max_trades_per_day: int = 10
-    max_simultaneous_positions: int = 5
+    max_simultaneous_positions: int = 10
     min_risk_reward: float = 1.2
     cooldown_after_losses: int = 3
 

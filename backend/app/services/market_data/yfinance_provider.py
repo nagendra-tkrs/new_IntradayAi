@@ -11,6 +11,7 @@ import requests
 
 from app.services.market_data.base import MarketDataProvider
 from app.core.market_session import now_ist, IST
+from app.services.provider_aliases import provider_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -349,9 +350,17 @@ class YFinanceMarketDataProvider(MarketDataProvider):
         return "yfinance"
 
     def _ns_symbol(self, symbol: str) -> str:
-        if symbol.endswith(".NS") or symbol.startswith("^"):
+        """Canonical symbol → provider wire symbol (Phase 5B §13).
+
+        Applies the canonical→provider alias map at the boundary ONLY: canonical
+        identity (pools, DB, attribution) is never rewritten — the alias decides
+        which ticker is actually requested from Yahoo.
+        """
+        if symbol.startswith("^"):
             return symbol
-        return f"{symbol}.NS"
+        base = symbol[:-3] if symbol.endswith(".NS") else symbol
+        mapped = provider_symbol(base)
+        return f"{mapped}.NS"
 
     def _strip_ns(self, symbol: str) -> str:
         if symbol.endswith(".NS"):
