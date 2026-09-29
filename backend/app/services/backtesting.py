@@ -20,6 +20,7 @@ class BacktestEngine:
         max_positions: int = 1,
         risk_per_trade_pct: float = 0.02,
         strategy_version: str = 'v1',
+        periods_per_year: int = 252,
     ):
         self.initial_capital = initial_capital
         self.brokerage_pct = brokerage_pct
@@ -28,6 +29,10 @@ class BacktestEngine:
         self.max_positions = max_positions
         self.risk_per_trade_pct = risk_per_trade_pct
         self.strategy_version = strategy_version
+        # Annualization periods for Sharpe/Sortino. The API path feeds daily
+        # yfinance bars, so the default is 252 trading days per year. Override
+        # for other bar frequencies.
+        self.periods_per_year = periods_per_year
 
     def _generate_trade_id(self) -> str:
         return uuid.uuid4().hex[:16]
@@ -97,11 +102,11 @@ class BacktestEngine:
         df = calculate_all_indicators(df)
         df_reset = df.reset_index(drop=True)
 
-        capital = self.initial_capital
+        cash = self.initial_capital
         equity_curve = []
         trades = []
         open_position: Optional[dict] = None
-        max_equity = capital
+        max_equity = cash
         max_drawdown = 0.0
         wins = 0
         losses = 0
@@ -260,7 +265,12 @@ class BacktestEngine:
                         'exit_bar': exit_bar,
                     })
 
-                    capital += net_pnl
+                    # Return the committed notional and add the realized P&L.
+                    # net_pnl already includes the round-trip brokerage + STT, so
+                    # this yields cash_after == cash_before_entry + net_pnl for
+                    # BOTH long and short positions (a short's collateral is the
+                    # entry notional, which must be returned on buy-back).
+                    cash += actual_entry * quantity + net_pnl
                     open_position = None
 
             if open_position is None and i + 1 < len(df_reset):
@@ -299,9 +309,9 @@ class BacktestEngine:
                 if risk <= 0:
                     continue
 
-                max_risk = capital * (sv.risk_per_trade_pct / 100.0)
+                max_risk = cash * (sv.risk_per_trade_pct / 100.0)
                 qty = int(max_risk / risk)
-                max_qty_by_capital = int((capital * 0.1) / entry_price)
+                max_qty_by_capital = int((cash * 0.1) / entry_price)
                 qty = min(qty, max_qty_by_capital)
 
                 if qty <= 0:
@@ -315,7 +325,7 @@ class BacktestEngine:
                 else:
                     actual_entry = entry_price - entry_slip
 
-                capital -= actual_entry * qty
+                cash -= actual_entry * qty
 
                 signal_info = {
                     'score': score_total,
@@ -350,21 +360,23 @@ class BacktestEngine:
 
             if open_position:
                 pos = open_position
-                if pos['direction'] in (
-                    SignalDirection.STRONG_LONG,
-                    SignalDirection.LONG,
-                    SignalDirection.WEAK_LONG,
-                ):
-                    unrealized = (current_close - pos['entry']) * pos['quantity']
-                else:
-                    unrealized = (pos['entry'] - current_close) * pos['quantity']
+                position_value = current_close * pos['quantity']
+                position_cost_basis = pos['actual_entry'] * pos['quantity']
+                unrealized = position_value - position_cost_basis
             else:
+                position_value = 0.0
                 unrealized = 0.0
 
-            current_equity = capital + unrealized
+            # Equity = available cash + marked-to-market position value. While a
+            # position is open the committed notional is held in position_value,
+            # so equity does not collapse merely because cash was reduced.
+            current_equity = cash + position_value
             equity_curve.append({
                 'timestamp': str(current_ts),
                 'equity': round(current_equity, 2),
+                'cash': round(cash, 2),
+                'position_value': round(position_value, 2),
+                'unrealized_pnl': round(unrealized, 2),
                 'bar_index': i,
                 'has_position': open_position is not None,
             })
@@ -404,10 +416,11 @@ class BacktestEngine:
         sharpe = 0.0
         sortino = 0.0
         if len(returns) > 1 and returns.std() > 0:
-            sharpe = (returns.mean() / returns.std()) * np.sqrt(252 * 75)
+            ann = np.sqrt(self.periods_per_year)
+            sharpe = (returns.mean() / returns.std()) * ann
             downside = returns[returns < 0]
             if len(downside) > 0 and downside.std() > 0:
-                sortino = (returns.mean() / downside.std()) * np.sqrt(252 * 75)
+                sortino = (returns.mean() / downside.std()) * ann
 
         performance = {
             'total_trades': total_trades,

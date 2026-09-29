@@ -87,11 +87,13 @@ def _ctx(trend: str = "NEUTRAL", change: float = 0.0) -> dict:
             "banknifty_change_pct": change}
 
 
-def _dec(row: pd.Series, ctx: dict | None = "DEFAULT") -> dict:
-    """evaluate_row_signal with an optional market context (never None-by-default)."""
+def _dec(row: pd.Series, ctx: dict | None = "DEFAULT", **kwargs) -> dict:
+    """evaluate_row_signal with an optional market context (never None-by-default).
+
+    ``**kwargs`` forwards additive engine arguments (e.g. ``context_24h``)."""
     if ctx == "DEFAULT":
         ctx = None
-    d = evaluate_row_signal(row, market_context=ctx)
+    d = evaluate_row_signal(row, market_context=ctx, **kwargs)
     assert d is not None, "decision should never be None for a populated row"
     return d
 
@@ -793,10 +795,16 @@ def test_api_contract_shape_and_directional_evidence_type():
                bb_upper=110.0, bb_lower=90.0)
     d = _dec(row, _ctx("BULLISH", 1.0))
     assert set(d) == {"direction", "confidence", "signal_score", "setup",
-                      "reasons", "risks", "direction_evidence"}
+                      "reasons", "risks", "direction_evidence", "context_24h"}
     assert isinstance(d["direction_evidence"], DirectionalEvidence)
     assert isinstance(d["signal_score"].total, float)
     assert d["setup"].entry > 0 and d["setup"].risk_reward_ratio >= 0
+    # context_24h is additive + optional: None when the Mode B payload is not
+    # supplied (flag OFF), a dict when it is — never fabricated.
+    assert d["context_24h"] is None
+    d_ctx = _dec(row, _ctx("BULLISH", 1.0), context_24h={"net": 0.4, "candles": 74})
+    assert d_ctx["context_24h"] == {"net": 0.4, "candles": 74}
+    assert d["setup"].model_dump() == d_ctx["setup"].model_dump()
 
     # DirectionalEvidence serialises cleanly (pydantic round-trip).
     dumped = d["direction_evidence"].model_dump()

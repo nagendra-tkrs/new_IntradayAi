@@ -52,17 +52,17 @@ python -m venv venv
 source venv/bin/activate  # or venv\Scripts\activate on Windows
 pip install -r requirements.txt
 cp ../.env.example ../.env
-python -m uvicorn app.main:app --reload --port 8000
+python -m uvicorn app.main:app --reload --port 8020
 ```
 
 **Frontend:**
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev -- -p 3005
 ```
 
-The app will be available at http://localhost:3000 (frontend) and http://localhost:8000 (API).
+The app will be available at http://localhost:3005 (frontend) and http://localhost:8020 (API).
 
 ### Docker Compose
 ```bash

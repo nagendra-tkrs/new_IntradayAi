@@ -1,0 +1,376 @@
+{
+  "date": "2026-08-20",
+  "strategy_version": "v1",
+  "generated_at": "2026-08-20T14:26:15.578558+05:30",
+  "data_range": {
+    "source": "yfinance",
+    "timeframe": "5m",
+    "start": "2026-05-29",
+    "end": "2026-08-20",
+    "total_bars": 13160,
+    "symbols": 3
+  },
+  "stats": {
+    "RELIANCE": {
+      "total_trades": 45,
+      "win_rate": 24.4,
+      "profit_factor": 0.16,
+      "expectancy": -70.03,
+      "avg_r_multiple": -1.216,
+      "max_drawdown": 98.46,
+      "total_pnl": -3151.15,
+      "by_direction": {
+        "STRONG_LONG": {
+          "count": 0,
+          "wins": 0,
+          "total_pnl": 0
+        },
+        "STRONG_SHORT": {
+          "count": 0,
+          "wins": 0,
+          "total_pnl": 0
+        },
+        "LONG": {
+          "count": 0,
+          "wins": 0,
+          "total_pnl": 0
+        },
+        "SHORT": {
+          "count": 0,
+          "wins": 0,
+          "total_pnl": 0
+        },
+        "SignalDirection.LONG": {
+          "count": 44,
+          "wins": 10,
+          "total_pnl": -3263.46
+        },
+        "SignalDirection.STRONG_LONG": {
+          "count": 1,
+          "wins": 1,
+          "total_pnl": 112.31
+        }
+      },
+      "evaluated_at": "2026-08-20T14:26:05.647977+05:30"
+    },
+    "TCS": {
+      "total_trades": 43,
+      "win_rate": 58.1,
+      "profit_factor": 1.68,
+      "expectancy": 29.51,
+      "avg_r_multiple": -0.094,
+      "max_drawdown": 98.02,
+      "total_pnl": 1269.13,
+      "by_direction": {
+        "STRONG_LONG": {
+          "count": 0,
+          "wins": 0,
+          "total_pnl": 0
+        },
+        "STRONG_SHORT": {
+          "count": 0,
+          "wins": 0,
+          "total_pnl": 0
+        },
+        "LONG": {
+          "count": 0,
+          "wins": 0,
+          "total_pnl": 0
+        },
+        "SHORT": {
+          "count": 0,
+          "wins": 0,
+          "total_pnl": 0
+        },
+        "SignalDirection.LONG": {
+          "count": 39,
+          "wins": 23,
+          "total_pnl": 1333.4900000000005
+        },
+        "SignalDirection.STRONG_LONG": {
+          "count": 4,
+          "wins": 2,
+          "total_pnl": -64.36
+        }
+      },
+      "evaluated_at": "2026-08-20T14:26:08.650467+05:30"
+    },
+    "HDFCBANK": {
+      "total_trades": 39,
+      "win_rate": 48.7,
+      "profit_factor": 0.35,
+      "expectancy": -43.27,
+      "avg_r_multiple": -0.639,
+      "max_drawdown": 98.0,
+      "total_pnl": -1687.7,
+      "by_direction": {
+        "STRONG_LONG": {
+          "count": 0,
+          "wins": 0,
+          "total_pnl": 0
+        },
+        "STRONG_SHORT": {
+          "count": 0,
+          "wins": 0,
+          "total_pnl": 0
+        },
+        "LONG": {
+          "count": 0,
+          "wins": 0,
+          "total_pnl": 0
+        },
+        "SHORT": {
+          "count": 0,
+          "wins": 0,
+          "total_pnl": 0
+        },
+        "SignalDirection.LONG": {
+          "count": 37,
+          "wins": 18,
+          "total_pnl": -1371.77
+        },
+        "SignalDirection.STRONG_LONG": {
+          "count": 2,
+          "wins": 1,
+          "total_pnl": -315.93
+        }
+      },
+      "evaluated_at": "2026-08-20T14:26:11.574717+05:30"
+    },
+    "current": {
+      "total_trades": 127,
+      "total_pnl": -3569.7200000000003,
+      "avg_profit_factor": 0.73,
+      "avg_expectancy": -27.929999999999996,
+      "symbol_count": 3,
+      "updated_at": "2026-08-20T14:26:11.577275+05:30"
+    }
+  },
+  "signal_distribution": {
+    "STRONG_LONG": 0,
+    "STRONG_SHORT": 0,
+    "LONG": 0,
+    "SHORT": 0,
+    "SignalDirection.LONG": 120,
+    "SignalDirection.STRONG_LONG": 7
+  },
+  "strong_performance": {
+    "count": 7,
+    "wins": 4,
+    "win_rate": 57.14285714285714,
+    "total_pnl": -267.98,
+    "profit_factor": 0.2953272502563833,
+    "expectancy": -38.28285714285715,
+    "avg_r": -38.28285714285715
+  },
+  "wf_results": {
+    "RELIANCE": [
+      {
+        "fold": 1,
+        "train_bars": 1462,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      },
+      {
+        "fold": 2,
+        "train_bars": 2010,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      },
+      {
+        "fold": 3,
+        "train_bars": 2558,
+        "test_bars": 100,
+        "test_pnl": 431.94,
+        "test_pf": 999.0,
+        "test_trades": 1,
+        "test_expectancy": 431.94
+      },
+      {
+        "fold": 4,
+        "train_bars": 3106,
+        "test_bars": 100,
+        "test_pnl": -365.23,
+        "test_pf": 0.05,
+        "test_trades": 2,
+        "test_expectancy": -182.61
+      },
+      {
+        "fold": 5,
+        "train_bars": 3654,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      },
+      {
+        "fold": 6,
+        "train_bars": 4202,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      }
+    ],
+    "TCS": [
+      {
+        "fold": 1,
+        "train_bars": 1462,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      },
+      {
+        "fold": 2,
+        "train_bars": 2010,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      },
+      {
+        "fold": 3,
+        "train_bars": 2558,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      },
+      {
+        "fold": 4,
+        "train_bars": 3106,
+        "test_bars": 100,
+        "test_pnl": -1228.82,
+        "test_pf": 0.0,
+        "test_trades": 2,
+        "test_expectancy": -614.41
+      },
+      {
+        "fold": 5,
+        "train_bars": 3654,
+        "test_bars": 100,
+        "test_pnl": 141.67,
+        "test_pf": 999.0,
+        "test_trades": 1,
+        "test_expectancy": 141.67
+      },
+      {
+        "fold": 6,
+        "train_bars": 4202,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      }
+    ],
+    "HDFCBANK": [
+      {
+        "fold": 1,
+        "train_bars": 1462,
+        "test_bars": 100,
+        "test_pnl": -648.27,
+        "test_pf": 0.0,
+        "test_trades": 1,
+        "test_expectancy": -648.27
+      },
+      {
+        "fold": 2,
+        "train_bars": 2010,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      },
+      {
+        "fold": 3,
+        "train_bars": 2558,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      },
+      {
+        "fold": 4,
+        "train_bars": 3106,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      },
+      {
+        "fold": 5,
+        "train_bars": 3654,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      },
+      {
+        "fold": 6,
+        "train_bars": 4202,
+        "test_bars": 100,
+        "test_pnl": 0,
+        "test_pf": 999.0,
+        "test_trades": 0,
+        "test_expectancy": 0
+      }
+    ]
+  },
+  "comparison": {
+    "v2_candidate": {
+      "is_better": "False",
+      "avg_pnl": -104.29666666666664,
+      "avg_pf": 0.64,
+      "wf_positive_symbols": "1",
+      "wf_total_symbols": 3,
+      "pf_margin_required": 0.803,
+      "capital_preserved": "False",
+      "min_trades_met": true,
+      "decision": "REJECT"
+    }
+  },
+  "recommendations": [
+    {
+      "check": "Profit Factor >= 1.5",
+      "status_ok": "False",
+      "recommendation": "PF=0.73. Consider reviewing strategy risk/reward logic"
+    },
+    {
+      "check": "Trade frequency > 5/day",
+      "status_ok": true,
+      "recommendation": "Trades=127"
+    },
+    {
+      "check": "Positive expectancy",
+      "status_ok": "False",
+      "recommendation": "Exp=-27.93. Review signal quality and exit logic"
+    },
+    {
+      "check": "Multi-symbol consistency",
+      "status_ok": false,
+      "recommendation": "1/3 symbols positive. Investigate symbol-specific issues"
+    },
+    {
+      "check": "Candidate evaluation",
+      "status_ok": true,
+      "recommendation": "All candidates rejected - current strategy validated"
+    }
+  ]
+}

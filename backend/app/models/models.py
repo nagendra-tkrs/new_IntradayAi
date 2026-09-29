@@ -72,6 +72,58 @@ class Signal(Base):
     outcome = Column(String(20), default="pending")
     realized_pnl = Column(Float, default=0.0)
     holding_duration = Column(Integer, default=0)
+    # Additive recommendation traceability (24H-context experiment): quality
+    # label and order-usage fields written by signal_store when an order links
+    # this signal_id (quantity / risk_amount = qty × |entry − SL|).
+    signal_quality = Column(String(20))
+    quantity = Column(Float)
+    risk_amount = Column(Float)
+    # Full evidence snapshot at recommendation time (additive, nullable):
+    # atr_14 value, strategy version (None when a version is not wired), and the
+    # effective risk percentage of portfolio value at order time.
+    atr = Column(Float)
+    strategy_version = Column(String(20))
+    risk_percent = Column(Float)
+
+
+class Signal24hComparison(Base):
+    """Shadow comparison row: Mode A (current) signal vs Mode B (24H-context)
+    shadow signal at the same decision candle.
+
+    Read-only experimental record. The 24H variant NEVER places paper orders —
+    it only records what it would have recommended so the two decision spaces
+    can be compared without changing trading behavior (see
+    ``app.services.signal_store.persist_24h_comparison``)."""
+    __tablename__ = "signal_24h_comparisons"
+    __table_args__ = (
+        Index("ix_signal_24h_comparisons_symbol", "symbol"),
+    )
+    id = Column(String(16), primary_key=True, default=gen_id)
+    symbol = Column(String(50), nullable=False)
+    candle_ts = Column(DateTime, nullable=False)
+    generated_at = Column(DateTime)
+    current_direction = Column(String(20))
+    current_score = Column(Float)
+    current_confidence = Column(Float)
+    current_quality = Column(String(20))
+    current_entry = Column(Float)
+    current_sl = Column(Float)
+    current_t1 = Column(Float)
+    current_t2 = Column(Float)
+    current_rr = Column(Float)
+    ctx24_direction = Column(String(20))
+    ctx24_score = Column(Float)
+    ctx24_confidence = Column(Float)
+    ctx24_quality = Column(String(20))
+    ctx24_entry = Column(Float)
+    ctx24_sl = Column(Float)
+    ctx24_t1 = Column(Float)
+    ctx24_t2 = Column(Float)
+    ctx24_rr = Column(Float)
+    context_24h = Column(Text)
+    current_evidence = Column(Text)
+    ctx24_evidence = Column(Text)
+    agreement = Column(Integer, default=0)
 
 
 class Trade(Base):
@@ -93,6 +145,9 @@ class Trade(Base):
     pnl = Column(Float, default=0.0)
     fees = Column(Float, default=0.0)
     slippage = Column(Float, default=0.0)
+    # Profit-capture details (exit_reason, partial linkage, initial/remaining
+    # quantities, trailing fields). Additive JSON column; NULL on legacy rows.
+    details_json = Column(Text, nullable=True)
 
 
 class Portfolio(Base):
@@ -125,8 +180,11 @@ class Position(Base):
 class Backtest(Base):
     __tablename__ = "backtests"
     id = Column(String(16), primary_key=True, default=gen_id)
+    user_id = Column(String(16), ForeignKey("users.id"), nullable=True, index=True)
     strategy = Column(String(100), nullable=False)
     symbol = Column(String(50))
+    universe = Column(String(50), nullable=True)
+    days = Column(Integer, nullable=True)
     start_date = Column(DateTime, nullable=False)
     end_date = Column(DateTime, nullable=False)
     initial_capital = Column(Float, nullable=False)
@@ -138,6 +196,7 @@ class Backtest(Base):
     sharpe_ratio = Column(Float, default=0.0)
     expectancy = Column(Float, default=0.0)
     total_pnl = Column(Float, default=0.0)
+    status = Column(String(20), default="completed")
     created_at = Column(DateTime, default=datetime.utcnow)
     results_json = Column(Text)
 
@@ -200,6 +259,11 @@ class PaperPosition(Base):
     opened_at = Column(String(40), nullable=False)
     status = Column(String(20), default="open")
     filled_at = Column(String(40), nullable=True)
+    # Profit-capture state (exit_stage, t1_exit_price/qty/pnl, trailing_active,
+    # realized_pnl, atr_ref, initial_quantity). Additive JSON column.
+    profit_meta = Column(Text, nullable=True)
+    # Traceability: the AI signal (signals.id) this position originated from.
+    signal_id = Column(String(16), nullable=True)
 
 
 class PaperPendingOrder(Base):
@@ -224,3 +288,7 @@ class PaperPendingOrder(Base):
     opened_at = Column(String(40), nullable=False)
     status = Column(String(20), default="pending")
     filled_at = Column(String(40), nullable=True)
+    # Profit-capture metadata carried into the position on fill (atr_ref).
+    profit_meta = Column(Text, nullable=True)
+    # Traceability: the AI signal (signals.id) this pending order originated from.
+    signal_id = Column(String(16), nullable=True)

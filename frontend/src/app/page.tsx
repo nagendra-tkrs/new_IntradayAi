@@ -3,7 +3,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import Header from "@/components/Header";
-import SignalCard from "@/components/SignalCard";
+import TopSignals from "@/components/TopSignals";
 import { runScanner, getMarketStatus } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import Link from "next/link";
@@ -78,7 +78,15 @@ export default function Dashboard() {
             Intraday market scanner with multi-factor signal analysis
           </p>
           <div className="mt-2 px-3 py-2 bg-blue-500/10 border border-blue-500/30 rounded-lg text-xs text-blue-400 flex items-center justify-between">
-            <span>Data sourced via yfinance (Yahoo Finance). Prices may be delayed. This is not financial advice.</span>
+            <span className="flex items-center gap-2 flex-wrap">
+              {scanner?.universe && (
+                <Link href="/universe" className="text-blue-400 hover:text-blue-300 underline decoration-dotted underline-offset-2">
+                  Live Universe: {scanner.universe} &rarr;
+                </Link>
+              )}
+              <span className="hidden sm:inline-block text-blue-400/40">|</span>
+              <span>Data sourced via yfinance (Yahoo Finance). Prices may be delayed. This is not financial advice.</span>
+            </span>
             <span className="flex items-center gap-2">
               {isRefreshing && <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />}
               {lastRefresh && <span>Last: {lastRefresh.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" })}</span>}
@@ -90,7 +98,7 @@ export default function Dashboard() {
           <div className="flex items-center justify-center py-20">
             <div className="text-center">
               <div className="w-12 h-12 border-4 border-blue-500/30 border-t-blue-500 rounded-full animate-spin mx-auto mb-4" />
-              <p className="text-gray-400 text-sm">Scanning NIFTY50 universe...</p>
+              <p className="text-gray-400 text-sm">Scanning the active universe...</p>
             </div>
           </div>
         )}
@@ -117,9 +125,12 @@ export default function Dashboard() {
                 <div className="text-xl font-bold text-yellow-400 mt-1">{scanner.data_source}</div>
               </div>
               <div className="card">
-                <div className="text-xs text-gray-500 uppercase tracking-wider">Strong Signals</div>
+                <div className="text-xs text-gray-500 uppercase tracking-wider">Top Quality Signals</div>
                 <div className="text-xl font-bold text-green-400 mt-1">
-                  {scanner.top_signals?.filter((s) => s.confidence >= 70).length || 0}
+                  {scanner.results?.filter((r) => r.top_signal_eligible === true).length || 0}
+                </div>
+                <div className="text-[9px] text-gray-600 mt-0.5">
+                  eligible this scan · top 3 shown below
                 </div>
               </div>
             </div>
@@ -131,22 +142,13 @@ export default function Dashboard() {
               </Link>
             </div>
 
-            {scanner.top_signals && scanner.top_signals.length > 0 ? (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
-                {scanner.top_signals.map((signal) => (
-                  <SignalCard
-                    key={signal.symbol}
-                    signal={signal.signal_data}
-                    onClick={() => window.location.href = `/stock/${signal.symbol}`}
-                  />
-                ))}
-              </div>
-            ) : (
-              <div className="card text-center py-12 text-gray-500">
-                <p className="text-lg mb-2">No strong signals detected</p>
-                <p className="text-xs">The scanner evaluates multiple confirmations before generating signals.</p>
-              </div>
-            )}
+            <div className="mb-8">
+              <TopSignals
+                results={scanner.results}
+                scanned={scanner.total_scanned}
+                onSelect={(sym) => router.push(`/stock/${sym}`)}
+              />
+            </div>
 
             <div className="flex items-center justify-between mb-4 mt-8">
               <h2 className="text-lg font-bold text-white">All Stocks</h2>

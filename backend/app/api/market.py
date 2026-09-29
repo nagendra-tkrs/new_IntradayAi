@@ -1,14 +1,18 @@
 from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.market_data.provider_factory import get_provider, get_data_status
 from app.services.scanner import MarketScanner
+from app.services.signal_quality import rank_top_signals, select_top_signals
 from app.services.indicators import calculate_all_indicators
 from app.services.data_validation import data_status
 from app.core.market_session import is_market_hours
 from app.core.database import get_db
+from app.core.config import settings
 from app.models.models import User, UserTradeSetup
 from app.api.auth import get_current_user
+import app.services.active_universe as active_universe
 
 router = APIRouter(prefix="/api", tags=["market"])
 
@@ -54,7 +58,18 @@ async def market_index(name: str = "NIFTY50"):
 
 
 @router.get("/stocks")
-async def list_stocks(universe: str = "NIFTY50"):
+async def list_stocks(universe: str = settings.LIVE_UNIVERSE):
+    """List instruments. DEFAULT (no ``universe`` param): the ACTIVE live
+    universe (80 stocks, CORE/ROTATION classification) resolved via
+    ``active_universe`` — FAIL CLOSED (503) when the 80-stock universe is not
+    available. Explicit legacy universes (NIFTY50/NIFTY100/BANKNIFTY) keep the
+    previous provider behavior."""
+    if active_universe.is_active_universe_request(universe):
+        try:
+            resolution = await active_universe.get_active_trading_universe()
+        except active_universe.ActiveUniverseUnavailable as exc:
+            return JSONResponse(status_code=503, content=exc.payload)
+        return resolution["stocks"]
     return await _get_provider().get_instruments(universe)
 
 
@@ -261,20 +276,45 @@ async def stock_chart(symbol: str, days: int = 1, interval: str = "5m"):
 
 
 @router.get("/scanner")
-async def run_scanner(universe: str = "NIFTY50"):
+async def run_scanner(universe: str = settings.LIVE_UNIVERSE):
     provider = _get_provider()
     scanner = _get_scanner()
+    active = active_universe.is_active_universe_request(universe)
+    active_version = None
+    if active:
+        # Fail-closed envelope: resolve the ACTIVE universe BEFORE scanning so
+        # an unavailable universe returns 503 instead of scanning the wrong one.
+        try:
+            resolution = await active_universe.get_active_trading_universe()
+            active_version = resolution.get("universe_version")
+        except active_universe.ActiveUniverseUnavailable as exc:
+            return JSONResponse(status_code=503, content=exc.payload)
     results = await scanner.scan_universe(universe)
-    top_signals = [r for r in results if r.get("signal") not in ("NO_TRADE", "ERROR", None)]
-    top_signals.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+    # Top Signal Quality Layer: deterministic quality ranking. Eligible rows
+    # (PREMIUM / QUALIFIED) get a 1..n ``top_signal_rank``; base signals are
+    # untouched and ``results`` keeps its original scan order.
+    ranked = rank_top_signals(results)
+    # Dynamic Top Signals: combined LONG/SHORT pool from the CURRENT scan,
+    # quality-ranked, at most 3. Recalculated on every fresh scan — never the
+    # previous scan's result, never direction-balanced, never padded with
+    # WEAK/REJECTED rows (select_top_signals only keeps PREMIUM / QUALIFIED).
+    top_signals = select_top_signals(ranked)
+    quality_dist: dict[str, int] = {}
+    for r in ranked:
+        q = r.get("setup_quality")
+        if q:
+            quality_dist[q] = quality_dist.get(q, 0) + 1
     ds = get_data_status()
     return {
         "total_scanned": len(results),
-        "signals_found": len(top_signals),
+        "signals_found": len([r for r in results if r.get("signal") not in ("NO_TRADE", "ERROR", None)]),
+        "setup_quality_distribution": quality_dist,
         "data_source": provider.data_source_label,
         "data_status": ds,
         "signals_paused": data_status.signals_paused,
+        "universe": "rotation_80" if active else universe,
+        "active_universe_version": active_version,
         "results": results,
-        "top_signals": top_signals[:10],
+        "top_signals": top_signals,
         "disclaimer": "Market data supplied through yfinance may be delayed. Signal scores are not guaranteed accuracy.",
     }

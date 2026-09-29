@@ -38,6 +38,7 @@ export default function Header() {
   const navItems = [
     { href: "/", label: "Dashboard" },
     { href: "/scanner", label: "Scanner" },
+    { href: "/universe", label: "Universe" },
     { href: "/signals", label: "Signals" },
     { href: "/paper-trading", label: "Paper Trading" },
     { href: "/backtest", label: "Backtest" },

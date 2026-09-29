@@ -1,0 +1,139 @@
+================================================================================
+DAILY TRADING REPORT - 2026-08-20
+================================================================================
+
+1. CURRENT STRATEGY VERSION
+----------------------------------------
+  Version: v1
+  Description: Baseline: STRONG threshold 80, normal RR 1.2, STRONG RR 2.0
+
+2. SIGNAL DISTRIBUTION
+----------------------------------------
+  LONG: 0
+  SHORT: 0
+  STRONG_LONG: 0
+  STRONG_SHORT: 0
+  SignalDirection.LONG: 120
+  SignalDirection.STRONG_LONG: 7
+  TOTAL: 127
+
+3. PERFORMANCE SUMMARY
+----------------------------------------
+  Total Trades: 127
+  Total P&L: -3569.72
+  Avg Profit Factor: 0.73
+  Avg Expectancy: -27.93
+
+4. STRONG SIGNAL PERFORMANCE
+----------------------------------------
+  STRONG trades: 7
+  Win Rate: 57.1%
+  Expectancy: -38.28
+  Profit Factor: 0.30
+  Avg R:Multiple: -38.28
+
+5. SYMBOL BREAKDOWN
+----------------------------------------
+  RELIANCE:
+    Trades: 45
+    Win Rate: 24.4%
+    Profit Factor: 0.16
+    Expectancy: -70.03
+    Max Drawdown: 98.5%
+    Avg R:Multiple: -1.22
+  TCS:
+    Trades: 43
+    Win Rate: 58.1%
+    Profit Factor: 1.68
+    Expectancy: 29.51
+    Max Drawdown: 98.0%
+    Avg R:Multiple: -0.09
+  HDFCBANK:
+    Trades: 39
+    Win Rate: 48.7%
+    Profit Factor: 0.35
+    Expectancy: -43.27
+    Max Drawdown: 98.0%
+    Avg R:Multiple: -0.64
+
+6. ACTIVE STRATEGY PARAMETERS
+----------------------------------------
+  --- Score Thresholds ---
+  STRONG Long:  >= 80.0
+  LONG:         >= 75.0
+  WEAK Long:    >= 65.0
+  NO_TRADE:     >= 55.0
+  WEAK Short:   >= 45.0
+  SHORT:        >= 30.0
+  STRONG Short: <  30.0
+  Min Score:    45.0
+  --- Risk/Reward ---
+  STRONG Min R:R: 2.0
+  Normal Min R:R: 1.2
+  --- ATR Multipliers ---
+  STRONG Target: 3.0x ATR
+  Normal Target: 2.0x ATR
+  Stop Loss:     1.5x ATR
+  --- STRONG Quality Filters ---
+  Min ADX: 25.0
+  Min RelVol: 1.0
+  Max RSI (Long): 75.0
+  Min RSI (Short): 25.0
+  --- Risk Management ---
+  Risk Per Trade: 2.0%
+  Capital: 1000000
+
+7. WALK-FORWARD VALIDATION
+----------------------------------------
+  RELIANCE:
+    Cycle 1: PnL=0.00, PF=999.00, Trades=0
+    Cycle 2: PnL=0.00, PF=999.00, Trades=0
+    Cycle 3: PnL=431.94, PF=999.00, Trades=1
+    Cycle 4: PnL=-365.23, PF=0.05, Trades=2
+    Cycle 5: PnL=0.00, PF=999.00, Trades=0
+    Cycle 6: PnL=0.00, PF=999.00, Trades=0
+  TCS:
+    Cycle 1: PnL=0.00, PF=999.00, Trades=0
+    Cycle 2: PnL=0.00, PF=999.00, Trades=0
+    Cycle 3: PnL=0.00, PF=999.00, Trades=0
+    Cycle 4: PnL=-1228.82, PF=0.00, Trades=2
+    Cycle 5: PnL=141.67, PF=999.00, Trades=1
+    Cycle 6: PnL=0.00, PF=999.00, Trades=0
+  HDFCBANK:
+    Cycle 1: PnL=-648.27, PF=0.00, Trades=1
+    Cycle 2: PnL=0.00, PF=999.00, Trades=0
+    Cycle 3: PnL=0.00, PF=999.00, Trades=0
+    Cycle 4: PnL=0.00, PF=999.00, Trades=0
+    Cycle 5: PnL=0.00, PF=999.00, Trades=0
+    Cycle 6: PnL=0.00, PF=999.00, Trades=0
+
+8. CANDIDATE STRATEGIES
+----------------------------------------
+  Production: v1
+  Candidate            Decision   Avg PF     Avg PnL      WF   
+  ------------------------------------------------------------
+  v2_candidate         REJECT     0.64       -104.30      1/3  
+
+9. DEPLOYMENT STATUS
+----------------------------------------
+  Current: v1 (deployed 2026-08-20T11:37:35.539890+05:30)
+  Rollback events: 0
+
+10. DATA PERIOD
+----------------------------------------
+  Source: yfinance
+  Period: 2026-05-29 to 2026-08-20
+  Timeframe: 5m
+  Total Bars: 13160
+
+11. RECOMMENDATIONS
+----------------------------------------
+  [FAIL] Profit Factor >= 1.5: PF=0.73. Consider reviewing strategy risk/reward logic
+  [PASS] Trade frequency > 5/day: Trades=127
+  [FAIL] Positive expectancy: Exp=-27.93. Review signal quality and exit logic
+  [FAIL] Multi-symbol consistency: 1/3 symbols positive. Investigate symbol-specific issues
+  [PASS] Candidate evaluation: All candidates rejected - current strategy validated
+
+================================================================================
+END OF REPORT
+================================================================================

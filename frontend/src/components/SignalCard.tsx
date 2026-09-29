@@ -16,6 +16,23 @@ const EMPTY_SETUP: SignalSetup = {
 interface SignalCardProps {
   signal: SignalInfo | null | undefined;
   onClick?: () => void;
+  /** Top Signal Quality Layer fields (additive; optional for older payloads). */
+  setupQuality?: string | null | undefined;
+  qualityScore?: number | null | undefined;
+  confirmationCount?: number | null | undefined;
+  confirmationTotal?: number | null | undefined;
+  riskRewardRatio?: number | null | undefined;
+}
+
+function qualityBadgeClasses(level: string | null | undefined): string | null {
+  switch (level) {
+    case "PREMIUM": return "text-amber-300 bg-amber-500/10 border border-amber-500/40";
+    case "QUALIFIED": return "text-emerald-300 bg-emerald-500/10 border border-emerald-500/40";
+    case "NORMAL": return "text-sky-300 bg-sky-500/10 border border-sky-500/40";
+    case "WEAK": return "text-gray-300 bg-gray-500/10 border border-gray-500/40";
+    case "REJECTED": return "text-red-300 bg-red-500/10 border border-red-500/40";
+    default: return null;
+  }
 }
 
 function confidenceColor(confidence: number) {
@@ -63,10 +80,19 @@ function TimeIcon() {
   );
 }
 
-export default function SignalCard({ signal, onClick }: SignalCardProps) {
+export default function SignalCard({
+  signal,
+  onClick,
+  setupQuality,
+  qualityScore,
+  confirmationCount,
+  confirmationTotal,
+  riskRewardRatio,
+}: SignalCardProps) {
   if (!signal) return null;
   const confidence = signal.confidence || 0;
   const setup = signal.setup || EMPTY_SETUP;
+  const qualityBadge = qualityBadgeClasses(setupQuality);
 
   return (
     <div
@@ -84,7 +110,12 @@ export default function SignalCard({ signal, onClick }: SignalCardProps) {
             </p>
           )}
         </div>
-        <div className="text-right">
+        <div className="text-right flex flex-col items-end gap-1">
+          {qualityBadge && (
+            <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-bold ${qualityBadge}`}>
+              {setupQuality}
+            </span>
+          )}
           <span className={`inline-block px-2.5 py-1 rounded-full text-xs font-bold ${directionBadge(signal.direction)}`}>
             {signal.direction}
           </span>
@@ -99,6 +130,15 @@ export default function SignalCard({ signal, onClick }: SignalCardProps) {
         <span className={`text-xs font-medium ml-1 ${confidenceColor(confidence)}`}>
           {confidenceLabel(confidence)}
         </span>
+        {qualityScore != null && (
+          <span className="text-[10px] text-gray-500 ml-auto">
+            Quality <span className="text-sky-300 font-semibold">{qualityScore}</span>
+            {confirmationCount != null && confirmationTotal != null
+              ? ` · ${confirmationCount}/${confirmationTotal} confirmations`
+              : ""}
+            {riskRewardRatio != null ? ` · RR ${riskRewardRatio.toFixed(2)}` : ""}
+          </span>
+        )}
       </div>
 
       <div className="confidence-bar mb-3">

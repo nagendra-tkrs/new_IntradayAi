@@ -31,9 +31,9 @@ SYMS = ["RELIANCE", "TCS", "INFY", "HDFC", "ICICI", "SBIN", "LT", "WIPRO",
         "NESTLEIND", "SUNPHARMA", "BHARTIARTL", "HCLTECH", "KOTAKBANK",
         "AXISBANK", "TITAN"]
 
-LONG_A = dict(direction="LONG", quantity=10, entry_price=100.0,
+LONG_A = dict(direction="LONG", quantity=4, entry_price=100.0,
               stop_loss=95.0, target_1=105.0)
-SHORT_A = dict(direction="SHORT", quantity=10, entry_price=100.0,
+SHORT_A = dict(direction="SHORT", quantity=4, entry_price=100.0,
                stop_loss=105.0, target_1=95.0)
 
 
@@ -284,8 +284,8 @@ def test_phase7_short_accounting_unchanged():
     assert s["total_pnl"] == pytest.approx(100.0)
 
 
-# ── M. SL / Target-1 auto-close unchanged ───────────────────────────────
-def test_phase7_sl_target_auto_close_unchanged():
+# ── M. SL full-close / Target-1 partial auto-exit ───────────────────────
+def test_phase7_sl_target_auto_close():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
@@ -293,14 +293,20 @@ def test_phase7_sl_target_auto_close_unchanged():
     pt.check_entry_triggers({"RELIANCE": 100.0}, user_id="u")
     assert len(pt.get_positions(user_id="u")) == 1
 
+    # Target-1 hit → controlled partial exit (50%), remainder stays open.
     exits = pt.check_stops({"RELIANCE": 105.0}, user_id="u")
     assert len(exits) == 1
-    assert exits[0]["pnl"] == pytest.approx((105.0 - 100.0) * 10)
-    assert pt.get_positions(user_id="u") == []
+    assert exits[0]["exit_reason"] == "T1_PARTIAL"
+    assert exits[0]["pnl"] == pytest.approx((105.0 - 100.0) * 5)
+    pos = pt.get_positions(user_id="u")
+    assert len(pos) == 1
+    assert pos[0]["quantity"] == pytest.approx(5.0)
 
+    # SL still closes fully (SHORT price >= SL → LOSS).
     r2 = pt.place_order("TCS", "SELL", 5, 100.0, 105.0, 95.0, user_id="u")
     pt.check_entry_triggers({"TCS": 100.0}, user_id="u")
     exits = pt.check_stops({"TCS": 105.0}, user_id="u")
     assert len(exits) == 1
     assert exits[0]["trade"]["result"] == "LOSS"
+    assert exits[0]["trade"]["exit_reason"] == "STOP_LOSS"
     assert exits[0]["pnl"] == pytest.approx((100.0 - 105.0) * 5)

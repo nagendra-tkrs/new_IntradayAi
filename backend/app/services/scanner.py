@@ -6,16 +6,39 @@ from typing import Optional
 from app.services.market_data.base import MarketDataProvider
 from app.services.indicators import calculate_all_indicators
 from app.services.signal_engine import evaluate_signal
+from app.services.signal_quality import compute_setup_quality
 from app.services.signal_snapshot import set_signal, get_signal, invalidate_symbol
 from app.services.signal_snapshot import set_signal, get_signal
 from app.models.schemas import SignalDirection
 from app.core.market_session import now_ist, is_market_hours
+from app.core.config import settings
+from app.services.context_24h import compute_24h_context
+from app.services import signal_store
 from app.services.data_validation import data_status
+import app.services.active_universe as active_universe
 
 logger = logging.getLogger(__name__)
 
 MAX_PARALLEL_FETCHES = 8
 SCAN_CACHE_TTL = 300  # 5 minutes
+
+
+_QUALITY_FIELDS = (
+    "setup_quality_score", "setup_quality", "confirmation_count",
+    "confirmation_total", "top_signal_eligible", "risk_reward_ratio",
+    "top_signal_rank", "quality_detail",
+)
+
+
+def _attach_quality(result: dict, quality: dict) -> dict:
+    """Copy the additive Top-Signal quality fields onto a scanner result row.
+
+    The base signal (``signal`` / ``signal_data`` / ``confidence``) is never
+    touched — the quality layer is purely additive.
+    """
+    for k in _QUALITY_FIELDS:
+        result[k] = quality.get(k)
+    return result
 
 
 class MarketScanner:
@@ -55,6 +78,8 @@ class MarketScanner:
             "name": inst.get("name", symbol),
             "sector": inst.get("sector", "Unknown"),
         }
+        if inst.get("classification"):
+            base["classification"] = inst["classification"]
         try:
             combined = await self.provider.get_quote_and_bars(symbol, timeframe="5m")
             return {**base, "_df": combined["df"], "_quote": combined["quote"], "_error": None}
@@ -68,6 +93,8 @@ class MarketScanner:
             "name": fetch_result["name"],
             "sector": fetch_result["sector"],
         }
+        if fetch_result.get("classification"):
+            base["classification"] = fetch_result["classification"]
 
         if fetch_result["_error"]:
             return {**base, "price": 0, "change_pct": 0, "volume": 0,
@@ -84,6 +111,15 @@ class MarketScanner:
 
         df = calculate_all_indicators(df)
         row = df.iloc[-1]
+
+        # Optional 24H context (Mode B). Computed read-only on every scan so a
+        # result can carry it regardless of the flag; it only influences the
+        # signal when USE_24H_CONTEXT=true (shadow evaluation below). The
+        # decision timestamp is the decision CANDLE's timestamp (never the wall
+        # clock) so no bar after the decision can leak into the window.
+        decision_ts = row.get("timestamp") if "timestamp" in df.columns else None
+        ctx24 = compute_24h_context(df, decision_ts=decision_ts,
+                                    window_hours=settings.CONTEXT_24H_WINDOW_HOURS)
 
         data_status_val = quote.get("data_status", "UNKNOWN")
         data_age = quote.get("data_age_seconds")
@@ -108,6 +144,7 @@ class MarketScanner:
                   "vwap": round(float(row.get("vwap", 0)), 2) if pd.notna(row.get("vwap")) else None,
                   "relative_volume": round(float(row.get("relative_volume", 0)), 1) if pd.notna(row.get("relative_volume")) else None,
                   "distance_from_vwap": round(float(row.get("distance_from_vwap", 0)), 2) if pd.notna(row.get("distance_from_vwap")) else None,
+                  "context_24h": ctx24,
                   "trend": self._get_trend(row)}
 
         signal = evaluate_signal(
@@ -150,17 +187,67 @@ class MarketScanner:
                 "snapshot_id": f"{symbol}_{int(time.time())}",
             }
 
+        # Top Signal Quality Layer (additive): never modifies the base signal.
+        _attach_quality(result, compute_setup_quality(signal, row, market_context=market_ctx, df=df))
+
+        # Traceability (Mode A) + optional 24H-context SHADOW (Mode B). The
+        # shadow never places paper orders — only the current signal does.
+        if signal:
+            signal_store.persist_signal(signal, candle_ts=decision_ts,
+                                        market_ctx=market_ctx,
+                                        quality=result.get("setup_quality"))
+        if signal and settings.USE_24H_CONTEXT:
+            signal_24h = evaluate_signal(
+                df, symbol,
+                data_source=self.provider.data_source_label,
+                market_context=market_ctx,
+                data_age_seconds=data_age,
+                data_status=data_status_val,
+                market_data_timestamp=quote.get("timestamp"),
+                context_24h=ctx24,
+            )
+            if signal_24h:
+                q24 = compute_setup_quality(signal_24h, row, market_context=market_ctx, df=df)
+                result["signal_24h"] = {
+                    "direction": signal_24h["direction"],
+                    "confidence": signal_24h["confidence"],
+                    "signal_data": signal_24h,
+                    "context_24h": ctx24,
+                }
+                signal_store.persist_24h_comparison(
+                    signal, signal_24h, ctx24, candle_ts=decision_ts,
+                    quality=result.get("setup_quality"),
+                    quality24=q24.get("setup_quality"),
+                )
+
         return result
 
-    async def scan_universe(self, universe: str = "NIFTY50") -> list[dict]:
-        cache_key = universe
+    async def scan_universe(self, universe: Optional[str] = None) -> list[dict]:
+        """Scan the requested universe.
+
+        Phase 1: the ACTIVE live universe (``LIVE_UNIVERSE=rotation_80`` or the
+        ``ACTIVE`` sentinel) is resolved through
+        ``active_universe.get_active_trading_universe()`` — the single source
+        of truth — and ALL 80 symbols are processed (never a fallback). When a
+        valid ACTIVE universe is unavailable this raises
+        ``ActiveUniverseUnavailable`` (FAIL CLOSED); the legacy
+        ``NIFTY50``/``NIFTY100``/``BANKNIFTY`` provider paths remain intact for
+        explicit requests.
+        """
+        if universe is None or active_universe.is_active_universe_request(universe):
+            resolution = await active_universe.get_active_trading_universe()
+            instruments = resolution["stocks"]
+            universe_key = f"active:{resolution.get('universe_version_id')}"
+        else:
+            instruments = await self.provider.get_instruments(universe)
+            universe_key = universe
+        cache_key = universe_key
         now = time.time()
         if cache_key in self._scan_cache:
             cached_time, cached_data = self._scan_cache[cache_key]
             if now - cached_time < SCAN_CACHE_TTL:
                 return cached_data
 
-        instruments = await self.provider.get_instruments(universe)
         market_ctx = await self._get_market_context()
 
         sem = asyncio.Semaphore(MAX_PARALLEL_FETCHES)
@@ -187,6 +274,10 @@ class MarketScanner:
             df = calculate_all_indicators(df)
             row = df.iloc[-1]
 
+            decision_ts = row.get("timestamp") if "timestamp" in df.columns else None
+            ctx24 = compute_24h_context(df, decision_ts=decision_ts,
+                                        window_hours=settings.CONTEXT_24H_WINDOW_HOURS)
+
             data_status_val = quote.get("data_status", "UNKNOWN")
             data_age = quote.get("data_age_seconds")
             should_trade, trade_reason = data_status.should_trade(symbol)
@@ -200,7 +291,7 @@ class MarketScanner:
                 market_data_timestamp=quote.get("timestamp"),
             )
 
-            return {
+            result = {
                 "symbol": symbol,
                 "price": quote["price"],
                 "change_pct": quote["change_pct"],
@@ -226,8 +317,41 @@ class MarketScanner:
                     "distance_from_vwap": round(float(row.get("distance_from_vwap", 0)), 2),
                 },
                 "market_context": market_ctx,
+                "context_24h": ctx24,
                 "signal": signal,
             }
+            # Top Signal Quality Layer (additive): never modifies the base signal.
+            _attach_quality(result, compute_setup_quality(signal, row, market_context=market_ctx, df=df))
+            # Traceability + Mode B shadow (see _process_stock). Persisted only
+            # when the data gate allows trading, matching scan_universe.
+            if signal and should_trade:
+                signal_store.persist_signal(signal, candle_ts=decision_ts,
+                                            market_ctx=market_ctx,
+                                            quality=result.get("setup_quality"))
+            if signal and should_trade and settings.USE_24H_CONTEXT:
+                signal_24h = evaluate_signal(
+                    df, symbol,
+                    data_source=self.provider.data_source_label,
+                    market_context=market_ctx,
+                    data_age_seconds=data_age,
+                    data_status=data_status_val,
+                    market_data_timestamp=quote.get("timestamp"),
+                    context_24h=ctx24,
+                )
+                if signal_24h:
+                    q24 = compute_setup_quality(signal_24h, row, market_context=market_ctx, df=df)
+                    result["signal_24h"] = {
+                        "direction": signal_24h["direction"],
+                        "confidence": signal_24h["confidence"],
+                        "signal_data": signal_24h,
+                        "context_24h": ctx24,
+                    }
+                    signal_store.persist_24h_comparison(
+                        signal, signal_24h, ctx24, candle_ts=decision_ts,
+                        quality=result.get("setup_quality"),
+                        quality24=q24.get("setup_quality"),
+                    )
+            return result
         except Exception as e:
             return {"symbol": symbol, "error": str(e)}
 

@@ -49,6 +49,10 @@ body {
 .badge-short { background: rgba(239,68,68,0.15); color: var(--red); border: 1px solid rgba(239,68,68,0.3); }
 .badge-no-trade { background: rgba(107,114,128,0.15); color: var(--text-muted); border: 1px solid rgba(107,114,128,0.3); }
 
+/* Universe classification badges (live universe CORE / ROTATION) */
+.badge-core { background: rgba(59,130,246,0.15); color: var(--blue); border: 1px solid rgba(59,130,246,0.35); }
+.badge-rotation { background: rgba(168,85,247,0.15); color: var(--purple); border: 1px solid rgba(168,85,247,0.35); }
+
 /* Confidence meter */
 .confidence-bar {
   height: 4px;

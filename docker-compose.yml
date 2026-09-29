@@ -6,16 +6,16 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "8020:8020"
     environment:
       - DATABASE_URL=sqlite+aiosqlite:///./intradayai.db
       - MARKET_DATA_PROVIDER=yfinance
       - INITIAL_CAPITAL=1000000
-      - CORS_ORIGINS=["http://localhost:3000","https://trading.tksrproductservices.com"]
+      - CORS_ORIGINS=["http://localhost:3005","https://trading.tksrproductservices.com"]
       - GOOGLE_CLIENT_ID=678365536626-2ago6n13j2a71e36jp0gi33gj2jfr30f.apps.googleusercontent.com
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
       - GOOGLE_REDIRECT_URI=https://trading.tksrproductservices.com/api/auth/google/callback
-      - FRONTEND_URL=http://localhost:3000
+      - FRONTEND_URL=http://localhost:3005
       - JWT_SECRET=${JWT_SECRET}
     volumes:
       - backend-data:/app/data
@@ -26,9 +26,9 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        - NEXT_PUBLIC_API_URL=http://localhost:8000
+        - NEXT_PUBLIC_API_URL=http://localhost:8020
     ports:
-      - "3000:3000"
+      - "3005:3005"
     depends_on:
       - backend
     restart: unless-stopped

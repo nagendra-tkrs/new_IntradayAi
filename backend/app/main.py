@@ -38,6 +38,21 @@ class AuthMiddleware(BaseHTTPMiddleware):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    # Additive profit-capture persistence columns (trades.details_json,
+    # paper_positions/paper_pending_orders.profit_meta) on the live ledger.
+    try:
+        from app.services.paper_trading import ensure_profit_capture_schema
+        ensure_profit_capture_schema()
+    except Exception:
+        pass
+    # Additive AI-recommendation traceability schema (signals.quantity/quality,
+    # position.signal_id, signal_24h_comparisons). Idempotent; historical
+    # signals/ledger rows are never touched.
+    try:
+        from app.services.signal_store import ensure_signal_schema
+        ensure_signal_schema()
+    except Exception:
+        pass
     # Best-effort: ensure a default user exists so authenticated endpoints work
     # even when Google OAuth is not configured or used.
     try:

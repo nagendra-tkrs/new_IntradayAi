@@ -7,10 +7,13 @@ import { useEffect } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 import type { BacktestResult, Instrument } from "@/lib/types";
 
+const STRATEGIES = ["v1", "v2", "v3", "v2_candidate", "v3_candidate", "v4_candidate"];
+
 export default function BacktestPage() {
   const [stocks, setStocks] = useState<Instrument[]>([]);
   const [symbol, setSymbol] = useState("RELIANCE");
-  const [days, setDays] = useState(30);
+  const [strategy, setStrategy] = useState("v1");
+  const [days, setDays] = useState(365);
   const [capital, setCapital] = useState(1000000);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<BacktestResult | null>(null);
@@ -23,7 +26,7 @@ export default function BacktestPage() {
     try {
       setLoading(true);
       setResult(null);
-      const r = await runBacktest({ symbol, days, initial_capital: capital });
+      const r = await runBacktest({ symbol, days, initial_capital: capital, strategy_version: strategy });
       setResult(r);
     } catch (e) {
       alert("Error: " + (e instanceof Error ? e.message : e));
@@ -47,8 +50,14 @@ export default function BacktestPage() {
               {stocks.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
             </select>
             <div className="flex items-center gap-2">
+              <label className="text-xs text-gray-500">Strategy:</label>
+              <select value={strategy} onChange={(e) => setStrategy(e.target.value)} className="px-3 py-2 bg-[#111827] border border-[#2d3548] rounded-lg text-white text-sm">
+                {STRATEGIES.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+            <div className="flex items-center gap-2">
               <label className="text-xs text-gray-500">Days:</label>
-              <input type="number" value={days} onChange={(e) => setDays(parseInt(e.target.value) || 30)} className="w-20 px-2 py-2 bg-[#111827] border border-[#2d3548] rounded-lg text-white text-sm" />
+              <input type="number" value={days} onChange={(e) => setDays(parseInt(e.target.value) || 365)} className="w-20 px-2 py-2 bg-[#111827] border border-[#2d3548] rounded-lg text-white text-sm" />
             </div>
             <div className="flex items-center gap-2">
               <label className="text-xs text-gray-500">Capital:</label>
@@ -62,6 +71,10 @@ export default function BacktestPage() {
 
         {result && !result.error && (
           <>
+            <div className="flex items-center justify-between flex-wrap gap-2 mb-3 text-xs text-gray-500">
+              <span>Strategy: <span className="text-gray-300 font-semibold">{result.strategy_version || result.strategy}</span></span>
+              {result.id && <span>Backtest ID: <span className="text-gray-300 font-mono">{result.id}</span></span>}
+            </div>
             <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3 mb-6">
               <div className="card">
                 <div className="text-[10px] text-gray-500 uppercase">Total Trades</div>

@@ -1,0 +1,77 @@
+{
+  "review_date": "2026-08-20T11:49:30.327700+05:30",
+  "symbol_strategy_count": 3,
+  "sections": {
+    "risk_reward": {
+      "passed": true,
+      "total_trades": 126,
+      "strong_violations": [],
+      "normal_violations": [],
+      "total_violations": 0
+    },
+    "position_sizing": {
+      "passed": true,
+      "avg_risk_pct": 0.010019880952380968,
+      "max_risk_pct": 0.05891000000000118,
+      "violations": [],
+      "total_trades": 126
+    },
+    "drawdown": {
+      "passed": true,
+      "max_drawdown": 98.46,
+      "worst_strategy": "RELIANCE_v1",
+      "avg_drawdown": 98.16000000000001,
+      "all_drawdowns": [
+        98.46,
+        98.02,
+        98.0
+      ],
+      "excessive_drawdown": "False"
+    },
+    "stop_loss": {
+      "passed": true,
+      "hit_stop": 70,
+      "hit_target": 56,
+      "partial": 56,
+      "no_exit": 0,
+      "stop_rate_pct": 38.46153846153847,
+      "target_rate_pct": 30.76923076923077
+    },
+    "diversification": {
+      "passed": true,
+      "num_symbols": 3,
+      "positive_symbols": 1,
+      "num_trades": 126,
+      "symbol_stats": {
+        "RELIANCE": {
+          "trade_count": 45,
+          "total_pnl": -3151.15,
+          "strategies": [
+            "v1"
+          ]
+        },
+        "TCS": {
+          "trade_count": 43,
+          "total_pnl": 1269.13,
+          "strategies": [
+            "v1"
+          ]
+        },
+        "HDFCBANK": {
+          "trade_count": 38,
+          "total_pnl": -1680.35,
+          "strategies": [
+            "v1"
+          ]
+        }
+      }
+    },
+    "recommendations": [
+      "OK: All trades meet minimum R:R requirements.",
+      "OK: Risk per trade max 0.06% within limits.",
+      "CAUTION: Max drawdown 98.5% is high. Consider reducing position size or adding volatility filters.",
+      "OK: Stop rate 38.5% within acceptable range.",
+      "WARNING: Insufficient symbol diversification. Expand to at least 2-3 symbols."
+    ]
+  }
+}

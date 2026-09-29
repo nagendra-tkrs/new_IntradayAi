@@ -1,0 +1,628 @@
+{
+  "current_strategy": "v1",
+  "last_update": "2026-08-20T14:26:15.582473+05:30",
+  "daily_stats": [
+    {
+      "date": "2026-08-20",
+      "strategy": "v1",
+      "summary": {
+        "total_trades": 31,
+        "total_pnl": 268.7500000000002,
+        "avg_profit_factor": 9.993333333333334,
+        "avg_expectancy": 10.90999999999999,
+        "symbol_count": 3,
+        "updated_at": "2026-08-20T11:33:51.313581+05:30"
+      },
+      "walkforward": {},
+      "comparison": {
+        "v3_candidate": {
+          "is_better": false,
+          "avg_pnl": 0.0,
+          "avg_pf": 0,
+          "decision": "REJECT"
+        }
+      }
+    },
+    {
+      "date": "2026-08-20",
+      "strategy": "v1",
+      "summary": {
+        "total_trades": 31,
+        "total_pnl": 268.7500000000002,
+        "avg_profit_factor": 9.993333333333334,
+        "avg_expectancy": 10.90999999999999,
+        "symbol_count": 3,
+        "updated_at": "2026-08-20T11:38:30.384811+05:30"
+      },
+      "walkforward": {},
+      "comparison": {
+        "v3_candidate": {
+          "is_better": false,
+          "avg_pnl": 0.0,
+          "avg_pf": 0,
+          "decision": "REJECT"
+        }
+      },
+      "report": "C:\\Users\\Hello\\OneDrive\\Documents\\Default Project\\backend\\app\\services\\..\\data\\reports\\report_2026-08-20.txt"
+    },
+    {
+      "date": "2026-08-20",
+      "strategy": "v1",
+      "summary": {
+        "total_trades": 31,
+        "total_pnl": 268.7500000000002,
+        "avg_profit_factor": 9.993333333333334,
+        "avg_expectancy": 10.90999999999999,
+        "symbol_count": 3,
+        "updated_at": "2026-08-20T11:40:53.644069+05:30"
+      },
+      "walkforward": {
+        "RELIANCE": [
+          {
+            "fold": 1,
+            "train_bars": 1451,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 2,
+            "train_bars": 1995,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 3,
+            "train_bars": 2539,
+            "test_bars": 100,
+            "test_pnl": -3283.19,
+            "test_pf": 0.08,
+            "test_trades": 4,
+            "test_expectancy": -820.8
+          },
+          {
+            "fold": 4,
+            "train_bars": 3083,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 5,
+            "train_bars": 3627,
+            "test_bars": 100,
+            "test_pnl": -2444.62,
+            "test_pf": 0.0,
+            "test_trades": 1,
+            "test_expectancy": -2444.62
+          },
+          {
+            "fold": 6,
+            "train_bars": 4171,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          }
+        ],
+        "TCS": [
+          {
+            "fold": 1,
+            "train_bars": 1450,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 2,
+            "train_bars": 1994,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 3,
+            "train_bars": 2538,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 4,
+            "train_bars": 3082,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 5,
+            "train_bars": 3626,
+            "test_bars": 100,
+            "test_pnl": 619.74,
+            "test_pf": 999.0,
+            "test_trades": 1,
+            "test_expectancy": 619.74
+          },
+          {
+            "fold": 6,
+            "train_bars": 4170,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          }
+        ],
+        "HDFCBANK": [
+          {
+            "fold": 1,
+            "train_bars": 1451,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 2,
+            "train_bars": 1995,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 3,
+            "train_bars": 2539,
+            "test_bars": 100,
+            "test_pnl": -2351.55,
+            "test_pf": 0.0,
+            "test_trades": 1,
+            "test_expectancy": -2351.55
+          },
+          {
+            "fold": 4,
+            "train_bars": 3083,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 5,
+            "train_bars": 3627,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 6,
+            "train_bars": 4171,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          }
+        ]
+      },
+      "comparison": {
+        "v3_candidate": {
+          "is_better": false,
+          "avg_pnl": 0.0,
+          "avg_pf": 0,
+          "decision": "REJECT"
+        }
+      },
+      "report": "C:\\Users\\Hello\\OneDrive\\Documents\\Default Project\\backend\\app\\services\\..\\data\\reports\\report_2026-08-20.txt"
+    },
+    {
+      "date": "2026-08-20",
+      "strategy": "v1",
+      "summary": {
+        "total_trades": 126,
+        "total_pnl": -3562.37,
+        "avg_profit_factor": 0.73,
+        "avg_expectancy": -28.246666666666666,
+        "symbol_count": 3,
+        "updated_at": "2026-08-20T11:50:00.873879+05:30"
+      },
+      "walkforward": {
+        "RELIANCE": [
+          {
+            "fold": 1,
+            "train_bars": 1451,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 2,
+            "train_bars": 1995,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 3,
+            "train_bars": 2539,
+            "test_bars": 100,
+            "test_pnl": -836.99,
+            "test_pf": 0.27,
+            "test_trades": 4,
+            "test_expectancy": -209.25
+          },
+          {
+            "fold": 4,
+            "train_bars": 3083,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 5,
+            "train_bars": 3627,
+            "test_bars": 100,
+            "test_pnl": -483.7,
+            "test_pf": 0.0,
+            "test_trades": 1,
+            "test_expectancy": -483.7
+          },
+          {
+            "fold": 6,
+            "train_bars": 4171,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          }
+        ],
+        "TCS": [
+          {
+            "fold": 1,
+            "train_bars": 1451,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 2,
+            "train_bars": 1995,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 3,
+            "train_bars": 2539,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 4,
+            "train_bars": 3083,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 5,
+            "train_bars": 3627,
+            "test_bars": 100,
+            "test_pnl": 121.52,
+            "test_pf": 999.0,
+            "test_trades": 1,
+            "test_expectancy": 121.52
+          },
+          {
+            "fold": 6,
+            "train_bars": 4171,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          }
+        ],
+        "HDFCBANK": [
+          {
+            "fold": 1,
+            "train_bars": 1451,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 2,
+            "train_bars": 1995,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 3,
+            "train_bars": 2539,
+            "test_bars": 100,
+            "test_pnl": -467.22,
+            "test_pf": 0.0,
+            "test_trades": 1,
+            "test_expectancy": -467.22
+          },
+          {
+            "fold": 4,
+            "train_bars": 3083,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 5,
+            "train_bars": 3627,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 6,
+            "train_bars": 4171,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          }
+        ]
+      },
+      "comparison": {
+        "v2_candidate": {
+          "is_better": "False",
+          "avg_pnl": -104.16333333333331,
+          "avg_pf": 0.64,
+          "decision": "REJECT"
+        }
+      },
+      "report": "C:\\Users\\Hello\\OneDrive\\Documents\\Default Project\\backend\\app\\services\\..\\data\\reports\\report_2026-08-20.txt"
+    },
+    {
+      "date": "2026-08-20",
+      "strategy": "v1",
+      "summary": {
+        "total_trades": 127,
+        "total_pnl": -3569.7200000000003,
+        "avg_profit_factor": 0.73,
+        "avg_expectancy": -27.929999999999996,
+        "symbol_count": 3,
+        "updated_at": "2026-08-20T14:26:11.577275+05:30"
+      },
+      "walkforward": {
+        "RELIANCE": [
+          {
+            "fold": 1,
+            "train_bars": 1462,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 2,
+            "train_bars": 2010,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 3,
+            "train_bars": 2558,
+            "test_bars": 100,
+            "test_pnl": 431.94,
+            "test_pf": 999.0,
+            "test_trades": 1,
+            "test_expectancy": 431.94
+          },
+          {
+            "fold": 4,
+            "train_bars": 3106,
+            "test_bars": 100,
+            "test_pnl": -365.23,
+            "test_pf": 0.05,
+            "test_trades": 2,
+            "test_expectancy": -182.61
+          },
+          {
+            "fold": 5,
+            "train_bars": 3654,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 6,
+            "train_bars": 4202,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          }
+        ],
+        "TCS": [
+          {
+            "fold": 1,
+            "train_bars": 1462,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 2,
+            "train_bars": 2010,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 3,
+            "train_bars": 2558,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 4,
+            "train_bars": 3106,
+            "test_bars": 100,
+            "test_pnl": -1228.82,
+            "test_pf": 0.0,
+            "test_trades": 2,
+            "test_expectancy": -614.41
+          },
+          {
+            "fold": 5,
+            "train_bars": 3654,
+            "test_bars": 100,
+            "test_pnl": 141.67,
+            "test_pf": 999.0,
+            "test_trades": 1,
+            "test_expectancy": 141.67
+          },
+          {
+            "fold": 6,
+            "train_bars": 4202,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          }
+        ],
+        "HDFCBANK": [
+          {
+            "fold": 1,
+            "train_bars": 1462,
+            "test_bars": 100,
+            "test_pnl": -648.27,
+            "test_pf": 0.0,
+            "test_trades": 1,
+            "test_expectancy": -648.27
+          },
+          {
+            "fold": 2,
+            "train_bars": 2010,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 3,
+            "train_bars": 2558,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 4,
+            "train_bars": 3106,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 5,
+            "train_bars": 3654,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          },
+          {
+            "fold": 6,
+            "train_bars": 4202,
+            "test_bars": 100,
+            "test_pnl": 0,
+            "test_pf": 999.0,
+            "test_trades": 0,
+            "test_expectancy": 0
+          }
+        ]
+      },
+      "comparison": {
+        "v2_candidate": {
+          "is_better": "False",
+          "avg_pnl": -104.29666666666664,
+          "avg_pf": 0.64,
+          "wf_positive_symbols": "1",
+          "wf_total_symbols": 3,
+          "pf_margin_required": 0.803,
+          "capital_preserved": "False",
+          "min_trades_met": true,
+          "decision": "REJECT"
+        }
+      },
+      "report": "C:\\Users\\Hello\\OneDrive\\Documents\\Default Project\\backend\\app\\services\\..\\data\\reports\\report_2026-08-20.txt"
+    }
+  ],
+  "active": true
+}

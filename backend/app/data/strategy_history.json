@@ -1,0 +1,70 @@
+{
+  "deployments": [
+    {
+      "version": "v1",
+      "deployed_at": "2026-08-20T11:37:35.539890+05:30",
+      "deployed_by": "daily_improvement"
+    }
+  ],
+  "performance_snapshots": [
+    {
+      "version": "v1",
+      "timestamp": "2026-08-20T11:37:35.539921+05:30",
+      "total_trades": 31,
+      "total_pnl": 268.7500000000002,
+      "avg_profit_factor": 9.993333333333334,
+      "avg_expectancy": 10.90999999999999,
+      "symbol_count": 3,
+      "updated_at": "2026-08-20T11:37:30.714212+05:30"
+    },
+    {
+      "version": "v1",
+      "timestamp": "2026-08-20T11:37:35.541020+05:30",
+      "avg_profit_factor": 9.993333333333334,
+      "avg_expectancy": 10.90999999999999,
+      "total_trades": 31,
+      "total_pnl": 268.7500000000002
+    },
+    {
+      "version": "v1",
+      "timestamp": "2026-08-20T11:38:35.252356+05:30",
+      "avg_profit_factor": 9.993333333333334,
+      "avg_expectancy": 10.90999999999999,
+      "total_trades": 31,
+      "total_pnl": 268.7500000000002
+    },
+    {
+      "version": "v1",
+      "timestamp": "2026-08-20T11:41:00.904644+05:30",
+      "avg_profit_factor": 9.993333333333334,
+      "avg_expectancy": 10.90999999999999,
+      "total_trades": 31,
+      "total_pnl": 268.7500000000002
+    },
+    {
+      "version": "v1",
+      "timestamp": "2026-08-20T11:50:07.368197+05:30",
+      "avg_profit_factor": 0.73,
+      "avg_expectancy": -28.246666666666666,
+      "total_trades": 126,
+      "total_pnl": -3562.37
+    },
+    {
+      "version": "v1",
+      "timestamp": "2026-08-20T14:26:15.572975+05:30",
+      "avg_profit_factor": 0.73,
+      "avg_expectancy": -27.929999999999996,
+      "total_trades": 127,
+      "total_pnl": -3569.7200000000003
+    },
+    {
+      "version": "v1",
+      "timestamp": "2026-08-20T14:26:15.574058+05:30",
+      "avg_profit_factor": 0.73,
+      "avg_expectancy": -27.929999999999996,
+      "total_trades": 127,
+      "total_pnl": -3569.7200000000003
+    }
+  ],
+  "rollbacks": []
+}

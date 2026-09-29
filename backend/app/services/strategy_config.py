@@ -32,6 +32,13 @@ class StrategyVersion:
         risk_per_trade_pct: float = 2.0,
         min_score: float = 45.0,
         description: str = "",
+        # Profit-capture / geometry overrides. All are OPTIONAL: None keeps the
+        # version's existing semantics (T2 = T1 + 1 ATR via the +1.0 in
+        # compute_trade_setup, SL = stop_loss_atr_mult for both strengths).
+        normal_sl_atr_mult: Optional[float] = None,
+        strong_sl_atr_mult: Optional[float] = None,
+        normal_target_2_atr_mult: Optional[float] = None,
+        strong_target_2_atr_mult: Optional[float] = None,
     ):
         self.version = version
         self.strong_long_threshold = strong_long_threshold
@@ -53,6 +60,23 @@ class StrategyVersion:
         self.risk_per_trade_pct = risk_per_trade_pct
         self.min_score = min_score
         self.description = description
+        self.normal_sl_atr_mult = normal_sl_atr_mult
+        self.strong_sl_atr_mult = strong_sl_atr_mult
+        self.normal_target_2_atr_mult = normal_target_2_atr_mult
+        self.strong_target_2_atr_mult = strong_target_2_atr_mult
+
+    def sl_atr_mult_for(self, is_strong: bool) -> Optional[float]:
+        """Per-strength stop-loss ATR multiplier override, or None to keep the
+        version's shared ``stop_loss_atr_mult`` semantics."""
+        return (self.strong_sl_atr_mult if is_strong else self.normal_sl_atr_mult) or None
+
+    def target_1_atr_mult_for(self, is_strong: bool) -> float:
+        return self.strong_atr_mult if is_strong else self.normal_atr_mult
+
+    def target_2_atr_mult_for(self, is_strong: bool) -> Optional[float]:
+        """Per-strength Target-2 ATR multiplier override, or None to keep the
+        legacy ``T2 = T1 + 1 ATR`` geometry."""
+        return (self.strong_target_2_atr_mult if is_strong else self.normal_target_2_atr_mult) or None
 
     def determine_direction(self, total_score: float) -> SignalDirection:
         if total_score >= self.strong_long_threshold:

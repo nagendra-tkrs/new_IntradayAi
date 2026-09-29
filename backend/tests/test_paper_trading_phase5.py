@@ -13,6 +13,7 @@ risk logic or per-user isolation.
 """
 
 import pytest
+from app.core.config import settings
 
 
 def test_phase5_buy_below_entry_stays_pending():
@@ -20,7 +21,7 @@ def test_phase5_buy_below_entry_stays_pending():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "BUY", 10, 1694.0, 1685.0, 1710.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "BUY", 5, 1694.0, 1685.0, 1710.0, user_id="user-a")
     fills = pt.check_entry_triggers({"RELIANCE": 1693.0}, user_id="user-a")
     assert fills == []
     assert len(pt.get_pending_orders(user_id="user-a")) == 1
@@ -32,7 +33,7 @@ def test_phase5_buy_exactly_at_entry_autofills():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "BUY", 10, 1694.0, 1685.0, 1710.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "BUY", 5, 1694.0, 1685.0, 1710.0, user_id="user-a")
     fills = pt.check_entry_triggers({"RELIANCE": 1694.0}, user_id="user-a")
     assert len(fills) == 1
     assert fills[0]["status"] == "filled"
@@ -45,7 +46,7 @@ def test_phase5_buy_above_entry_autofills():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "BUY", 10, 1694.0, 1685.0, 1710.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "BUY", 5, 1694.0, 1685.0, 1710.0, user_id="user-a")
     fills = pt.check_entry_triggers({"RELIANCE": 1695.0}, user_id="user-a")
     assert len(fills) == 1
     assert fills[0]["status"] == "filled"
@@ -93,7 +94,7 @@ def test_phase5_autofill_creates_correct_open_position():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "BUY", 10, 1694.0, 1685.0, 1710.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "BUY", 5, 1694.0, 1685.0, 1710.0, user_id="user-a")
     fills = pt.check_entry_triggers({"RELIANCE": 1697.0}, user_id="user-a")
     assert len(fills) == 1
     pos = pt.get_positions(user_id="user-a")
@@ -127,16 +128,16 @@ def test_phase5_autofill_cash_accounting_correct():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r1 = pt.place_order("RELIANCE", "BUY", 10, 1694.0, 1685.0, 1710.0, user_id="user-a")
+    r1 = pt.place_order("RELIANCE", "BUY", 4, 1694.0, 1685.0, 1710.0, user_id="user-a")
     pt.check_entry_triggers({"RELIANCE": 1695.0}, user_id="user-a")
     s = pt.get_portfolio_summary(user_id="user-a")
-    assert s["cash"] == pytest.approx(1_000_000.0 - 10 * 1694.0)
+    assert s["cash"] == pytest.approx(settings.INITIAL_CAPITAL - 4 * 1694.0)
     assert s["positions_count"] == 1
 
-    r2 = pt.place_order("TCS", "SELL", 5, 1694.0, 1705.0, 1680.0, user_id="user-a")
+    r2 = pt.place_order("TCS", "SELL", 1, 1694.0, 1705.0, 1680.0, user_id="user-a")
     pt.check_entry_triggers({"TCS": 1693.0}, user_id="user-a")
     s2 = pt.get_portfolio_summary(user_id="user-a")
-    assert s2["cash"] == pytest.approx(1_000_000.0 - 10 * 1694.0 + 5 * 1694.0)
+    assert s2["cash"] == pytest.approx(settings.INITIAL_CAPITAL - 4 * 1694.0 + 1 * 1694.0)
     assert s2["positions_count"] == 2
 
 
@@ -145,7 +146,7 @@ def test_phase5_same_pending_order_cannot_fill_twice():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "BUY", 10, 1694.0, 1685.0, 1710.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "BUY", 5, 1694.0, 1685.0, 1710.0, user_id="user-a")
     f1 = pt.check_entry_triggers({"RELIANCE": 1694.0}, user_id="user-a")
     f2 = pt.check_entry_triggers({"RELIANCE": 1694.0}, user_id="user-a")
     assert len(f1) == 1
@@ -159,7 +160,7 @@ def test_phase5_user_isolation_pending_fill():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    rA = pt.place_order("RELIANCE", "BUY", 10, 1694.0, 1685.0, 1710.0, user_id="user-a")
+    rA = pt.place_order("RELIANCE", "BUY", 5, 1694.0, 1685.0, 1710.0, user_id="user-a")
     rB = pt.place_order("TCS", "BUY", 5, 1694.0, 1685.0, 1710.0, user_id="user-b")
 
     fills = pt.check_entry_triggers(
@@ -169,15 +170,15 @@ def test_phase5_user_isolation_pending_fill():
     assert pt.get_positions(user_id="user-a")[0]["symbol"] == "RELIANCE"
     assert pt.get_positions(user_id="user-b") == []
     assert len(pt.get_pending_orders(user_id="user-b")) == 1
-    assert pt.get_portfolio_summary(user_id="user-b")["cash"] == pytest.approx(1_000_000.0)
+    assert pt.get_portfolio_summary(user_id="user-b")["cash"] == pytest.approx(settings.INITIAL_CAPITAL)
 
 
-def test_phase5_autofill_then_sl_target_still_works():
-    """After auto-fill the existing SL/Target_1 monitoring still closes."""
+def test_phase5_autofill_then_target_partial():
+    """After auto-fill, Target_1 triggers the controlled partial exit (50%)."""
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "BUY", 10, 1694.0, 1685.0, 1710.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "BUY", 5, 1694.0, 1685.0, 1710.0, user_id="user-a")
     pt.check_entry_triggers({"RELIANCE": 1694.0}, user_id="user-a")
     assert len(pt.get_positions(user_id="user-a")) == 1
 
@@ -185,8 +186,16 @@ def test_phase5_autofill_then_sl_target_still_works():
     assert len(exits) == 1
     assert exits[0]["trade"]["exit_price"] == 1710.0
     assert exits[0]["trade"]["result"] == "WIN"
-    assert exits[0]["pnl"] == pytest.approx((1710.0 - 1694.0) * 10)
+    assert exits[0]["exit_reason"] == "T1_PARTIAL"
+    assert exits[0]["pnl"] == pytest.approx((1710.0 - 1694.0) * 2.5)
+    pos = pt.get_positions(user_id="user-a")
+    assert len(pos) == 1
+    assert pos[0]["quantity"] == pytest.approx(2.5)
+    assert pos[0]["exit_stage"] == "T1_EXECUTED"
+    # Remainder manually closed → full 5-share profit eventually realized.
+    pt.close_position(pos[0]["id"], 1710.0, user_id="user-a")
     assert pt.get_positions(user_id="user-a") == []
+    assert pt.get_portfolio_summary(user_id="user-a")["total_pnl"] == pytest.approx((1710.0 - 1694.0) * 5)
 
 
 def test_phase5_autofill_then_sl_close():
@@ -209,12 +218,12 @@ def test_phase5_invalid_market_prices_do_not_trigger_fills():
     bad_prices = [0, -1, float("nan"), None, "garbage"]
     for bad in bad_prices:
         pt = PaperTradingEngine()
-        r = pt.place_order("RELIANCE", "BUY", 10, 1694.0, 1685.0, 1710.0, user_id="user-a")
+        r = pt.place_order("RELIANCE", "BUY", 5, 1694.0, 1685.0, 1710.0, user_id="user-a")
         fills = pt.check_entry_triggers({"RELIANCE": bad}, user_id="user-a")
         assert fills == []
         assert len(pt.get_pending_orders(user_id="user-a")) == 1
         assert pt.get_positions(user_id="user-a") == []
-        assert pt.get_portfolio_summary(user_id="user-a")["cash"] == pytest.approx(1_000_000.0)
+        assert pt.get_portfolio_summary(user_id="user-a")["cash"] == pytest.approx(settings.INITIAL_CAPITAL)
 
 
 def test_phase5_autofill_insufficient_cash_leaves_order_pending():
@@ -230,7 +239,7 @@ def test_phase5_autofill_insufficient_cash_leaves_order_pending():
     assert fills == []
     assert pt.get_pending_orders(user_id="user-a") == []
     assert pt.get_positions(user_id="user-a") == []
-    assert pt.get_portfolio_summary(user_id="user-a")["cash"] == pytest.approx(1_000_000.0)
+    assert pt.get_portfolio_summary(user_id="user-a")["cash"] == pytest.approx(settings.INITIAL_CAPITAL)
 
 
 def test_phase5_monitor_cycle_autofills_pending_and_opens_position():
@@ -241,7 +250,7 @@ def test_phase5_monitor_cycle_autofills_pending_and_opens_position():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "BUY", 10, 1694.0, 1685.0, 1710.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "BUY", 5, 1694.0, 1685.0, 1710.0, user_id="user-a")
 
     async def fake_quote(symbol):
         assert symbol == "RELIANCE"
@@ -295,12 +304,18 @@ def test_phase5_monitor_marks_filled_position_then_monitors_sl_target():
     loop.run_until_complete(_run_monitor_cycle(pt, fake_quote, fake_finalize))
     loop.close()
 
-    assert pt.get_positions(user_id="user-a") == []
     assert len(closed) == 1
     assert closed[0][1] == "user-a"
+    assert closed[0][0]["exit_reason"] == "T1_PARTIAL"
     assert closed[0][0]["trade"]["exit_price"] == 1680.0
     assert closed[0][0]["trade"]["result"] == "WIN"
-    assert closed[0][0]["pnl"] == pytest.approx((1694.0 - 1680.0) * 5)
+    # T1 partial = 50% of 5 → 2.5 shares at +14 = +35 realized.
+    assert closed[0][0]["pnl"] == pytest.approx((1694.0 - 1680.0) * 2.5)
+    pos = pt.get_positions(user_id="user-a")[0]
+    assert pos["quantity"] == pytest.approx(2.5)
+    assert pos["exit_stage"] == "T1_EXECUTED"
+    # Closing the remainder realizes the full 5-share profit.
+    pt.close_position(pos["id"], 1680.0, user_id="user-a")
     assert pt.get_portfolio_summary(user_id="user-a")["total_pnl"] == pytest.approx(70.0)
 
 
@@ -312,7 +327,7 @@ def test_phase5_monitor_uses_one_quote_per_symbol_across_users():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    pt.place_order("RELIANCE", "BUY", 10, 1694.0, 1685.0, 1710.0, user_id="user-a")
+    pt.place_order("RELIANCE", "BUY", 5, 1694.0, 1685.0, 1710.0, user_id="user-a")
     pt.place_order("TCS", "SELL", 5, 1694.0, 1705.0, 1680.0, user_id="user-b")
 
     quotes = {"RELIANCE": 1694.0, "TCS": 1695.0}  # A triggers; B stays pending

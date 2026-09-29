@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import Header from "@/components/Header";
+import TopSignals from "@/components/TopSignals";
 import {
   runScanner,
   getAllUserSetups,
@@ -13,9 +14,9 @@ import {
 import { useAuth } from "@/lib/auth";
 import type { ScannerResponse, ScannerResult, SignalSetup, TradeSetup } from "@/lib/types";
 
-type FilterType = "all" | "long" | "short" | "strong" | "high_volume" | "no_trade";
+type FilterType = "all" | "long" | "short" | "strong" | "qualified" | "high_volume" | "no_trade";
 
-type SortKey = "symbol" | "price" | "change_pct" | "volume" | "relative_volume" | "rsi" | "adx" | "distance_from_vwap" | "confidence";
+type SortKey = "symbol" | "price" | "change_pct" | "volume" | "relative_volume" | "rsi" | "adx" | "distance_from_vwap" | "confidence" | "setup_quality_score";
 
 const SCANNER_REFRESH_INTERVAL = 120000;
 
@@ -61,6 +62,7 @@ function validateSetup(
 export default function ScannerPage() {
   const [scanner, setScanner] = useState<ScannerResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<FilterType>("all");
   const [sortBy, setSortBy] = useState<SortKey>("confidence");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
@@ -95,9 +97,13 @@ export default function ScannerPage() {
       if (isMountedRef.current) {
         setScanner(data);
         setLastRefresh(new Date());
+        setError(null);
       }
     } catch (e) {
       console.error(e);
+      if (isMountedRef.current) {
+        setError(e instanceof Error && e.message ? e.message : "Failed to load scanner data");
+      }
     } finally {
       if (isMountedRef.current) setLoading(false);
     }
@@ -293,6 +299,7 @@ export default function ScannerPage() {
         entry_price: entryNum,
         stop_loss: slNum,
         target_1: tgtNum,
+        signal_id: stock.signal_data?.id ?? undefined,
       });
       setOrderMsg((prev) => ({
         ...prev,
@@ -312,6 +319,7 @@ export default function ScannerPage() {
       case "long": results = results.filter((r) => getSignalDir(r).includes("LONG")); break;
       case "short": results = results.filter((r) => getSignalDir(r).includes("SHORT")); break;
       case "strong": results = results.filter((r) => r.confidence >= 75); break;
+      case "qualified": results = results.filter((r) => r.top_signal_eligible); break;
       case "high_volume": results = results.filter((r) => r.relative_volume >= 1.5); break;
       case "no_trade": results = results.filter((r) => getSignalDir(r) === "NO_TRADE"); break;
     }
@@ -330,6 +338,7 @@ export default function ScannerPage() {
 
   const filters: { key: FilterType; label: string }[] = [
     { key: "all", label: "All" },
+    { key: "qualified", label: "Top Quality" },
     { key: "strong", label: "Strong (75+)" },
     { key: "long", label: "Long" },
     { key: "short", label: "Short" },
@@ -344,7 +353,14 @@ export default function ScannerPage() {
         <div className="flex items-center justify-between mb-6">
           <div>
             <h1 className="text-2xl font-bold text-white">Market Scanner</h1>
-            <p className="text-sm text-gray-500">Real-time scan of NIFTY50 universe with technical indicators</p>
+            <p className="text-sm text-gray-500">Real-time scan of the active universe with technical indicators</p>
+            {scanner && (
+              <p className="text-[10px] text-gray-600 mt-1">
+                Active Universe: <span className="text-blue-400 font-semibold">{scanner.universe || "—"}</span>
+                {" · "}Stocks Scanned: <span className="text-blue-400 font-semibold">{scanner.total_scanned ?? "—"}</span>
+                {scanner.active_universe_version ? <>{" · "}Version: <span className="text-gray-400">{scanner.active_universe_version}</span></> : null}
+              </p>
+            )}
             {lastRefresh && (
               <p className="text-[10px] text-gray-600 mt-1">
                 Last refreshed: {lastRefresh.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" })}
@@ -374,16 +390,48 @@ export default function ScannerPage() {
           ))}
         </div>
 
+        {error && (
+          <div className="card bg-red-500/10 border-red-500/30 text-sm mb-4">
+            <div className="text-red-400 font-semibold">Failed to load the active universe</div>
+            <p className="text-gray-400 text-xs mt-1">
+              The scanner fails closed when the active universe is unavailable — it will never silently fall back to
+              another universe. Reason: {error}
+            </p>
+            <button
+              onClick={() => loadScanner()}
+              className="mt-3 px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 text-red-400 text-xs font-semibold rounded-lg transition-colors"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
         {loading ? (
           <div className="flex items-center justify-center py-20">
             <div className="w-10 h-10 border-4 border-blue-500/30 border-t-blue-500 rounded-full animate-spin" />
           </div>
-        ) : (
-          <div className="card overflow-x-auto">
+        ) : error && !scanner ? null : (
+          <>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-bold text-white">Top Signals</h2>
+            </div>
+            <div className="mb-6">
+              <TopSignals
+                results={scanner?.results || []}
+                scanned={scanner?.total_scanned}
+                onSelect={(sym) => router.push(`/stock/${sym}`)}
+              />
+            </div>
+
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-bold text-white">All Stocks</h2>
+            </div>
+            <div className="card overflow-x-auto">
             <table className="data-table">
               <thead>
                 <tr>
                   <th className="cursor-pointer" onClick={() => toggleSort("symbol")}>Symbol</th>
+                  <th>Class</th>
                   <th>Sector</th>
                   <th className="num cursor-pointer" onClick={() => toggleSort("price")}>Price</th>
                   <th className="num cursor-pointer" onClick={() => toggleSort("change_pct")}>Chg %</th>
@@ -395,6 +443,7 @@ export default function ScannerPage() {
                   <th className="num cursor-pointer" onClick={() => toggleSort("distance_from_vwap")}>VWAP Dist</th>
                   <th>Signal</th>
                   <th className="num cursor-pointer" onClick={() => toggleSort("confidence")}>Conf</th>
+                  <th className="num cursor-pointer" onClick={() => toggleSort("setup_quality_score")}>Quality</th>
                   <th>Setup</th>
                 </tr>
               </thead>
@@ -420,6 +469,17 @@ export default function ScannerPage() {
                       <td>
                         <div className="font-semibold text-white">{sym}</div>
                         <div className="text-[10px] text-gray-500">{stock.name}</div>
+                      </td>
+                      <td>
+                        {stock.classification ? (
+                          <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                            stock.classification === "CORE" ? "badge-core" : "badge-rotation"
+                          }`}>
+                            {stock.classification}
+                          </span>
+                        ) : (
+                          <span className="text-[10px] text-gray-600">-</span>
+                        )}
                       </td>
                       <td className="text-xs text-gray-400">{stock.sector}</td>
                       <td className="num font-semibold">₹{stock.price?.toLocaleString()}</td>
@@ -454,6 +514,22 @@ export default function ScannerPage() {
                         stock.confidence >= 60 ? "text-blue-400" :
                         stock.confidence > 0 ? "text-yellow-400" : "text-gray-500"
                       }`}>{stock.confidence || 0}</td>
+                      <td className="text-center">
+                        {stock.setup_quality ? (
+                          <div className="flex flex-col items-center gap-0.5">
+                            <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                              stock.setup_quality === "PREMIUM" ? "text-amber-300 bg-amber-500/10 border border-amber-500/40" :
+                              stock.setup_quality === "QUALIFIED" ? "text-emerald-300 bg-emerald-500/10 border border-emerald-500/40" :
+                              stock.setup_quality === "NORMAL" ? "text-sky-300 bg-sky-500/10 border border-sky-500/40" :
+                              stock.setup_quality === "WEAK" ? "text-gray-300 bg-gray-500/10 border border-gray-500/40" :
+                              "text-red-300 bg-red-500/10 border border-red-500/40"
+                            }`}>{stock.setup_quality}</span>
+                            <span className="text-[10px] text-gray-400">{stock.setup_quality_score ?? "-"}</span>
+                          </div>
+                        ) : (
+                          <span className="text-[10px] text-gray-600">-</span>
+                        )}
+                      </td>
                       <td className="text-[10px] text-gray-400">
                         {active.isCustom ? (
                           <span className="text-amber-400 font-bold">Custom</span>
@@ -468,7 +544,8 @@ export default function ScannerPage() {
                 })}
               </tbody>
             </table>
-          </div>
+            </div>
+          </>
         )}
 
         {expandedSymbol && (() => {

@@ -41,7 +41,7 @@ def test_a_pending_long_reserves_margin():
     assert s["total_value"] == pytest.approx(INITIAL)
     assert s["pending_value"] == pytest.approx(10_000.0)
     assert s["reserved_margin"] == pytest.approx(10_000.0)
-    assert s["available_cash"] == pytest.approx(990_000.0)
+    assert s["available_cash"] == pytest.approx(0.0)
     assert _equity_invariant(s)
 
 
@@ -52,7 +52,7 @@ def test_b_pending_short_reserves_margin():
     s = pt.get_portfolio_summary(user_id=None)
     assert r["status"] == "pending"
     assert s["reserved_margin"] == pytest.approx(5_000.0)
-    assert s["available_cash"] == pytest.approx(995_000.0)
+    assert s["available_cash"] == pytest.approx(INITIAL - 5_000.0)
     assert _equity_invariant(s)
 
 
@@ -155,37 +155,37 @@ def test_h_close_long_realizes():
 # ── I. Placement gate + aggregate reservations; fill respects commitments ─────
 def test_i_pending_aggregation_and_fill_gate():
     pt = PaperTradingEngine(db_path=None)
-    # Pending A (700k) reserves buying power; B (250k) still fits (950k ≤ 1M);
-    # a further C (200k) would push available negative and is REJECTED at
+    # Pending A (7k) reserves buying power; B (2.5k) still fits (9.5k ≤ 10k);
+    # a further C (2k) would push available negative and is REJECTED at
     # placement (contract: Available Cash never goes negative).
-    ra = pt.place_order("A", "LONG", 70_000, 10.0, 9.0, 12.0)  # 700k
-    rb = pt.place_order("B", "LONG", 25_000, 10.0, 9.0, 12.0)  # 250k
+    ra = pt.place_order("A", "LONG", 700, 10.0, 9.0, 12.0)  # 7k
+    rb = pt.place_order("B", "LONG", 250, 10.0, 9.0, 12.0)  # 2.5k
     s = pt.get_portfolio_summary(user_id=None)
-    assert s["pending_value"] == pytest.approx(950_000.0)
-    assert s["reserved_margin"] == pytest.approx(950_000.0)
-    assert s["available_cash"] == pytest.approx(50_000.0)
+    assert s["pending_value"] == pytest.approx(9_500.0)
+    assert s["reserved_margin"] == pytest.approx(9_500.0)
+    assert s["available_cash"] == pytest.approx(500.0)
 
-    # Placement gate: C (200k) > available (50k) -> rejected, nothing changed.
+    # Placement gate: C (2k) > available (500) -> rejected, nothing changed.
     cash_before = pt.cash
-    rc = pt.place_order("C", "LONG", 20_000, 10.0, 9.0, 12.0)
+    rc = pt.place_order("C", "LONG", 200, 10.0, 9.0, 12.0)
     assert "error" in rc
     assert rc["error"].startswith("Insufficient available cash")
     assert pt.cash == cash_before
-    assert s["pending_value"] == pytest.approx(950_000.0)  # unchanged
+    assert s["pending_value"] == pytest.approx(9_500.0)  # unchanged
     assert {o["id"] for o in pt.get_pending_orders()} == {ra["order_id"], rb["order_id"]}
 
-    # Edit gate: growing B to 400k (needs 400k > 300k available) is rejected too.
-    redit = pt.edit_order(rb["order_id"], quantity=40_000)
+    # Edit gate: growing B to 4k (needs 4k > 500 available) is rejected too.
+    redit = pt.edit_order(rb["order_id"], quantity=400)
     assert "error" in redit
     assert {o["id"] for o in pt.get_pending_orders()} == {ra["order_id"], rb["order_id"]}
 
-    # Releasing B frees 250k; A now fills for its own 700k.
+    # Releasing B frees 2.5k; A now fills for its own 7k.
     pt.cancel_order(rb["order_id"])
     fill = pt.fill_order(ra["order_id"])
     assert "error" not in fill
-    assert pt.cash == pytest.approx(INITIAL - 700_000.0)
+    assert pt.cash == pytest.approx(INITIAL - 7_000.0)
     s2 = pt.get_portfolio_summary(user_id=None)
-    assert s2["reserved_margin"] == pytest.approx(700_000.0)  # open LONG capital
+    assert s2["reserved_margin"] == pytest.approx(7_000.0)  # open LONG capital
     assert s2["positions_count"] == 1
     assert _equity_invariant(s2)
 
@@ -193,8 +193,8 @@ def test_i_pending_aggregation_and_fill_gate():
 # ── J. Equity invariant across full round-trip with pending orders ─────────
 def test_j_invariant_full_roundtrip_with_pending():
     pt = PaperTradingEngine(db_path=None)
-    pl = pt.place_order("LX", "LONG", 100, 100.0, 95.0, 110.0)
-    ps = pt.place_order("SX", "SHORT", 100, 100.0, 105.0, 90.0)
+    pl = pt.place_order("LX", "LONG", 50, 100.0, 95.0, 110.0)
+    ps = pt.place_order("SX", "SHORT", 50, 100.0, 105.0, 90.0)
     assert _equity_invariant(pt.get_portfolio_summary(user_id=None))
     pt.fill_order(pl["order_id"])
     assert _equity_invariant(pt.get_portfolio_summary(user_id=None))
@@ -206,8 +206,8 @@ def test_j_invariant_full_roundtrip_with_pending():
     assert _equity_invariant(pt.get_portfolio_summary(user_id=None))
     pt.close_position(ps["order_id"], 90.0)
     s = pt.get_portfolio_summary(user_id=None)
-    assert s["total_value"] == pytest.approx(INITIAL + 2_000.0)
-    assert s["realized_pnl"] == pytest.approx(2_000.0)
+    assert s["total_value"] == pytest.approx(INITIAL + 1_000.0)
+    assert s["realized_pnl"] == pytest.approx(1_000.0)
     assert _equity_invariant(s)
 
 
@@ -260,11 +260,11 @@ def test_k_realized_replayed_from_db_ledger():
         assert len(pt.get_trade_history(user_id="u")) == 5
 
         # A new close this session keeps memory == DB (seed + delta).
-        r = pt.place_order("NEW", "LONG", 100, 100.0, 95.0, 110.0, user_id="u")
+        r = pt.place_order("NEW", "LONG", 90, 100.0, 95.0, 110.0, user_id="u")
         pt.fill_order(r["order_id"], user_id="u")
         pt.close_position(r["order_id"], 110.0, user_id="u")
         s2 = pt.get_portfolio_summary(user_id="u")
-        assert s2["realized_pnl"] == pytest.approx(766.0)  # -234 + 1000
+        assert s2["realized_pnl"] == pytest.approx(666.0)  # -234 + 900
         assert _equity_invariant(s2)
     finally:
         os.remove(path)
@@ -273,31 +273,31 @@ def test_k_realized_replayed_from_db_ledger():
 # ── L. SHORT reservation carried, never doubled, across fill+close ─────────
 def test_l_short_reserve_never_doubled():
     pt = PaperTradingEngine(db_path=None)
-    # Two identical 200k short orders: whatever their stage (pending/open), the
+    # Two identical 2k short orders: whatever their stage (pending/open), the
     # total reservation is exactly the sum of the two entry notionals - never
     # multiplied, never lost.
-    n = 2_000
+    n = 20
     r1 = pt.place_order("S1", "SHORT", n, 100.0, 105.0, 90.0)
     r2 = pt.place_order("S2", "SHORT", n, 100.0, 105.0, 90.0)
-    # Both pending: reservation = 400k (committed notional).
-    assert pt.get_portfolio_summary(user_id=None)["reserved_margin"] == pytest.approx(400_000.0)
-    # Fill one: 200k moves from pending commitment to open collateral; the SUM
-    # is unchanged (200k collateral + 200k still pending).
+    # Both pending: reservation = 4k (committed notional).
+    assert pt.get_portfolio_summary(user_id=None)["reserved_margin"] == pytest.approx(4_000.0)
+    # Fill one: 2k moves from pending commitment to open collateral; the SUM
+    # is unchanged (2k collateral + 2k still pending).
     pt.fill_order(r1["order_id"])
-    assert pt.get_portfolio_summary(user_id=None)["reserved_margin"] == pytest.approx(400_000.0)
-    # Fill the second: both now open, reservation still 400k - not 800k.
+    assert pt.get_portfolio_summary(user_id=None)["reserved_margin"] == pytest.approx(4_000.0)
+    # Fill the second: both now open, reservation still 4k - not 8k.
     pt.fill_order(r2["order_id"])
     s2 = pt.get_portfolio_summary(user_id=None)
-    assert s2["reserved_margin"] == pytest.approx(400_000.0)
-    assert s2["cash"] == pytest.approx(INITIAL + 400_000.0)
-    assert s2["available_cash"] == pytest.approx(INITIAL - 400_000.0)
+    assert s2["reserved_margin"] == pytest.approx(4_000.0)
+    assert s2["cash"] == pytest.approx(INITIAL + 4_000.0)
+    assert s2["available_cash"] == pytest.approx(INITIAL - 4_000.0)
     assert _equity_invariant(s2)
 
     # Closing one releases exactly that position's collateral.
     pt.close_position(r1["order_id"], 100.0)
     s3 = pt.get_portfolio_summary(user_id=None)
-    assert s3["reserved_margin"] == pytest.approx(200_000.0)
-    assert s3["cash"] == pytest.approx(INITIAL + 200_000.0)
+    assert s3["reserved_margin"] == pytest.approx(2_000.0)
+    assert s3["cash"] == pytest.approx(INITIAL + 2_000.0)
     assert _equity_invariant(s3)
     pt.close_position(r2["order_id"], 100.0)
     s4 = pt.get_portfolio_summary(user_id=None)
@@ -341,18 +341,18 @@ def test_live_scenario_regression_realized_agrees_with_db():
         assert _equity_invariant(s)
 
         # Open two shorts and mark them so unrealized is live too.
-        s1 = pt.place_order("CIPLA", "SHORT", 100, 1372.5, 1375.3, 1368.76, user_id="u")
-        s2 = pt.place_order("TCS", "SHORT", 100, 2199.8, 2204.57, 2193.45, user_id="u")
+        s1 = pt.place_order("CIPLA", "SHORT", 5, 1372.5, 1375.3, 1368.76, user_id="u")
+        s2 = pt.place_order("TCS", "SHORT", 1, 2199.8, 2204.57, 2193.45, user_id="u")
         pt.fill_order(s1["order_id"], user_id="u")
         pt.fill_order(s2["order_id"], user_id="u")
         pt.update_prices({"CIPLA": 1371.5, "TCS": 2198.6}, user_id="u")
         sc = pt.get_portfolio_summary(user_id="u")
         assert sc["realized_pnl"] == pytest.approx(-44.0)
-        assert sc["unrealized_pnl"] == pytest.approx(220.0)
-        assert sc["total_value"] == pytest.approx(INITIAL - 44.0 + 220.0)
-        assert sc["reserved_margin"] == pytest.approx(137_250.0 + 219_980.0)
+        assert sc["unrealized_pnl"] == pytest.approx(5.0 + 1.2)
+        assert sc["total_value"] == pytest.approx(INITIAL - 44.0 + 5.0 + 1.2)
+        assert sc["reserved_margin"] == pytest.approx(5 * 1372.5 + 1 * 2199.8)
         # Contract formula: short proceeds NEVER inflate buying power.
-        assert sc["available_cash"] == pytest.approx(INITIAL - 44.0 - (137_250.0 + 219_980.0))
+        assert sc["available_cash"] == pytest.approx(INITIAL - 44.0 - (5 * 1372.5 + 1 * 2199.8))
         assert _equity_invariant(sc)
     finally:
         os.remove(path)
@@ -361,18 +361,18 @@ def test_live_scenario_regression_realized_agrees_with_db():
 # ── BUY/SELL aliases keep identical margin behavior ────────────────────────
 def test_buy_sell_alias_reservation():
     pt = PaperTradingEngine(db_path=None)
-    r = pt.place_order("X", "BUY", 100, 100.0, 95.0, 110.0)
-    assert pt.get_portfolio_summary(user_id=None)["reserved_margin"] == pytest.approx(10_000.0)
+    r = pt.place_order("X", "BUY", 60, 100.0, 95.0, 110.0)
+    assert pt.get_portfolio_summary(user_id=None)["reserved_margin"] == pytest.approx(6_000.0)
     pt.fill_order(r["order_id"])
-    rs = pt.place_order("Y", "SELL", 50, 100.0, 102.0, 95.0)
-    # open LONG committed 10,000 + pending SELL 5,000 are BOTH reserved
-    assert pt.get_portfolio_summary(user_id=None)["reserved_margin"] == pytest.approx(15_000.0)
+    rs = pt.place_order("Y", "SELL", 30, 100.0, 102.0, 95.0)
+    # open LONG committed 6,000 + pending SELL 3,000 are BOTH reserved
+    assert pt.get_portfolio_summary(user_id=None)["reserved_margin"] == pytest.approx(9_000.0)
     pt.fill_order(rs["order_id"])
     s = pt.get_portfolio_summary(user_id=None)
-    # cash: -10000 (BUY) + 5000 (SELL proceeds) ; reserved 15,000 (LONG + SHORT)
-    assert s["cash"] == pytest.approx(INITIAL - 5_000.0)
-    assert s["reserved_margin"] == pytest.approx(15_000.0)
-    assert s["available_cash"] == pytest.approx(INITIAL - 15_000.0)
+    # cash: -6000 (BUY) + 3000 (SELL proceeds) ; reserved 9,000 (LONG + SHORT)
+    assert s["cash"] == pytest.approx(INITIAL - 3_000.0)
+    assert s["reserved_margin"] == pytest.approx(9_000.0)
+    assert s["available_cash"] == pytest.approx(INITIAL - 9_000.0)
     assert _equity_invariant(s)
 
 
@@ -381,24 +381,24 @@ def test_available_cash_contract_formula():
     # Open short credits proceeds to cash AND reserves its entry notional; the
     # proceeds must NOT inflate buying power.
     pt = PaperTradingEngine(db_path=None)
-    ro = pt.place_order("OP", "SHORT", 100, 1845.9, 1848.55, 1842.37)
+    ro = pt.place_order("OP", "SHORT", 4, 1845.9, 1848.55, 1842.37)
     pt.fill_order(ro["order_id"])
     s1 = pt.get_portfolio_summary(user_id=None)
-    assert s1["reserved_margin"] == pytest.approx(184_590.0)
-    assert s1["available_cash"] == pytest.approx(INITIAL - 184_590.0)
+    assert s1["reserved_margin"] == pytest.approx(4 * 1845.9)
+    assert s1["available_cash"] == pytest.approx(INITIAL - 4 * 1845.9)
 
     # An additional PENDING short must ALSO cut available cash by its notional.
-    rp = pt.place_order("PN", "SHORT", 100, 1380.1, 1382.3, 1377.16)
+    rp = pt.place_order("PN", "SHORT", 1, 1380.1, 1382.3, 1377.16)
     s2 = pt.get_portfolio_summary(user_id=None)
-    assert s2["reserved_margin"] == pytest.approx(184_590.0 + 138_010.0)
-    assert s2["available_cash"] == pytest.approx(s1["available_cash"] - 138_010.0)
+    assert s2["reserved_margin"] == pytest.approx(4 * 1845.9 + 1 * 1380.1)
+    assert s2["available_cash"] == pytest.approx(s1["available_cash"] - 1 * 1380.1)
     assert s2["available_cash"] == pytest.approx(INITIAL - s2["reserved_margin"])
     assert _equity_invariant(s2)
 
     # Cancel releases the pending reserve -> available cash rises back.
     pt.cancel_order(rp["order_id"])
     s3 = pt.get_portfolio_summary(user_id=None)
-    assert s3["reserved_margin"] == pytest.approx(184_590.0)
+    assert s3["reserved_margin"] == pytest.approx(4 * 1845.9)
     assert s3["available_cash"] == pytest.approx(s1["available_cash"])
     assert s3["available_cash"] == pytest.approx(INITIAL - s3["reserved_margin"])
 
@@ -419,23 +419,23 @@ def test_headroom_formulas_match_verified_live_state():
     # realized -44 (persisted ledger), two open shorts marked to market.
     pt = PaperTradingEngine(db_path=None)
     pt._ensure_account(None).seed_history(-44.0, [])
-    r1 = pt.place_order("SUNPHARMA", "SHORT", 100, 1845.9, 1848.55, 1842.37)
-    r2 = pt.place_order("ICICIBANK", "SHORT", 100, 1380.1, 1382.3, 1377.16)
+    r1 = pt.place_order("SUNPHARMA", "SHORT", 4, 1845.9, 1848.55, 1842.37)
+    r2 = pt.place_order("ICICIBANK", "SHORT", 1, 1380.1, 1382.3, 1377.16)
     pt.fill_order(r1["order_id"])
     pt.fill_order(r2["order_id"])
     pt.update_prices({"SUNPHARMA": 1846.3, "ICICIBANK": 1380.5})
     s = pt.get_portfolio_summary(user_id=None)
 
-    reserved = 184_590.0 + 138_010.0
-    unrealized = -40.0 + -40.0
-    # Validated live values: total_value 999,876 / available 677,356
+    reserved = 4 * 1845.9 + 1 * 1380.1
+    unrealized = -1.6 + -0.4
+    # Validated live values: total_value 9,954 / available 1,192.3
     # (available = INITIAL + realized − reserved under the contract).
     assert s["realized_pnl"] == pytest.approx(-44.0)
     assert s["unrealized_pnl"] == pytest.approx(unrealized)
     assert s["reserved_margin"] == pytest.approx(reserved)          # committed (LONG+SHORT)
-    assert s["available_cash"] == pytest.approx(677_356.0)          # INITIAL + realized − reserved
+    assert s["available_cash"] == pytest.approx(1_192.3)            # INITIAL + realized − reserved
     assert s["available_cash"] == pytest.approx(INITIAL - 44.0 - reserved)
-    assert s["total_value"] == pytest.approx(999_876.0)             # INITIAL + realized + unrealized
+    assert s["total_value"] == pytest.approx(9_954.0)               # INITIAL + realized + unrealized
     assert _equity_invariant(s)
 
 
@@ -457,79 +457,82 @@ def _persist_closed_trade(path, trade, user_id):
 
 
 def test_golden_scenario_section_13():
-    """End-to-end Section-13 numbers: 1,000,000 initial, two shorts, a pending
-    order, a cancel and one +5,000 short close (second short marked +2,000).
+    """End-to-end Section-13 numbers: 10,000 initial, two shorts, a pending
+    order, a cancel and one +50 short close (second short marked +20).
 
-    200k SHORT  -> avail 800,000 / reserved 200,000
-    +100k SHORT -> avail 700,000 / reserved 300,000
-    +50k pending-> avail 650,000 / reserved 350,000
-    cancel      -> avail 700,000 / reserved 300,000
-    close +5,000-> avail 905,000 / reserved 100,000 / realized +5,000
-    second short unrealized +2,000 -> total_value 1,007,000
+    2,000 SHORT -> avail 8,000 / reserved 2,000
+    +1,000 SHORT -> avail 7,000 / reserved 3,000
+    +500 pending-> avail 6,500 / reserved 3,500
+    cancel      -> avail 7,000 / reserved 3,000
+    close +50   -> avail 9,050 / reserved 1,000 / realized +50
+    second short unrealized +20 -> total_value 10,070
     """
     path = _make_ledger([])
     try:
         pt = PaperTradingEngine(db_path=path, persist=True)
         gid = "g"
 
-        # Step 1: SHORT 200k margin
-        r1 = pt.place_order("G1", "SHORT", 2_000, 100.0, 105.0, 90.0, user_id=gid)
+        # Step 1: SHORT 2,000 margin
+        r1 = pt.place_order("G1", "SHORT", 20, 100.0, 105.0, 90.0, user_id=gid)
         s = pt.get_portfolio_summary(user_id=gid)
-        assert s["available_cash"] == pytest.approx(800_000.0)
-        assert s["reserved_margin"] == pytest.approx(200_000.0)
+        assert s["available_cash"] == pytest.approx(8_000.0)
+        assert s["reserved_margin"] == pytest.approx(2_000.0)
         pt.fill_order(r1["order_id"], user_id=gid)
         s = pt.get_portfolio_summary(user_id=gid)
-        assert s["available_cash"] == pytest.approx(800_000.0)
-        assert s["reserved_margin"] == pytest.approx(200_000.0)
+        assert s["available_cash"] == pytest.approx(8_000.0)
+        assert s["reserved_margin"] == pytest.approx(2_000.0)
 
-        # Step 2: +SHORT 100k
-        r2 = pt.place_order("G2", "SHORT", 1_000, 100.0, 105.0, 90.0, user_id=gid)
+        # Step 2: +SHORT 1,000
+        r2 = pt.place_order("G2", "SHORT", 10, 100.0, 105.0, 90.0, user_id=gid)
         s = pt.get_portfolio_summary(user_id=gid)
-        assert s["available_cash"] == pytest.approx(700_000.0)
-        assert s["reserved_margin"] == pytest.approx(300_000.0)
+        assert s["available_cash"] == pytest.approx(7_000.0)
+        assert s["reserved_margin"] == pytest.approx(3_000.0)
         pt.fill_order(r2["order_id"], user_id=gid)
         s = pt.get_portfolio_summary(user_id=gid)
-        assert s["available_cash"] == pytest.approx(700_000.0)
-        assert s["reserved_margin"] == pytest.approx(300_000.0)
+        assert s["available_cash"] == pytest.approx(7_000.0)
+        assert s["reserved_margin"] == pytest.approx(3_000.0)
 
-        # Step 3: +50k pending
-        r3 = pt.place_order("G3", "SHORT", 500, 100.0, 105.0, 90.0, user_id=gid)
+        # Step 3: +500 pending
+        r3 = pt.place_order("G3", "SHORT", 5, 100.0, 105.0, 90.0, user_id=gid)
         s = pt.get_portfolio_summary(user_id=gid)
-        assert s["available_cash"] == pytest.approx(650_000.0)
-        assert s["reserved_margin"] == pytest.approx(350_000.0)
+        assert s["available_cash"] == pytest.approx(6_500.0)
+        assert s["reserved_margin"] == pytest.approx(3_500.0)
 
         # Step 4: cancel the pending
         pt.cancel_order(r3["order_id"], user_id=gid)
         s = pt.get_portfolio_summary(user_id=gid)
-        assert s["available_cash"] == pytest.approx(700_000.0)
-        assert s["reserved_margin"] == pytest.approx(300_000.0)
+        assert s["available_cash"] == pytest.approx(7_000.0)
+        assert s["reserved_margin"] == pytest.approx(3_000.0)
 
-        # Step 5: close first SHORT (2,000 @100) at 97.5 -> +5,000 realized
+        # Step 5: close first SHORT (20 @100) at 97.5 -> +50 realized
         close = pt.close_position(r1["order_id"], 97.5, user_id=gid)
-        assert close["pnl"] == pytest.approx(5_000.0)
+        assert close["pnl"] == pytest.approx(50.0)
         _persist_closed_trade(path, close["trade"], gid)
         s = pt.get_portfolio_summary(user_id=gid)
-        assert s["available_cash"] == pytest.approx(905_000.0)
-        assert s["reserved_margin"] == pytest.approx(100_000.0)
-        assert s["realized_pnl"] == pytest.approx(5_000.0)
+        assert s["available_cash"] == pytest.approx(9_050.0)
+        assert s["reserved_margin"] == pytest.approx(1_000.0)
+        assert s["realized_pnl"] == pytest.approx(50.0)
 
-        # Step 6: second SHORT marked to +2,000 unrealized
+        # Step 6: second SHORT marked to +20 unrealized
         pt.update_prices({"G2": 98.0}, user_id=gid)
         s = pt.get_portfolio_summary(user_id=gid)
-        assert s["unrealized_pnl"] == pytest.approx(2_000.0)
-        assert s["total_value"] == pytest.approx(1_007_000.0)
+        assert s["unrealized_pnl"] == pytest.approx(20.0)
+        assert s["total_value"] == pytest.approx(10_070.0)
         assert _equity_invariant(s)
 
-        # Restart: remaining SHORT + realized +5,000 must survive.
+        # Restart: remaining SHORT + realized +50 must survive. Price marks are
+        # not durable by design (write reduction) — the 5s monitor refreshes
+        # them; replay the mark here to model that refresh.
         fresh = PaperTradingEngine(db_path=path, persist=True)
+        fresh.update_prices({"G2": 98.0}, user_id=gid)
         fs = fresh.get_portfolio_summary(user_id=gid)
         assert fs["positions_count"] == 1
         assert fs["pending_orders_count"] == 0
-        assert fs["reserved_margin"] == pytest.approx(100_000.0)
-        assert fs["available_cash"] == pytest.approx(905_000.0)
-        assert fs["realized_pnl"] == pytest.approx(5_000.0)
-        assert fs["unrealized_pnl"] == pytest.approx(2_000.0)
-        assert fs["total_value"] == pytest.approx(1_007_000.0)
+        assert fs["reserved_margin"] == pytest.approx(1_000.0)
+        assert fs["available_cash"] == pytest.approx(9_050.0)
+        assert fs["realized_pnl"] == pytest.approx(50.0)
+        assert fs["unrealized_pnl"] == pytest.approx(20.0)
+        assert fs["total_value"] == pytest.approx(10_070.0)
         assert _equity_invariant(fs)
     finally:
         os.remove(path)
@@ -540,8 +543,8 @@ def test_p_persist_and_restart_restores_positions_pending():
     path = _make_ledger([])
     try:
         pt = PaperTradingEngine(db_path=path, persist=True)
-        rl = pt.place_order("LX", "LONG", 100, 100.0, 95.0, 110.0, user_id="p")
-        rs = pt.place_order("SX", "SHORT", 50, 100.0, 105.0, 90.0, user_id="p")
+        rl = pt.place_order("LX", "LONG", 60, 100.0, 95.0, 110.0, user_id="p")
+        rs = pt.place_order("SX", "SHORT", 30, 100.0, 105.0, 90.0, user_id="p")
         pt.fill_order(rl["order_id"], user_id="p")
         # state: one open LONG + one pending SHORT, both durable.
 
@@ -549,11 +552,11 @@ def test_p_persist_and_restart_restores_positions_pending():
         s = fresh.get_portfolio_summary(user_id="p")
         assert s["positions_count"] == 1
         assert s["pending_orders_count"] == 1
-        assert s["reserved_margin"] == pytest.approx(10_000.0 + 5_000.0)
+        assert s["reserved_margin"] == pytest.approx(6_000.0 + 3_000.0)
         assert fresh.get_positions(user_id="p")[0]["symbol"] == "LX"
         assert fresh.get_pending_orders(user_id="p")[0]["symbol"] == "SX"
         # LONG disbursed from ledger cash; the pending SHORT committed nothing yet
-        assert s["cash"] == pytest.approx(INITIAL - 10_000.0)
+        assert s["cash"] == pytest.approx(INITIAL - 6_000.0)
         assert _equity_invariant(s)
     finally:
         os.remove(path)
@@ -639,8 +642,8 @@ def test_t_db_rows_mirror_engine_state():
     path = _make_ledger([])
     try:
         pt = PaperTradingEngine(db_path=path, persist=True)
-        r1 = pt.place_order("A", "LONG", 100, 100.0, 95.0, 110.0, user_id="t")
-        r2 = pt.place_order("B", "SHORT", 50, 100.0, 105.0, 90.0, user_id="t")
+        r1 = pt.place_order("A", "LONG", 60, 100.0, 95.0, 110.0, user_id="t")
+        r2 = pt.place_order("B", "SHORT", 30, 100.0, 105.0, 90.0, user_id="t")
         pt.fill_order(r1["order_id"], user_id="t")
 
         con = sqlite3.connect(path)
@@ -648,7 +651,7 @@ def test_t_db_rows_mirror_engine_state():
         pen = con.execute("SELECT symbol, direction, quantity, entry_price FROM paper_pending_orders WHERE user_id='t'").fetchall()
         con.close()
 
-        assert pos == [("A", "LONG", 100, 100.0)]
-        assert pen == [("B", "SHORT", 50, 100.0)]
+        assert pos == [("A", "LONG", 60, 100.0)]
+        assert pen == [("B", "SHORT", 30, 100.0)]
     finally:
         os.remove(path)

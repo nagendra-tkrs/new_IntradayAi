@@ -6,6 +6,10 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, date
 
+from app.core.config import settings
+
+INIT = settings.INITIAL_CAPITAL
+
 
 def test_atr_wilders_smoothing():
     """Test ATR uses Wilder's smoothing (alpha=1/period)"""
@@ -1947,7 +1951,7 @@ def test_paper_buy_and_sell_execution():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    result = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    result = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     assert result["status"] == "pending"
     assert pt.get_portfolio_summary()["pending_orders_count"] == 1
     assert pt.get_portfolio_summary()["positions_count"] == 0
@@ -1974,7 +1978,7 @@ def test_paper_sell_execution():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    result = pt.place_order("TCS", "SHORT", 5, 3200.0, 3230.0, 3160.0)
+    result = pt.place_order("TCS", "SHORT", 2, 3200.0, 3230.0, 3160.0)
     assert result["status"] == "pending"
     fill = pt.fill_order(result["order_id"])
     assert fill["status"] == "filled"
@@ -1983,7 +1987,7 @@ def test_paper_sell_execution():
     assert close["pnl"] > 0
     assert close["trade"]["result"] == "WIN"
 
-    result2 = pt.place_order("TCS", "SHORT", 5, 3200.0, 3230.0, 3160.0)
+    result2 = pt.place_order("TCS", "SHORT", 2, 3200.0, 3230.0, 3160.0)
     fill2 = pt.fill_order(result2["order_id"])
     assert fill2["status"] == "filled"
     close2 = pt.close_position(result2["order_id"], 3240.0)
@@ -1996,7 +2000,7 @@ def test_paper_sl_exit():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    result = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    result = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     pt.fill_order(result["order_id"])
 
     exits = pt.check_stops({"RELIANCE": 2415.0})
@@ -2007,18 +2011,35 @@ def test_paper_sl_exit():
 
 
 def test_paper_target_exit():
-    """Position is correctly closed at target price."""
+    """Position auto-executes T1 partial at target, remainder closes later.
+
+    Profit Capture default: T1 triggers a partial exit (50%) at the observed
+    price; the remaining quantity stays open under the protective stop. A
+    subsequent full close realizes the rest of the profit."""
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    result = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    result = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     pt.fill_order(result["order_id"])
 
     exits = pt.check_stops({"RELIANCE": 2510.0})
     assert len(exits) == 1
     assert exits[0]["trade"]["exit_price"] == 2510.0
     assert exits[0]["trade"]["result"] == "WIN"
+    assert exits[0]["trade"]["exit_reason"] == "T1_PARTIAL"
+    assert exits[0]["pnl"] == pytest.approx((2510.0 - 2450.0) * 2)
+    # Remaining half stays open: stop protected to entry (2450) and the default
+    # RANGE trailing has already ratcheted it on the same tick (2510 - 25).
+    positions = pt.get_positions()
+    assert len(positions) == 1
+    assert positions[0]["quantity"] == 2
+    assert positions[0]["exit_stage"] == "T1_EXECUTED"
+    assert positions[0]["stop_loss"] == pytest.approx(2510.0 - 0.5 * (2500.0 - 2450.0))
+
+    # Final close of the remainder realizes the full round-trip profit.
+    pt.close_position(positions[0]["id"], 2510.0)
     assert pt.get_portfolio_summary()["positions_count"] == 0
+    assert pt.get_portfolio_summary()["total_pnl"] == pytest.approx((2510.0 - 2450.0) * 4)
 
 
 def test_paper_realized_and_unrealized_pnl():
@@ -2026,20 +2047,20 @@ def test_paper_realized_and_unrealized_pnl():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     pt.fill_order(r["order_id"])
 
     pt.update_prices({"RELIANCE": 2460.0})
     positions = pt.get_positions()
     assert len(positions) == 1
-    assert positions[0]["unrealized_pnl"] == pytest.approx(100.0)
+    assert positions[0]["unrealized_pnl"] == pytest.approx(40.0)
 
     summary = pt.get_portfolio_summary()
-    assert summary["unrealized_pnl"] == pytest.approx(100.0)
+    assert summary["unrealized_pnl"] == pytest.approx(40.0)
 
     pt.close_position(pt.get_positions()[0]["id"], 2460.0)
     summary = pt.get_portfolio_summary()
-    assert summary["total_pnl"] == pytest.approx(100.0)
+    assert summary["total_pnl"] == pytest.approx(40.0)
 
 
 def test_paper_duplicate_position_prevention():
@@ -2048,7 +2069,7 @@ def test_paper_duplicate_position_prevention():
     from app.services.risk_engine import RiskEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     pt.fill_order(r["order_id"])
     positions = pt.get_positions()
     assert len(positions) == 1
@@ -2069,9 +2090,9 @@ def test_paper_max_simultaneous_positions():
     re = RiskEngine(config)
     pt = PaperTradingEngine()
 
-    r1 = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r1 = pt.place_order("RELIANCE", "LONG", 2, 2450.0, 2420.0, 2500.0)
     pt.fill_order(r1["order_id"])
-    r2 = pt.place_order("TCS", "LONG", 5, 3200.0, 3180.0, 3250.0)
+    r2 = pt.place_order("TCS", "LONG", 1, 3200.0, 3180.0, 3250.0)
     pt.fill_order(r2["order_id"])
     assert len(pt.get_positions()) == 2
 
@@ -2294,8 +2315,8 @@ def test_paper_long_open_debts_cash():
     pt = PaperTradingEngine()
     r = pt.place_order("RELIANCE", "LONG", 10, 100.0, 98.0, 105.0)
     pt.fill_order(r["order_id"])
-    assert pt.cash == pytest.approx(1_000_000.0 - 10 * 100.0)
-    assert pt.get_portfolio_summary()["cash"] == pytest.approx(999_000.0)
+    assert pt.cash == pytest.approx(INIT - 10 * 100.0)
+    assert pt.get_portfolio_summary()["cash"] == pytest.approx(INIT - 1_000.0)
 
 
 def test_paper_long_close_credits_cash():
@@ -2307,7 +2328,7 @@ def test_paper_long_close_credits_cash():
     pt.fill_order(r["order_id"])
     close = pt.close_position(r["order_id"], 110.0)
     assert close["pnl"] == pytest.approx(100.0)
-    assert pt.cash == pytest.approx(1_000_000.0 - 1_000.0 + 1_100.0)
+    assert pt.cash == pytest.approx(INIT - 1_000.0 + 1_100.0)
     assert pt.total_pnl == pytest.approx(100.0)
 
 
@@ -2318,8 +2339,8 @@ def test_paper_short_open_credits_cash():
     pt = PaperTradingEngine()
     r = pt.place_order("TCS", "SHORT", 10, 100.0, 102.0, 95.0)
     pt.fill_order(r["order_id"])
-    assert pt.cash == pytest.approx(1_000_000.0 + 10 * 100.0)
-    assert pt.get_portfolio_summary()["cash"] == pytest.approx(1_001_000.0)
+    assert pt.cash == pytest.approx(INIT + 10 * 100.0)
+    assert pt.get_portfolio_summary()["cash"] == pytest.approx(INIT + 1_000.0)
 
 
 def test_paper_short_profit_close_debts_cash():
@@ -2332,7 +2353,7 @@ def test_paper_short_profit_close_debts_cash():
     close = pt.close_position(r["order_id"], 90.0)
     assert close["pnl"] == pytest.approx(100.0)
     assert close["trade"]["result"] == "WIN"
-    assert pt.cash == pytest.approx(1_001_000.0 - 900.0)
+    assert pt.cash == pytest.approx(INIT + 1_000.0 - 900.0)
     assert pt.total_pnl == pytest.approx(100.0)
 
 
@@ -2346,7 +2367,7 @@ def test_paper_short_loss_close_debts_cash():
     close = pt.close_position(r["order_id"], 110.0)
     assert close["pnl"] == pytest.approx(-100.0)
     assert close["trade"]["result"] == "LOSS"
-    assert pt.cash == pytest.approx(1_001_000.0 - 1_100.0)
+    assert pt.cash == pytest.approx(INIT + 1_000.0 - 1_100.0)
     assert pt.total_pnl == pytest.approx(-100.0)
 
 
@@ -2360,7 +2381,7 @@ def test_paper_pending_order_does_not_change_cash():
     r2 = pt.place_order("TCS", "SHORT", 5, 100.0, 102.0, 95.0)
     assert r1["status"] == "pending" and r2["status"] == "pending"
     assert pt.cash == cash_before
-    assert pt.get_portfolio_summary()["cash"] == pytest.approx(1_000_000.0)
+    assert pt.get_portfolio_summary()["cash"] == pytest.approx(INIT)
 
 
 def test_paper_long_short_cash_accounting_symmetric():
@@ -2370,16 +2391,16 @@ def test_paper_long_short_cash_accounting_symmetric():
     pt = PaperTradingEngine()
     rl = pt.place_order("RELIANCE", "LONG", 10, 100.0, 98.0, 105.0)
     pt.fill_order(rl["order_id"])
-    assert pt.cash == pytest.approx(999_000.0)
+    assert pt.cash == pytest.approx(INIT - 1_000.0)
     pt.close_position(rl["order_id"], 105.0)
-    assert pt.cash == pytest.approx(1_000_050.0)
+    assert pt.cash == pytest.approx(INIT + 50.0)
     assert pt.total_pnl == pytest.approx(50.0)
 
     rs = pt.place_order("TCS", "SHORT", 10, 100.0, 102.0, 95.0)
     pt.fill_order(rs["order_id"])
-    assert pt.cash == pytest.approx(1_001_050.0)
+    assert pt.cash == pytest.approx(INIT + 1_050.0)
     pt.close_position(rs["order_id"], 95.0)
-    assert pt.cash == pytest.approx(1_000_100.0)
+    assert pt.cash == pytest.approx(INIT + 100.0)
     assert pt.total_pnl == pytest.approx(100.0)
 
 
@@ -2393,13 +2414,13 @@ def test_paper_mixed_long_short_positions_cash():
     rs = pt.place_order("TCS", "SHORT", 5, 200.0, 205.0, 190.0)
     pt.fill_order(rs["order_id"])
     # LONG: -1000; SHORT: +1000 -> cash back to start while both open
-    assert pt.cash == pytest.approx(1_000_000.0)
+    assert pt.cash == pytest.approx(INIT)
     assert len(pt.get_positions()) == 2
 
     pt.close_position(rl["order_id"], 110.0)   # LONG +100
-    assert pt.cash == pytest.approx(1_001_100.0)
+    assert pt.cash == pytest.approx(INIT + 1_100.0)
     pt.close_position(rs["order_id"], 190.0)   # SHORT +50
-    assert pt.cash == pytest.approx(1_000_150.0)
+    assert pt.cash == pytest.approx(INIT + 150.0)
     assert pt.total_pnl == pytest.approx(150.0)
     assert len(pt.get_positions()) == 0
 
@@ -2409,18 +2430,18 @@ def test_paper_short_not_blocked_by_long_cash_check():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    # Notional 500,000 < 1,000,000 available -> fills; proceeds credit the ledger.
-    r = pt.place_order("TCS", "SHORT", 5_000, 100.0, 102.0, 95.0)
+    # Notional 5,000 < 10,000 available -> fills; proceeds credit the ledger.
+    r = pt.place_order("TCS", "SHORT", 50, 100.0, 102.0, 95.0)
     fill = pt.fill_order(r["order_id"])
     assert "error" not in fill
     assert fill["status"] == "filled"
-    assert pt.cash == pytest.approx(1_000_000.0 + 5_000 * 100.0)
+    assert pt.cash == pytest.approx(INIT + 50 * 100.0)
     # Available cash is reduced by the short's committed collateral (proceeds
-    # never inflate buying power): 1,000,000 − 500,000.
+    # never inflate buying power): 10,000 − 5,000.
     s = pt.get_portfolio_summary()
-    assert s["reserved_margin"] == pytest.approx(500_000.0)
-    assert s["available_cash"] == pytest.approx(500_000.0)
-    assert s["total_value"] == pytest.approx(1_000_000.0)
+    assert s["reserved_margin"] == pytest.approx(5_000.0)
+    assert s["available_cash"] == pytest.approx(5_000.0)
+    assert s["total_value"] == pytest.approx(INIT)
 
 
 def test_paper_buy_sell_alias_cash_accounting():
@@ -2430,15 +2451,15 @@ def test_paper_buy_sell_alias_cash_accounting():
     pt = PaperTradingEngine()
     rb = pt.place_order("RELIANCE", "BUY", 10, 100.0, 98.0, 105.0)
     pt.fill_order(rb["order_id"])
-    assert pt.cash == pytest.approx(999_000.0)
+    assert pt.cash == pytest.approx(INIT - 1_000.0)
     pt.close_position(rb["order_id"], 110.0)
-    assert pt.cash == pytest.approx(1_000_100.0)
+    assert pt.cash == pytest.approx(INIT + 100.0)
 
     rs = pt.place_order("TCS", "SELL", 10, 100.0, 102.0, 95.0)
     pt.fill_order(rs["order_id"])
-    assert pt.cash == pytest.approx(1_001_100.0)
+    assert pt.cash == pytest.approx(INIT + 1_100.0)
     pt.close_position(rs["order_id"], 90.0)
-    assert pt.cash == pytest.approx(1_000_200.0)
+    assert pt.cash == pytest.approx(INIT + 200.0)
     assert pt.total_pnl == pytest.approx(200.0)
 
 
@@ -2452,7 +2473,7 @@ def test_paper_short_stop_exit_cash_accounting():
     exits = pt.check_stops({"TCS": 102.0})
     assert len(exits) == 1
     assert exits[0]["trade"]["result"] == "LOSS"
-    assert pt.cash == pytest.approx(1_001_000.0 - 1_020.0)
+    assert pt.cash == pytest.approx(INIT + 1_000.0 - 1_020.0)
     assert pt.total_pnl == pytest.approx(-20.0)
 
 
@@ -2462,8 +2483,8 @@ def test_paper_empty_portfolio_value():
 
     pt = PaperTradingEngine()
     s = pt.get_portfolio_summary()
-    assert s["total_value"] == pytest.approx(1_000_000.0)
-    assert s["cash"] == pytest.approx(1_000_000.0)
+    assert s["total_value"] == pytest.approx(INIT)
+    assert s["cash"] == pytest.approx(INIT)
     assert s["unrealized_pnl"] == 0.0
     assert s["positions_count"] == 0
     assert s["pending_orders_count"] == 0
@@ -2478,8 +2499,8 @@ def test_paper_long_unchanged_price_value():
     pt.fill_order(r["order_id"])
     pt.update_prices({"X": 100.0})
     s = pt.get_portfolio_summary()
-    assert s["cash"] == pytest.approx(999_000.0)
-    assert s["total_value"] == pytest.approx(1_000_000.0)
+    assert s["cash"] == pytest.approx(INIT - 1_000.0)
+    assert s["total_value"] == pytest.approx(INIT)
     assert s["unrealized_pnl"] == 0.0
 
 
@@ -2492,8 +2513,8 @@ def test_paper_long_profit_value():
     pt.fill_order(r["order_id"])
     pt.update_prices({"X": 110.0})
     s = pt.get_portfolio_summary()
-    assert s["cash"] == pytest.approx(999_000.0)
-    assert s["total_value"] == pytest.approx(1_000_100.0)
+    assert s["cash"] == pytest.approx(INIT - 1_000.0)
+    assert s["total_value"] == pytest.approx(INIT + 100.0)
     assert s["unrealized_pnl"] == pytest.approx(100.0)
 
 
@@ -2506,8 +2527,8 @@ def test_paper_long_loss_value():
     pt.fill_order(r["order_id"])
     pt.update_prices({"X": 90.0})
     s = pt.get_portfolio_summary()
-    assert s["cash"] == pytest.approx(999_000.0)
-    assert s["total_value"] == pytest.approx(999_900.0)
+    assert s["cash"] == pytest.approx(INIT - 1_000.0)
+    assert s["total_value"] == pytest.approx(INIT - 100.0)
     assert s["unrealized_pnl"] == pytest.approx(-100.0)
 
 
@@ -2520,8 +2541,8 @@ def test_paper_short_unchanged_price_value():
     pt.fill_order(r["order_id"])
     pt.update_prices({"X": 100.0})
     s = pt.get_portfolio_summary()
-    assert s["cash"] == pytest.approx(1_001_000.0)
-    assert s["total_value"] == pytest.approx(1_000_000.0)
+    assert s["cash"] == pytest.approx(INIT + 1_000.0)
+    assert s["total_value"] == pytest.approx(INIT)
     assert s["unrealized_pnl"] == 0.0
 
 
@@ -2534,11 +2555,11 @@ def test_paper_short_profit_value():
     pt.fill_order(r["order_id"])
     pt.update_prices({"X": 90.0})
     s = pt.get_portfolio_summary()
-    assert s["cash"] == pytest.approx(1_001_000.0)
-    assert s["total_value"] == pytest.approx(1_000_100.0)
+    assert s["cash"] == pytest.approx(INIT + 1_000.0)
+    assert s["total_value"] == pytest.approx(INIT + 100.0)
     assert s["unrealized_pnl"] == pytest.approx(100.0)
     # Invariant: equity == initial + realized + unrealized (no fees).
-    assert s["total_value"] == pytest.approx(1_000_000.0 + s["realized_pnl"] + s["unrealized_pnl"])
+    assert s["total_value"] == pytest.approx(INIT + s["realized_pnl"] + s["unrealized_pnl"])
 
 
 def test_paper_short_loss_value():
@@ -2550,10 +2571,10 @@ def test_paper_short_loss_value():
     pt.fill_order(r["order_id"])
     pt.update_prices({"X": 110.0})
     s = pt.get_portfolio_summary()
-    assert s["cash"] == pytest.approx(1_001_000.0)
-    assert s["total_value"] == pytest.approx(999_900.0)
+    assert s["cash"] == pytest.approx(INIT + 1_000.0)
+    assert s["total_value"] == pytest.approx(INIT - 100.0)
     assert s["unrealized_pnl"] == pytest.approx(-100.0)
-    assert s["total_value"] == pytest.approx(1_000_000.0 + s["realized_pnl"] + s["unrealized_pnl"])
+    assert s["total_value"] == pytest.approx(INIT + s["realized_pnl"] + s["unrealized_pnl"])
 
 
 def test_paper_mixed_long_short_value():
@@ -2567,11 +2588,11 @@ def test_paper_mixed_long_short_value():
     pt.fill_order(rs["order_id"])
     pt.update_prices({"LONGX": 110.0, "SHORTX": 190.0})
     s = pt.get_portfolio_summary()
-    assert s["cash"] == pytest.approx(1_000_000.0)
-    assert s["total_value"] == pytest.approx(1_000_150.0)
+    assert s["cash"] == pytest.approx(INIT)
+    assert s["total_value"] == pytest.approx(INIT + 150.0)
     assert s["unrealized_pnl"] == pytest.approx(150.0)
     # Invariant: initial + realized + unrealized
-    assert s["total_value"] == pytest.approx(1_000_000.0 + s["realized_pnl"] + s["unrealized_pnl"])
+    assert s["total_value"] == pytest.approx(INIT + s["realized_pnl"] + s["unrealized_pnl"])
 
 
 def test_paper_short_close_after_profit_value():
@@ -2583,13 +2604,13 @@ def test_paper_short_close_after_profit_value():
     pt.fill_order(r["order_id"])
     pt.update_prices({"X": 90.0})
     before = pt.get_portfolio_summary()
-    assert before["total_value"] == pytest.approx(1_000_100.0)
+    assert before["total_value"] == pytest.approx(INIT + 100.0)
 
     close = pt.close_position(r["order_id"], 90.0)
     assert close["pnl"] == pytest.approx(100.0)
     s = pt.get_portfolio_summary()
-    assert pt.cash == pytest.approx(1_000_100.0)
-    assert s["total_value"] == pytest.approx(1_000_100.0)
+    assert pt.cash == pytest.approx(INIT + 100.0)
+    assert s["total_value"] == pytest.approx(INIT + 100.0)
     assert s["unrealized_pnl"] == 0.0
     assert s["total_pnl"] == pytest.approx(100.0)
     assert s["positions_count"] == 0
@@ -2604,13 +2625,13 @@ def test_paper_short_close_after_loss_value():
     pt.fill_order(r["order_id"])
     pt.update_prices({"X": 110.0})
     before = pt.get_portfolio_summary()
-    assert before["total_value"] == pytest.approx(999_900.0)
+    assert before["total_value"] == pytest.approx(INIT - 100.0)
 
     close = pt.close_position(r["order_id"], 110.0)
     assert close["pnl"] == pytest.approx(-100.0)
     s = pt.get_portfolio_summary()
-    assert pt.cash == pytest.approx(999_900.0)
-    assert s["total_value"] == pytest.approx(999_900.0)
+    assert pt.cash == pytest.approx(INIT - 100.0)
+    assert s["total_value"] == pytest.approx(INIT - 100.0)
     assert s["unrealized_pnl"] == 0.0
     assert s["total_pnl"] == pytest.approx(-100.0)
     assert s["positions_count"] == 0
@@ -2624,8 +2645,8 @@ def test_paper_pending_short_no_equity_contribution():
     r = pt.place_order("X", "SHORT", 10, 100.0, 105.0, 90.0)
     assert r["status"] == "pending"
     s = pt.get_portfolio_summary()
-    assert s["cash"] == pytest.approx(1_000_000.0)
-    assert s["total_value"] == pytest.approx(1_000_000.0)
+    assert s["cash"] == pytest.approx(INIT)
+    assert s["total_value"] == pytest.approx(INIT)
     assert s["positions_count"] == 0
     assert s["pending_orders_count"] == 1
 
@@ -2638,8 +2659,8 @@ def test_paper_pending_long_no_equity_contribution():
     r = pt.place_order("X", "LONG", 10, 100.0, 95.0, 110.0)
     assert r["status"] == "pending"
     s = pt.get_portfolio_summary()
-    assert s["cash"] == pytest.approx(1_000_000.0)
-    assert s["total_value"] == pytest.approx(1_000_000.0)
+    assert s["cash"] == pytest.approx(INIT)
+    assert s["total_value"] == pytest.approx(INIT)
     assert s["positions_count"] == 0
     assert s["pending_orders_count"] == 1
 
@@ -2656,17 +2677,17 @@ def test_paper_mixed_open_closed_no_pnl_double_count():
     pt.close_position(rl["order_id"], 90.0)  # realized -100
     s1 = pt.get_portfolio_summary()
     assert s1["total_pnl"] == pytest.approx(-100.0)
-    assert s1["total_value"] == pytest.approx(999_900.0)
+    assert s1["total_value"] == pytest.approx(INIT - 100.0)
 
     rs = pt.place_order("Y", "SHORT", 10, 100.0, 105.0, 90.0)
     pt.fill_order(rs["order_id"])
     pt.update_prices({"Y": 90.0})  # unrealized +100
     s2 = pt.get_portfolio_summary()
-    assert s2["total_value"] == pytest.approx(1_000_000.0)
+    assert s2["total_value"] == pytest.approx(INIT)
     assert s2["unrealized_pnl"] == pytest.approx(100.0)
     assert s2["total_pnl"] == pytest.approx(-100.0)
     # Equity invariant: initial + realized + unrealized
-    assert s2["total_value"] == pytest.approx(1_000_000.0 + s2["total_pnl"] + s2["unrealized_pnl"])
+    assert s2["total_value"] == pytest.approx(INIT + s2["total_pnl"] + s2["unrealized_pnl"])
 
 
 def test_paper_multiple_long_short_independent_valuation():
@@ -2683,14 +2704,14 @@ def test_paper_multiple_long_short_independent_valuation():
     d = pt.place_order("SHY", "SHORT", 25, 80.0, 85.0, 70.0)
     pt.fill_order(d["order_id"])
     # cash: 1,000,000 - 1,000 - 1,000 + 1,000 + 2,000 = 1,001,000
-    assert pt.cash == pytest.approx(1_001_000.0)
+    assert pt.cash == pytest.approx(INIT + 1_000.0)
     pt.update_prices({"LONGX": 110.0, "LONGY": 55.0, "SHX": 190.0, "SHY": 100.0})
     s = pt.get_portfolio_summary()
     # LONGX +1,100 ; LONGY +1,100 ; SHX -950 ; SHY -2,500
-    assert s["total_value"] == pytest.approx(1_001_000.0 + 1_100.0 + 1_100.0 - 950.0 - 2_500.0)
+    assert s["total_value"] == pytest.approx(INIT + 1_000.0 + 1_100.0 + 1_100.0 - 950.0 - 2_500.0)
     assert s["unrealized_pnl"] == pytest.approx(100.0 + 100.0 + 50.0 - 500.0)
     assert s["positions_count"] == 4
-    assert s["total_value"] == pytest.approx(1_000_000.0 + s["total_pnl"] + s["unrealized_pnl"])
+    assert s["total_value"] == pytest.approx(INIT + s["total_pnl"] + s["unrealized_pnl"])
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -2756,18 +2777,18 @@ def test_phase3b_shorts_require_no_cash_cover_full_notional():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    # Notional 1,000,000 == available cash -> fills; reserved 100%, equity unchanged.
-    r = pt.place_order("X", "SHORT", 10_000, 100.0, 105.0, 90.0)
+    # Notional 10,000 == available cash -> fills; reserved 100%, equity unchanged.
+    r = pt.place_order("X", "SHORT", 100, 100.0, 105.0, 90.0)
     assert r["status"] == "pending"
     fill = pt.fill_order(r["order_id"])
     assert "error" not in fill
     assert fill["status"] == "filled"
-    assert pt.cash == pytest.approx(2_000_000.0)
+    assert pt.cash == pytest.approx(2.0 * INIT)
     s = pt.get_portfolio_summary()
-    assert s["reserved_margin"] == pytest.approx(1_000_000.0)
+    assert s["reserved_margin"] == pytest.approx(10_000.0)
     # full notional committed -> ALL buying power consumed, nothing left over
     assert s["available_cash"] == pytest.approx(0.0)
-    assert s["total_value"] == pytest.approx(1_000_000.0)
+    assert s["total_value"] == pytest.approx(INIT)
     assert s["unrealized_pnl"] == 0.0
 
     # Oversized short (notional 1,200,000 > 1,000,000 available) is rejected
@@ -2792,8 +2813,8 @@ def test_phase3b_pending_orders_reserve_no_capital():
     pt = PaperTradingEngine(db_path=None)
     cash_before = pt.cash
     equity_before = pt.get_portfolio_summary()["total_value"]
-    rl = pt.place_order("LX", "LONG", 500, 100.0, 95.0, 110.0)
-    rs = pt.place_order("SX", "SHORT", 500, 100.0, 105.0, 90.0)
+    rl = pt.place_order("LX", "LONG", 50, 100.0, 95.0, 110.0)
+    rs = pt.place_order("SX", "SHORT", 50, 100.0, 105.0, 90.0)
     assert rl["status"] == "pending" and rs["status"] == "pending"
     s = pt.get_portfolio_summary()
     assert pt.cash == cash_before
@@ -2801,18 +2822,18 @@ def test_phase3b_pending_orders_reserve_no_capital():
     assert s["positions_count"] == 0
     assert s["pending_orders_count"] == 2
     # Committed notional is reserved but NOT double-counted or spent.
-    assert s["pending_value"] == pytest.approx(100_000.0)
-    assert s["reserved_margin"] == pytest.approx(100_000.0)
-    assert s["available_cash"] == pytest.approx(900_000.0)
+    assert s["pending_value"] == pytest.approx(10_000.0)
+    assert s["reserved_margin"] == pytest.approx(10_000.0)
+    assert s["available_cash"] == pytest.approx(0.0)
     # Cancelling both releases the full reservation.
     pt.cancel_order(rl["order_id"])
     s1 = pt.get_portfolio_summary()
-    assert s1["reserved_margin"] == pytest.approx(50_000.0)
-    assert s1["available_cash"] == pytest.approx(950_000.0)
+    assert s1["reserved_margin"] == pytest.approx(5_000.0)
+    assert s1["available_cash"] == pytest.approx(5_000.0)
     pt.cancel_order(rs["order_id"])
     s2 = pt.get_portfolio_summary()
     assert s2["reserved_margin"] == 0.0
-    assert s2["available_cash"] == pytest.approx(1_000_000.0)
+    assert s2["available_cash"] == pytest.approx(INIT)
 
 
 def test_phase3b_equity_invariant_full_roundtrip():
@@ -2822,7 +2843,7 @@ def test_phase3b_equity_invariant_full_roundtrip():
 
     def equity_invariant(pt):
         s = pt.get_portfolio_summary()
-        return s["total_value"] == pytest.approx(1_000_000.0 + s["total_pnl"] + s["unrealized_pnl"])
+        return s["total_value"] == pytest.approx(INIT + s["total_pnl"] + s["unrealized_pnl"])
 
     pt = PaperTradingEngine()
     rl = pt.place_order("LX", "LONG", 10, 100.0, 95.0, 110.0)
@@ -2838,9 +2859,9 @@ def test_phase3b_equity_invariant_full_roundtrip():
     pt.close_position(rs["order_id"], 90.0)
     s = pt.get_portfolio_summary()
     assert s["positions_count"] == 0
-    assert s["total_value"] == pytest.approx(1_000_200.0)
+    assert s["total_value"] == pytest.approx(INIT + 200.0)
     assert s["total_pnl"] == pytest.approx(200.0)
-    assert s["total_value"] == pytest.approx(1_000_000.0 + s["total_pnl"] + s["unrealized_pnl"])
+    assert s["total_value"] == pytest.approx(INIT + s["total_pnl"] + s["unrealized_pnl"])
 
 
 
@@ -3105,7 +3126,7 @@ def test_scanner_order_appears_in_open_positions_and_trade_history():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    result = pt.place_order("RELIANCE", "LONG", 10, 2500.0, 2470.0, 2560.0)
+    result = pt.place_order("RELIANCE", "LONG", 4, 2500.0, 2470.0, 2560.0)
     assert result["status"] == "pending"
     fill = pt.fill_order(result["order_id"])
     assert fill["status"] == "filled"
@@ -3367,7 +3388,7 @@ def test_stock_detail_snapshot_bare_object_regression_guard():
 def test_edit_pending_buy_updates_prices_and_rr():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     oid = r["order_id"]
     assert r["status"] == "pending"
     updated = pt.edit_order(oid, entry_price=2440.0, stop_loss=2410.0, target_1=2500.0)
@@ -3384,7 +3405,7 @@ def test_edit_pending_buy_updates_prices_and_rr():
 def test_edit_pending_sell_updates_prices_and_rr():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("TCS", "SHORT", 5, 3200.0, 3230.0, 3160.0)
+    r = pt.place_order("TCS", "SHORT", 2, 3200.0, 3230.0, 3160.0)
     oid = r["order_id"]
     updated = pt.edit_order(oid, entry_price=3190.0, stop_loss=3220.0, target_1=3150.0)
     assert updated["status"] == "pending"
@@ -3396,7 +3417,7 @@ def test_edit_pending_sell_updates_prices_and_rr():
 def test_edit_pending_invalid_entry_zero_rejected():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     result = pt.edit_order(r["order_id"], entry_price=0)
     assert "error" in result
 
@@ -3404,7 +3425,7 @@ def test_edit_pending_invalid_entry_zero_rejected():
 def test_edit_pending_invalid_qty_rejected():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     result = pt.edit_order(r["order_id"], quantity=0)
     assert "error" in result
 
@@ -3412,7 +3433,7 @@ def test_edit_pending_invalid_qty_rejected():
 def test_edit_filled_order_rejected():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     pt.fill_order(r["order_id"])
     result = pt.edit_order(r["order_id"], entry_price=2500.0)
     assert "error" in result
@@ -3421,7 +3442,7 @@ def test_edit_filled_order_rejected():
 def test_edit_cancelled_order_rejected():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     pt.cancel_order(r["order_id"])
     result = pt.edit_order(r["order_id"], entry_price=2500.0)
     assert "error" in result
@@ -3430,7 +3451,7 @@ def test_edit_cancelled_order_rejected():
 def test_fill_pending_order_transitions_to_filled():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     assert r["status"] == "pending"
     assert pt.get_portfolio_summary()["positions_count"] == 0
     fill = pt.fill_order(r["order_id"])
@@ -3442,7 +3463,7 @@ def test_fill_pending_order_transitions_to_filled():
 def test_cancel_pending_order():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     assert pt.get_portfolio_summary()["pending_orders_count"] == 1
     cancel = pt.cancel_order(r["order_id"])
     assert cancel["status"] == "cancelled"
@@ -3452,8 +3473,8 @@ def test_cancel_pending_order():
 def test_get_pending_orders():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r1 = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
-    r2 = pt.place_order("TCS", "LONG", 5, 3200.0, 3180.0, 3250.0)
+    r1 = pt.place_order("RELIANCE", "LONG", 2, 2450.0, 2420.0, 2500.0)
+    r2 = pt.place_order("TCS", "LONG", 1, 3200.0, 3180.0, 3250.0)
     pt.fill_order(r2["order_id"])
     pending = pt.get_pending_orders()
     assert len(pending) == 1
@@ -3465,7 +3486,7 @@ def test_rr_recalculated_on_edit():
     from app.services.trade_setup import compute_risk_reward
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     result = pt.edit_order(r["order_id"], entry_price=2440.0, stop_loss=2410.0, target_1=2500.0)
     assert result["status"] == "pending"
     rr = compute_risk_reward(2440.0, 2410.0, 2500.0, "LONG")
@@ -3476,7 +3497,7 @@ def test_rr_recalculated_on_edit():
 def test_no_duplicate_positions_on_fill():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     pt.fill_order(r["order_id"])
     fill2 = pt.fill_order(r["order_id"])
     assert "error" in fill2
@@ -3486,7 +3507,7 @@ def test_no_duplicate_positions_on_fill():
 def test_cross_user_edit_rejected():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user_a")
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0, user_id="user_a")
     result = pt.edit_order(r["order_id"], entry_price=2500.0, user_id="user_b")
     assert "error" in result
 
@@ -3494,36 +3515,36 @@ def test_cross_user_edit_rejected():
 def test_long_position_live_pnl():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     pt.fill_order(r["order_id"])
     pt.update_prices({"RELIANCE": 2470.0})
     positions = pt.get_positions()
     assert len(positions) == 1
     assert positions[0]["current_price"] == 2470.0
-    assert positions[0]["unrealized_pnl"] == pytest.approx(200.0)
+    assert positions[0]["unrealized_pnl"] == pytest.approx(80.0)
 
 
 def test_short_position_live_pnl():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("TCS", "SHORT", 5, 3200.0, 3230.0, 3160.0)
+    r = pt.place_order("TCS", "SHORT", 2, 3200.0, 3230.0, 3160.0)
     pt.fill_order(r["order_id"])
     pt.update_prices({"TCS": 3180.0})
     positions = pt.get_positions()
     assert len(positions) == 1
     assert positions[0]["current_price"] == 3180.0
-    assert positions[0]["unrealized_pnl"] == pytest.approx(100.0)
+    assert positions[0]["unrealized_pnl"] == pytest.approx(40.0)
 
 
 def test_live_pnl_updates_after_price_change():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     pt.fill_order(r["order_id"])
     pt.update_prices({"RELIANCE": 2460.0})
-    assert pt.get_positions()[0]["unrealized_pnl"] == pytest.approx(100.0)
+    assert pt.get_positions()[0]["unrealized_pnl"] == pytest.approx(40.0)
     pt.update_prices({"RELIANCE": 2480.0})
-    assert pt.get_positions()[0]["unrealized_pnl"] == pytest.approx(300.0)
+    assert pt.get_positions()[0]["unrealized_pnl"] == pytest.approx(120.0)
     pt.update_prices({"RELIANCE": 2450.0})
     assert pt.get_positions()[0]["unrealized_pnl"] == pytest.approx(0.0)
 
@@ -3531,26 +3552,26 @@ def test_live_pnl_updates_after_price_change():
 def test_closed_trade_realized_pnl():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     pt.fill_order(r["order_id"])
     oid = pt.get_positions()[0]["id"]
     close = pt.close_position(oid, 2500.0)
-    assert close["pnl"] == pytest.approx(500.0)
+    assert close["pnl"] == pytest.approx(200.0)
     summary = pt.get_portfolio_summary()
-    assert summary["realized_pnl"] == pytest.approx(500.0)
+    assert summary["realized_pnl"] == pytest.approx(200.0)
     assert summary["unrealized_pnl"] == 0.0
-    assert summary["total_pnl"] == pytest.approx(500.0)
+    assert summary["total_pnl"] == pytest.approx(200.0)
     history = pt.get_trade_history()
     assert len(history) == 1
-    assert history[0]["pnl"] == pytest.approx(500.0)
+    assert history[0]["pnl"] == pytest.approx(200.0)
 
 
 def test_pending_value_in_summary():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     summary = pt.get_portfolio_summary()
-    assert summary["pending_value"] == pytest.approx(24500.0)
+    assert summary["pending_value"] == pytest.approx(9800.0)
     pt.cancel_order(r["order_id"])
     summary = pt.get_portfolio_summary()
     assert summary["pending_value"] == 0.0
@@ -3638,7 +3659,7 @@ def test_sector_batch_resolves_and_falls_back():
 def test_custom_setup_persists():
     from app.services.paper_trading import PaperTradingEngine
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2500.0, 2470.0, 2560.0, user_id="user_123")
+    r = pt.place_order("RELIANCE", "LONG", 4, 2500.0, 2470.0, 2560.0, user_id="user_123")
     pt.fill_order(r["order_id"])
     positions = pt.get_positions()
     assert len(positions) == 1

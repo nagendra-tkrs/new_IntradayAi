@@ -352,6 +352,7 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
         stop_loss: useSL,
         target_1: useTarget,
         target_2: useTarget2,
+        signal_id: detail?.signal?.id ?? undefined,
       });
       setOrderMsg(`${direction} order placed for ${orderQty} shares of ${symbol}`);
     } catch (e) {

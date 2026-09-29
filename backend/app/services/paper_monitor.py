@@ -57,11 +57,13 @@ async def _run_monitor_cycle(engine, get_quote, finalize, on_fill=None):
                 logger.exception("Paper monitor: failed to finalize auto-close: %s", e)
         # Write-through the restored/latest open positions + pending orders so
         # marks and auto-executions survive a restart (no-op on non-persistent
-        # engines used by tests). Never breaks the monitor loop.
-        try:
-            engine.persist_snapshot(account.user_id)
-        except Exception:
-            logger.exception("Paper monitor: failed to persist account snapshot")
+        # engines used by tests). Write reduction: price marks alone never set
+        # an account dirty, so an idle cycle writes nothing.
+        if account._dirty:
+            try:
+                engine.persist_snapshot(account.user_id)
+            except Exception:
+                logger.exception("Paper monitor: failed to persist account snapshot")
 
 
 async def _monitor_loop(engine, get_quote, finalize, on_fill=None):

@@ -340,8 +340,8 @@ class YFinanceMarketDataProvider(MarketDataProvider):
         self._rate_limiter = RateLimiter(max_requests=10, window_seconds=1.0)
         self._quote_cache = TTLCache(max_size=200, ttl_seconds=60)
         self._bar_cache = TTLCache(max_size=200, ttl_seconds=30)
-        self._instruments_cache: Optional[list[dict]] = None
-        self._instruments_ts: Optional[float] = None
+        self._instruments_cache: dict[str, list[dict]] = {}
+        self._instruments_ts: dict[str, float] = {}
         self._last_data_times: dict[str, datetime] = {}
         self._data_status: dict[str, str] = {}
 
@@ -541,8 +541,11 @@ class YFinanceMarketDataProvider(MarketDataProvider):
 
     async def get_instruments(self, universe: str = "NIFTY50") -> list[dict]:
         now = time.time()
-        if self._instruments_cache is not None and self._instruments_ts and (now - self._instruments_ts) < 3600:
-            return self._instruments_cache
+        # Cache is keyed BY UNIVERSE: a NIFTY50 request must never serve cached
+        # NIFTY100/BANKNIFTY instruments (and vice versa) for the cache lifetime.
+        cached = self._instruments_cache.get(universe)
+        if cached is not None and (now - self._instruments_ts.get(universe, 0.0)) < 3600:
+            return cached
 
         from app.services.market_data.sector_map import get_sector, get_name
         symbols = NSE_UNIVERSES.get(universe, NSE_UNIVERSES["NIFTY50"])
@@ -571,8 +574,8 @@ class YFinanceMarketDataProvider(MarketDataProvider):
         except Exception:
             logger.debug("Sector enrichment skipped; using static fallback")
 
-        self._instruments_cache = instruments
-        self._instruments_ts = now
+        self._instruments_cache[universe] = instruments
+        self._instruments_ts[universe] = now
 
         # Persist resolved sectors best-effort (never blocks the response). This
         # writes into the instruments table so sectors are stored and reused.
@@ -613,7 +616,8 @@ class YFinanceMarketDataProvider(MarketDataProvider):
         return {
             "mode": "yfinance",
             "data_source": "yfinance (direct API)",
-            "instruments_loaded": self._instruments_cache is not None,
+            "instruments_loaded": bool(self._instruments_cache),
+            "instruments_universes_cached": sorted(self._instruments_cache.keys()),
             "symbols_cached": len(self._quote_cache._cache),
             "bars_cached": len(self._bar_cache._cache),
         }

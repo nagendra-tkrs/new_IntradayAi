@@ -9,7 +9,6 @@ import type {
   MarketIndex,
   MarketStatus,
   PaperPosition,
-  PaperTrade,
   PendingOrder,
   Performance,
   PlaceOrderResult,
@@ -17,7 +16,11 @@ import type {
   ScannerResponse,
   StockChartResponse,
   StockDetailResponse,
+  TradeHistoryResponse,
   TradeSetup,
+  LegacyProfitCompareResponse,
+  ContextComparison,
+  AiDecisionResponse,
 } from "./types";
 
 const API_BASE = "/api";
@@ -47,6 +50,14 @@ export async function fetchAPI<T>(path: string, options?: RequestInit): Promise<
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
+    if (err && typeof err === "object" && "status" in err && err.status === "ACTIVE_UNIVERSE_UNAVAILABLE") {
+      const reason = typeof err.reason === "string" && err.reason
+        ? err.reason
+        : "The active universe is unavailable (ACTIVE_UNIVERSE_UNAVAILABLE).";
+      const e = new Error(reason);
+      (e as { payload?: unknown }).payload = err;
+      throw e;
+    }
     throw new Error(err.detail || `Request failed (${res.status})`);
   }
   return res.json();
@@ -64,7 +75,7 @@ export async function getMarketIndex(name: string = "NIFTY50"): Promise<MarketIn
   return fetchAPI(`/market/index/${name}`);
 }
 
-export async function getStocks(universe: string = "NIFTY50"): Promise<Instrument[]> {
+export async function getStocks(universe: string = "ACTIVE"): Promise<Instrument[]> {
   return fetchAPI(`/stocks?universe=${universe}`);
 }
 
@@ -98,7 +109,7 @@ export async function getStockChart(symbol: string, days: number = 1, interval: 
   return fetchAPI(`/stocks/${symbol}/chart?days=${days}&interval=${interval}`);
 }
 
-export async function runScanner(universe: string = "NIFTY50"): Promise<ScannerResponse> {
+export async function runScanner(universe: string = "ACTIVE"): Promise<ScannerResponse> {
   return fetchAPI(`/scanner?universe=${universe}`);
 }
 
@@ -114,6 +125,10 @@ export async function placePaperOrder(order: {
   stop_loss?: number;
   target_1?: number;
   target_2?: number;
+  setup_quality?: string;
+  signal_strength?: string;
+  atr?: number;
+  signal_id?: string;
 }): Promise<PlaceOrderResult> {
   return fetchAPI("/paper/orders", {
     method: "POST",
@@ -132,17 +147,45 @@ export async function getPositions(): Promise<{ positions: PaperPosition[] }> {
   return fetchAPI("/paper/positions");
 }
 
-export async function getTradeHistory(limit: number = 50): Promise<{ trades: PaperTrade[] }> {
-  return fetchAPI(`/paper/trades?limit=${limit}`);
+/**
+ * Realized paper-trade ledger with date-wise reporting.
+ *
+ * `date` (optional, IST `YYYY-MM-DD`) narrows the response to trades realized
+ * on that day; without it the flat `trades` list keeps its legacy cap of
+ * `limit` while `date_groups` / `summary` cover all closed trades.
+ */
+export async function getTradeHistory(limit: number = 50, date?: string): Promise<TradeHistoryResponse> {
+  const dateParam = date ? `&date=${encodeURIComponent(date)}` : "";
+  return fetchAPI(`/paper/trades?limit=${limit}${dateParam}`);
+}
+
+/** Read-only AI Decision detail for one closed paper trade (read-only). */
+export async function getAiDecision(tradeId: string): Promise<AiDecisionResponse> {
+  return fetchAPI(`/paper/trades/${encodeURIComponent(tradeId)}/ai-decision`);
 }
 
 export async function getPerformance(): Promise<Performance> {
   return fetchAPI("/paper/performance");
 }
 
+/** Read-only Legacy vs Profit Capture comparison (optional YYYY-MM-DD IST range). */
+export async function getPerformanceComparison(startDate?: string, endDate?: string): Promise<LegacyProfitCompareResponse> {
+  const params = new URLSearchParams();
+  if (startDate) params.set("start_date", startDate);
+  if (endDate) params.set("end_date", endDate);
+  const qs = params.toString();
+  return fetchAPI(`/paper/performance/comparison${qs ? `?${qs}` : ""}`);
+}
+
+/** Read-only Current (Mode A) vs 24H-context shadow (Mode B) comparison. */
+export async function getContextComparison(): Promise<ContextComparison> {
+  return fetchAPI("/paper/performance/context-comparison");
+}
+
 export async function runBacktest(params: {
   symbol: string;
   strategy?: string;
+  strategy_version?: string;
   days?: number;
   initial_capital?: number;
 }): Promise<BacktestResult> {

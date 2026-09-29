@@ -212,15 +212,18 @@ def test_phase6_auto_fill_short_then_stop_and_target():
     _eq(pt, "reserved_margin", 0.0, user_id="u")
     _equity_invariant(pt, user_id="u")
 
-    # new SELL then TARGET1: price <= target (1680) triggers a winning close
+    # new SELL then TARGET1: price <= target (1680) triggers the partial exit
     r2 = pt.place_order("TCS", "SELL", 5, 1694.0, 1705.0, 1680.0, user_id="u")
     pt.check_entry_triggers({"TCS": 1690.0}, user_id="u")
     assert len(pt.get_positions(user_id="u")) == 1
     exits = pt.check_stops({"TCS": 1680.0}, user_id="u")
     assert len(exits) == 1
     assert exits[0]["trade"]["result"] == "WIN"
-    _eq(pt, "total_pnl", (1694.0 - 1705.0) * 5 + (1694.0 - 1680.0) * 5, user_id="u")
-    _eq(pt, "reserved_margin", 0.0, user_id="u")
+    assert exits[0]["exit_reason"] == "T1_PARTIAL"
+    # T1 partial = 50% of 5 → 2.5 shares at +14 = realized +35.
+    _eq(pt, "total_pnl", (1694.0 - 1705.0) * 5 + (1694.0 - 1680.0) * 2.5, user_id="u")
+    # The 2.5 remaining shares still reserve their short collateral.
+    _eq(pt, "reserved_margin", 2.5 * 1694.0, user_id="u")
     _equity_invariant(pt, user_id="u")
 
 
@@ -330,19 +333,19 @@ def test_phase6_buy_auto_fill_regression():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "BUY", 10, 1694.0, 1685.0, 1710.0, user_id="u")
+    r = pt.place_order("RELIANCE", "BUY", 5, 1694.0, 1685.0, 1710.0, user_id="u")
     assert pt.check_entry_triggers({"RELIANCE": 1693.0}, user_id="u") == []
     fills = pt.check_entry_triggers({"RELIANCE": 1694.0}, user_id="u")
     assert len(fills) == 1
     assert pt.get_positions(user_id="u")[0]["direction"] == "LONG"
     _eq(pt, "total_value", INIT, user_id="u")
     # LONG committed capital is reserved like any open position
-    _eq(pt, "reserved_margin", 10 * 1694.0, user_id="u")
+    _eq(pt, "reserved_margin", 5 * 1694.0, user_id="u")
 
 
 # ── O. SL/Target regression (LONG) ──────────────────────────────────────
 def test_phase6_long_sl_target_regression():
-    """LONG SL (price <=) and Target1 (price >=) monitoring unchanged."""
+    """LONG SL (price <=) closes fully; Target1 (price >=) partial-exits 50%."""
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
@@ -350,12 +353,17 @@ def test_phase6_long_sl_target_regression():
     pt.fill_order(r["order_id"])
     exits = pt.check_stops({"RELIANCE": 95.0})
     assert len(exits) == 1 and exits[0]["trade"]["result"] == "LOSS"
+    assert exits[0]["trade"]["exit_reason"] == "STOP_LOSS"
     _eq(pt, "total_pnl", -50.0)
     r2 = pt.place_order("RELIANCE", "LONG", 10, 100.0, 95.0, 110.0)
     pt.fill_order(r2["order_id"])
     exits = pt.check_stops({"RELIANCE": 110.0})
     assert len(exits) == 1 and exits[0]["trade"]["result"] == "WIN"
-    _eq(pt, "total_pnl", -50.0 + 100.0)
+    assert exits[0]["exit_reason"] == "T1_PARTIAL"
+    # T1 partial = 50% of 10 → 5 shares at +10 = realized +50 (not +100).
+    _eq(pt, "total_pnl", -50.0 + 50.0)
+    pos = pt.get_positions()[0]
+    assert pos["quantity"] == 5 and pos["exit_stage"] == "T1_EXECUTED"
 
 
 # ── P. Pending orders reserve committed notional ─────────────────────────
@@ -365,10 +373,10 @@ def test_phase6_pending_orders_reserve_no_capital():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    rl = pt.place_order("LX", "LONG", 500, 100.0, 95.0, 110.0)
-    rs = pt.place_order("SX", "SHORT", 500, 100.0, 105.0, 90.0)
-    _eq(pt, "reserved_margin", 100_000.0)
-    _eq(pt, "available_cash", INIT - 100_000.0)
+    rl = pt.place_order("LX", "LONG", 40, 100.0, 95.0, 110.0)
+    rs = pt.place_order("SX", "SHORT", 40, 100.0, 105.0, 90.0)
+    _eq(pt, "reserved_margin", 8_000.0)
+    _eq(pt, "available_cash", INIT - 8_000.0)
     _eq(pt, "total_value", INIT)
     assert pt.get_pending_orders() and rl and rs
 
@@ -399,15 +407,15 @@ def test_phase6_collateral_frees_available_cash_after_close():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    rs = pt.place_order("S", "SHORT", 9_000, 100.0, 105.0, 90.0)  # notional 900,000
+    rs = pt.place_order("S", "SHORT", 90, 100.0, 105.0, 90.0)  # notional 9,000
     pt.fill_order(rs["order_id"])
-    _eq(pt, "available_cash", INIT - 900_000.0)
-    _eq(pt, "reserved_margin", 900_000.0)
-    pt.close_position(rs["order_id"], 90.0)  # win 90,000
-    _eq(pt, "available_cash", INIT + 90_000.0)
+    _eq(pt, "available_cash", INIT - 9_000.0)
+    _eq(pt, "reserved_margin", 9_000.0)
+    pt.close_position(rs["order_id"], 90.0)  # win 900
+    _eq(pt, "available_cash", INIT + 900.0)
     # A new LONG sized up to available cash now fits
-    rl = pt.place_order("L", "LONG", 900, 1_000.0, 990.0, 1010.0)  # 900,000
+    rl = pt.place_order("L", "LONG", 10, 1_000.0, 990.0, 1010.0)  # 10,000
     fill = pt.fill_order(rl["order_id"])
     assert fill["status"] == "filled"
-    _eq(pt, "available_cash", (INIT + 90_000.0) - 900_000.0)
-    _eq(pt, "reserved_margin", 900_000.0)
+    _eq(pt, "available_cash", (INIT + 900.0) - 10_000.0)
+    _eq(pt, "reserved_margin", 10_000.0)

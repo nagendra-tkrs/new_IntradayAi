@@ -113,7 +113,7 @@ def test_paper_trading():
 
     pt = PaperTradingEngine()
     initial = pt.get_portfolio_summary()["cash"]
-    result = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    result = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     assert result["status"] == "pending"
     assert pt.get_portfolio_summary()["positions_count"] == 0
     assert pt.fill_order(result["order_id"])["status"] == "filled"

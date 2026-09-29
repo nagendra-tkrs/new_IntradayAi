@@ -1,15 +1,88 @@
+# Dependencies
 node_modules/
-.next/
 backend/node_modules/
-*.pyc
-__pycache__/
-.env
-*.db
-.DS_Store
-frontend/.next/
 frontend/node_modules/
+
+# Next.js
+.next/
+frontend/.next/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+venv/
+env/
+.env
+.env.local
+.env.*.local
+
+# SQLite databases
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
 backend/intradayai.db
-backend/app/data/daily_improvement/
-backend/app/data/reports/
-backend/app/data/review/
-backend/app/data/strategy_history.json
+backend/intradayai.db.*
+
+# Logs
+*.log
+*.err
+uvicorn_*.log
+uvicorn_*.err
+frontend/dev_server.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test/debug scripts
+backend/verify*.py
+backend/trace_*.py
+backend/test_*.py
+backend/check_db.py
+backend/create_*.py
+backend/make_token*.py
+backend/inspect_db*.py
+backend/start_*.py
+backend/restart_backend.ps1
+backend/npm_start.bat
+backend/uvicorn_8020.err
+backend/uvicorn_8020.log
+
+# Reports (generated)
+*.md
+!README.md
+!**/README.md
+audit-reports/
+decision-finder/
+diagnosis_report.md
+final_report.md
+FULL_PROJECT_REPORT.md
+audit_report.md
+report.md
+paper_trading_full_report.md
+paper_trading_trade_setup_report.md
+
+# Docker
+docker-compose.override.yml
+
+# Backup files
+*.bak
+*.backup
+
+# Temporary files
+*.tmp
+*.temp

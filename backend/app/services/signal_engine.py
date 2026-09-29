@@ -504,6 +504,12 @@ def _net_market_context(market_context: dict | None) -> tuple[float, list[str]]:
     Neutral  : nifty_trend NEUTRAL/UNKNOWN, magnitude 0, or missing → 0
                (a missing context never creates an implicit LONG bias).
     Scaling  : magnitude = min(|nifty_change_pct| / 0.5, 1).
+
+    Optional additive 24-hour symbol context (Mode B / USE_24H_CONTEXT=true):
+    when ``market_context["symbol_24h"]`` carries a finite signed ``net`` on
+    [-1, +1] (from ``compute_24h_context``), it is ADDED to the NIFTY net and
+    capped at ±1 so the component can never exceed its 10-point budget. When
+    no symbol_24h is present the function is byte-identical to the original.
     """
     if not market_context:
         return 0.0, ["Market context neutral (no index data available)"]
@@ -519,10 +525,22 @@ def _net_market_context(market_context: dict | None) -> tuple[float, list[str]]:
     else:
         net = 0.0
     if net > 1e-9:
-        return round(net, 6), [f"NIFTY bullish context ({change:+.1f}%)"]
-    if net < -1e-9:
-        return round(net, 6), [f"NIFTY bearish context ({change:+.1f}%)"]
-    return 0.0, ["NIFTY context neutral"]
+        reasons = [f"NIFTY bullish context ({change:+.1f}%)"]
+    elif net < -1e-9:
+        reasons = [f"NIFTY bearish context ({change:+.1f}%)"]
+    else:
+        reasons = ["NIFTY context neutral"]
+
+    symbol_24h = market_context.get("symbol_24h")
+    if symbol_24h is not None:
+        raw = symbol_24h.get("net") if isinstance(symbol_24h, dict) else symbol_24h
+        if isinstance(raw, dict):
+            raw = raw.get("net")
+        sym_net = _clip(_finite(raw), -1.0, 1.0)
+        if not pd.isna(raw) and abs(sym_net) > 1e-9:
+            net = _clip(net + sym_net, -1.0, 1.0)
+            reasons.append(f"Symbol 24H context ({sym_net:+.2f})")
+    return round(net, 6), reasons
 
 
 def _risk_quality_v2(row: pd.Series) -> tuple[bool, float, list[str]]:
@@ -625,6 +643,28 @@ def compute_directional_evidence(
     }
 
 
+def _resolve_setup_multipliers(strategy_version, is_strong: bool) -> tuple[float, float, float]:
+    """Resolve the SL / T1 / T2 ATR multipliers for one bar.
+
+    Precedence is: strategy-version override > settings default. The legacy
+    geometry — a single ``stop_loss_atr_mult`` shared by both strengths and a
+    ``T2 = T1 + 1 ATR`` spacing — is preserved byte-for-byte whenever a version
+    sets no override (v1..v4 all leave the new fields None)."""
+    if strategy_version is None:
+        from app.core.config import settings
+        sl = settings.STRONG_SL_ATR_MULTIPLIER if is_strong else settings.NORMAL_SL_ATR_MULTIPLIER
+        t1 = settings.STRONG_T1_ATR_MULTIPLIER if is_strong else settings.NORMAL_T1_ATR_MULTIPLIER
+        t2 = settings.STRONG_T2_ATR_MULTIPLIER if is_strong else settings.NORMAL_T2_ATR_MULTIPLIER
+        return sl, t1, t2
+    sl = strategy_version.sl_atr_mult_for(is_strong) or strategy_version.stop_loss_atr_mult
+    t1 = strategy_version.target_1_atr_mult_for(is_strong)
+    t2 = strategy_version.target_2_atr_mult_for(is_strong)
+    if t2 is None:
+        # Legacy spacing: Target 2 sits exactly one ATR past Target 1.
+        t2 = t1 + 1.0
+    return sl, t1, t2
+
+
 def compute_trade_setup(row: pd.Series, direction: SignalDirection | str, strategy_version=None) -> TradeSetup:
     price = row.get("close", 0)
     atr_val = row.get("atr_14", 0)
@@ -634,23 +674,18 @@ def compute_trade_setup(row: pd.Series, direction: SignalDirection | str, strate
     dir_str = direction.value if isinstance(direction, SignalDirection) else str(direction)
     is_strong = dir_str == "STRONG_LONG" or dir_str == "STRONG_SHORT"
 
-    if strategy_version is not None:
-        stop_mult = strategy_version.stop_loss_atr_mult
-        target_mult = strategy_version.strong_atr_mult if is_strong else strategy_version.normal_atr_mult
-    else:
-        stop_mult = 1.5
-        target_mult = 3.0 if is_strong else 2.0
+    stop_mult, target_mult, target_2_mult = _resolve_setup_multipliers(strategy_version, is_strong)
 
     if dir_str in ("LONG", "STRONG_LONG", "WEAK_LONG"):
         entry = price
         stop_loss = round(price - stop_mult * atr_val, 2)
         target_1 = round(price + target_mult * atr_val, 2)
-        target_2 = round(price + (target_mult + 1.0) * atr_val, 2)
+        target_2 = round(price + target_2_mult * atr_val, 2)
     elif dir_str in ("SHORT", "STRONG_SHORT", "WEAK_SHORT"):
         entry = price
         stop_loss = round(price + stop_mult * atr_val, 2)
         target_1 = round(price - target_mult * atr_val, 2)
-        target_2 = round(price - (target_mult + 1.0) * atr_val, 2)
+        target_2 = round(price - target_2_mult * atr_val, 2)
     else:
         return TradeSetup()
     risk = abs(entry - stop_loss)
@@ -711,12 +746,20 @@ def evaluate_row_signal(
     row: pd.Series,
     market_context: dict | None = None,
     strategy_version=None,
+    context_24h: Optional[dict] = None,
 ) -> Optional[dict]:
     """Pure per-row signal decision — the single source of truth for direction,
     confidence, trade setup, and explanation.
 
     Used by BOTH `evaluate_signal` (live/scanner/stock detail) and the backtest
     engine so every consumer derives identical signals from the same candle.
+
+    ``context_24h`` (optional, Mode B / USE_24H_CONTEXT=true) is the dict from
+    ``compute_24h_context``. When it carries a finite signed ``net`` it is
+    ADDED to the NIFTY market context (see ``_net_market_context``); a None
+    value produces byte-identical behavior to the current engine. The trade
+    setup (entry/SL/T1/T2/R:R) is ALWAYS computed by the existing strategy —
+    the 24H context never creates its own SL/T1/T2 system.
 
     Returns a dict with keys:
         direction, confidence, signal_score, setup, reasons, risks
@@ -734,6 +777,7 @@ def evaluate_row_signal(
                 "reasons": [f"Missing critical indicator: {ind}"],
                 "risks": ["Incomplete indicator data"],
                 "direction_evidence": DirectionalEvidence(),
+                "context_24h": context_24h,
             }
 
     # Check OHLC validity
@@ -750,6 +794,7 @@ def evaluate_row_signal(
             "reasons": ["Invalid OHLC data"],
             "risks": ["Invalid price data"],
             "direction_evidence": DirectionalEvidence(),
+            "context_24h": context_24h,
         }
     if not (o > 0 and h > 0 and l > 0 and c > 0):
         return {
@@ -760,6 +805,7 @@ def evaluate_row_signal(
             "reasons": ["Non-positive price"],
             "risks": ["Invalid price data"],
             "direction_evidence": DirectionalEvidence(),
+            "context_24h": context_24h,
         }
     if not (h >= max(o, c) and l <= min(o, c)):
         return {
@@ -770,9 +816,19 @@ def evaluate_row_signal(
             "reasons": ["Invalid OHLC relationship"],
             "risks": ["Invalid price data"],
             "direction_evidence": DirectionalEvidence(),
+            "context_24h": context_24h,
         }
 
-    ev = compute_directional_evidence(row, market_context)
+    # Mode B: fold the signed 24H net into the market-context slot. When absent
+    # (USE_24H_CONTEXT=false) ctx is exactly `market_context` — no behavior
+    # change to the existing signal.
+    ctx = market_context
+    if context_24h is not None:
+        netv = context_24h.get("net") if isinstance(context_24h, dict) else context_24h
+        if isinstance(netv, (int, float)) and math.isfinite(netv):
+            ctx = {**(market_context or {}), "symbol_24h": context_24h}
+
+    ev = compute_directional_evidence(row, ctx)
     nets = ev["nets"]
     reasons = ev["reasons"]
     total = ev["total"]
@@ -803,6 +859,7 @@ def evaluate_row_signal(
             "reasons": list(ev["risk_reasons"]),
             "risks": ["Risk data invalid - cannot size a trade"],
             "direction_evidence": ev["evidence"],
+            "context_24h": context_24h,
         }
 
     # Conflict rule: strong LONG and strong SHORT evidence simultaneously →
@@ -820,6 +877,7 @@ def evaluate_row_signal(
             ],
             "risks": ["Strong contradictory LONG and SHORT evidence"],
             "direction_evidence": ev["evidence"],
+            "context_24h": context_24h,
         }
 
     if direction == SignalDirection.NO_TRADE:
@@ -834,6 +892,7 @@ def evaluate_row_signal(
             ],
             "risks": ["Insufficient confluence for a quality setup"],
             "direction_evidence": ev["evidence"],
+            "context_24h": context_24h,
         }
 
     is_strong = direction in (SignalDirection.STRONG_LONG, SignalDirection.STRONG_SHORT)
@@ -920,6 +979,7 @@ def evaluate_row_signal(
         "reasons": all_reasons,
         "risks": all_risks,
         "direction_evidence": ev["evidence"],
+        "context_24h": context_24h,
     }
 
 
@@ -933,6 +993,7 @@ def evaluate_signal(
     data_status: str = "UNKNOWN",
     market_data_timestamp: datetime | None = None,
     strategy_version=None,
+    context_24h: Optional[dict] = None,
 ) -> Optional[dict]:
     # Data quality checks
     if data_status in ("STALE", "UNAVAILABLE", "DELAYED"):
@@ -952,7 +1013,8 @@ def evaluate_signal(
     
     row = df.iloc[-1]
     sv = get_strategy(strategy_version) if strategy_version is not None else None
-    decision = evaluate_row_signal(row, market_context=market_context, strategy_version=sv)
+    decision = evaluate_row_signal(row, market_context=market_context, strategy_version=sv,
+                                   context_24h=context_24h)
 
     if decision is None:
         return {
@@ -1004,6 +1066,7 @@ def evaluate_signal(
         "risks": explanation.risks,
         "direction_evidence": decision["direction_evidence"],
         "strategy": strategy,
+        "strategy_version": getattr(strategy_version, "version", None),
         "data_source": data_source,
         "indicator_values": indicator_values,
         "market_data_timestamp": market_data_ts_str,
@@ -1012,4 +1075,5 @@ def evaluate_signal(
         "stop_loss_updated_at": sl_ts.isoformat(),
         "target_updated_at": target_ts.isoformat(),
         "last_updated_at": signal_generated_at.isoformat(),
+        "context_24h": context_24h,
     }

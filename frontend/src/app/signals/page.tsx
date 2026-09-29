@@ -25,7 +25,18 @@ export default function SignalsPage() {
     async function load() {
       try {
         const data = await runScanner();
-        setSignals(data.top_signals || []);
+        // Backend `top_signals` now carries only the Top 3 (combined pool).
+        // The journal keeps ALL eligible signals of the current scan so every
+        // quality-approved setup is surfaced, ranked deterministically.
+        const top = (data.results || [])
+          .filter((r) => r.top_signal_eligible === true)
+          .sort((a: ScannerResult, b: ScannerResult) => {
+            const ra = a.top_signal_rank ?? Number.MAX_SAFE_INTEGER;
+            const rb = b.top_signal_rank ?? Number.MAX_SAFE_INTEGER;
+            if (ra !== rb) return ra - rb;
+            return (b.confidence || 0) - (a.confidence || 0);
+          });
+        setSignals(top);
       } catch (e) {
         console.error(e);
       } finally {
@@ -57,6 +68,11 @@ export default function SignalsPage() {
               <SignalCard
                 key={signal.symbol}
                 signal={signal.signal_data}
+                setupQuality={signal.setup_quality}
+                qualityScore={signal.setup_quality_score}
+                confirmationCount={signal.confirmation_count}
+                confirmationTotal={signal.confirmation_total}
+                riskRewardRatio={signal.risk_reward_ratio}
                 onClick={() => window.location.href = `/stock/${signal.symbol}`}
               />
             ))}

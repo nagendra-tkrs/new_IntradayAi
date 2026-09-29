@@ -13,13 +13,13 @@ Covers:
 """
 
 import pytest
+from app.core.config import settings
 
 
 def test_phase4_user_account_auto_provisioning():
     """A user-scoped read provisions that user's account with full notional
     capital, independently of any other account."""
     from app.services.paper_trading import PaperTradingEngine
-    from app.core.config import settings
 
     pt = PaperTradingEngine()
     sA = pt.get_portfolio_summary(user_id="user-a")
@@ -39,9 +39,9 @@ def test_phase4_cross_user_isolation():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    rA = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    rA = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0, user_id="user-a")
     pt.fill_order(rA["order_id"], user_id="user-a")
-    pB = pt.place_order("TCS", "LONG", 5, 3200.0, 3180.0, 3250.0, user_id="user-b")
+    pB = pt.place_order("TCS", "LONG", 2, 3200.0, 3180.0, 3250.0, user_id="user-b")
 
     # B sees only its own pending order.
     b_pending = pt.get_pending_orders(user_id="user-b")
@@ -52,11 +52,11 @@ def test_phase4_cross_user_isolation():
     # A still has its position and A's cash reflects only A's LONG fill.
     assert len(pt.get_positions(user_id="user-a")) == 1
     a_sum = pt.get_portfolio_summary(user_id="user-a")
-    assert a_sum["cash"] == pytest.approx(1_000_000.0 - 10 * 2450.0)
+    assert a_sum["cash"] == pytest.approx(settings.INITIAL_CAPITAL - 4 * 2450.0)
     assert a_sum["positions_count"] == 1
     # B's pending order touches neither B cash nor B equity.
     b_sum = pt.get_portfolio_summary(user_id="user-b")
-    assert b_sum["cash"] == pytest.approx(1_000_000.0)
+    assert b_sum["cash"] == pytest.approx(settings.INITIAL_CAPITAL)
     assert b_sum["pending_orders_count"] == 1
     # B cannot fill A's order through B's account.
     assert "error" in pt.fill_order(rA["order_id"], user_id="user-b")
@@ -68,9 +68,9 @@ def test_phase4_cross_user_close_and_cancel_isolation():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    rA = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    rA = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0, user_id="user-a")
     pt.fill_order(rA["order_id"], user_id="user-a")
-    pB = pt.place_order("TCS", "LONG", 5, 3200.0, 3180.0, 3250.0, user_id="user-b")
+    pB = pt.place_order("TCS", "LONG", 2, 3200.0, 3180.0, 3250.0, user_id="user-b")
 
     assert "error" in pt.close_position(rA["order_id"], 2600.0, user_id="user-b")
     assert len(pt.get_positions(user_id="user-a")) == 1
@@ -84,7 +84,7 @@ def test_phase4_closed_trades_isolated_per_user():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    rA = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    rA = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0, user_id="user-a")
     pt.fill_order(rA["order_id"], user_id="user-a")
     pt.close_position(rA["order_id"], 2500.0, user_id="user-a")
 
@@ -100,24 +100,24 @@ def test_phase4_no_user_facade_backward_compatible():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    assert pt.get_portfolio_summary()["cash"] == pytest.approx(1_000_000.0)
+    assert pt.get_portfolio_summary()["cash"] == pytest.approx(settings.INITIAL_CAPITAL)
     assert pt.get_positions() == []
     assert pt.get_pending_orders() == []
     assert pt.get_trade_history() == []
 
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0)
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0)
     pt.fill_order(r["order_id"])
     assert pt.get_portfolio_summary()["positions_count"] == 1
     assert len(pt.get_positions()) == 1
     assert pt.get_positions()[0]["symbol"] == "RELIANCE"
 
 
-def test_phase4_runtime_long_target_autoclose():
-    """LONG position auto-closes at target_1 via the runtime monitor path."""
+def test_phase4_runtime_long_target_partial():
+    """LONG position auto-partially-exits at target_1 via the runtime path."""
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0, user_id="user-a")
     pt.fill_order(r["order_id"], user_id="user-a")
 
     pt.update_prices({"RELIANCE": 2499.0}, user_id="user-a")
@@ -126,11 +126,23 @@ def test_phase4_runtime_long_target_autoclose():
     assert len(exits) == 1
     assert exits[0]["trade"]["exit_price"] == 2500.0
     assert exits[0]["trade"]["result"] == "WIN"
-    assert exits[0]["pnl"] == pytest.approx(500.0)
-    assert pt.get_positions(user_id="user-a") == []
+    assert exits[0]["exit_reason"] == "T1_PARTIAL"
+    # T1 partial = 50% of 4 → 2 shares at +50 = realized +100.
+    assert exits[0]["pnl"] == pytest.approx(100.0)
+    pos = pt.get_positions(user_id="user-a")
+    assert len(pos) == 1
+    assert pos[0]["quantity"] == 2
+    assert pos[0]["exit_stage"] == "T1_EXECUTED"
+    assert pos[0]["realized_pnl"] == pytest.approx(100.0)
     s = pt.get_portfolio_summary(user_id="user-a")
-    assert s["total_pnl"] == pytest.approx(500.0)
-    assert s["unrealized_pnl"] == 0.0
+    assert s["total_pnl"] == pytest.approx(100.0)
+    # Remaining 2 shares marked at the T1 price → unrealized 100.
+    assert s["unrealized_pnl"] == pytest.approx(100.0)
+    # Remainder finally closes manually → full round-trip profit realized.
+    pt.close_position(pos[0]["id"], 2500.0, user_id="user-a")
+    s = pt.get_portfolio_summary(user_id="user-a")
+    assert s["positions_count"] == 0
+    assert s["total_pnl"] == pytest.approx(200.0)
 
 
 def test_phase4_runtime_long_sl_autoclose():
@@ -138,31 +150,38 @@ def test_phase4_runtime_long_sl_autoclose():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0, user_id="user-a")
     pt.fill_order(r["order_id"], user_id="user-a")
 
     exits = pt.check_stops({"RELIANCE": 2420.0}, user_id="user-a")
     assert len(exits) == 1
     assert exits[0]["trade"]["exit_price"] == 2420.0
     assert exits[0]["trade"]["result"] == "LOSS"
-    assert exits[0]["pnl"] == pytest.approx(-300.0)
+    assert exits[0]["pnl"] == pytest.approx(-120.0)
     assert pt.get_positions(user_id="user-a") == []
 
 
-def test_phase4_runtime_short_target_autoclose():
-    """SHORT position auto-closes at target_1 via the runtime monitor path."""
+def test_phase4_runtime_short_target_partial():
+    """SHORT position auto-partially-exits at target_1 via the runtime path."""
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("TCS", "SHORT", 5, 3200.0, 3230.0, 3160.0, user_id="user-a")
+    r = pt.place_order("TCS", "SHORT", 2, 3200.0, 3230.0, 3160.0, user_id="user-a")
     pt.fill_order(r["order_id"], user_id="user-a")
 
     exits = pt.check_stops({"TCS": 3160.0}, user_id="user-a")
     assert len(exits) == 1
     assert exits[0]["trade"]["exit_price"] == 3160.0
     assert exits[0]["trade"]["result"] == "WIN"
-    assert exits[0]["pnl"] == pytest.approx(200.0)
-    assert pt.get_positions(user_id="user-a") == []
+    assert exits[0]["exit_reason"] == "T1_PARTIAL"
+    # T1 partial = 50% of 2 → 1 share at +40 = realized +40.
+    assert exits[0]["pnl"] == pytest.approx(40.0)
+    pos = pt.get_positions(user_id="user-a")
+    assert len(pos) == 1
+    assert pos[0]["quantity"] == 1
+    assert pos[0]["exit_stage"] == "T1_EXECUTED"
+    s = pt.get_portfolio_summary(user_id="user-a")
+    assert s["total_pnl"] == pytest.approx(40.0)
 
 
 def test_phase4_runtime_short_sl_autoclose():
@@ -170,14 +189,14 @@ def test_phase4_runtime_short_sl_autoclose():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("TCS", "SHORT", 5, 3200.0, 3230.0, 3160.0, user_id="user-a")
+    r = pt.place_order("TCS", "SHORT", 2, 3200.0, 3230.0, 3160.0, user_id="user-a")
     pt.fill_order(r["order_id"], user_id="user-a")
 
     exits = pt.check_stops({"TCS": 3230.0}, user_id="user-a")
     assert len(exits) == 1
     assert exits[0]["trade"]["exit_price"] == 3230.0
     assert exits[0]["trade"]["result"] == "LOSS"
-    assert exits[0]["pnl"] == pytest.approx(-150.0)
+    assert exits[0]["pnl"] == pytest.approx(-60.0)
     assert pt.get_positions(user_id="user-a") == []
 
 
@@ -186,19 +205,23 @@ def test_phase4_runtime_gap_exits_at_observed_price():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "LONG", 2, 2450.0, 2420.0, 2500.0, user_id="user-a")
     pt.fill_order(r["order_id"], user_id="user-a")
     exits = pt.check_stops({"RELIANCE": 2400.0}, user_id="user-a")
     assert len(exits) == 1
     assert exits[0]["trade"]["exit_price"] == 2400.0
-    assert exits[0]["pnl"] == pytest.approx(-500.0)
+    assert exits[0]["pnl"] == pytest.approx(-100.0)
 
-    r2 = pt.place_order("TCS", "SHORT", 5, 3200.0, 3230.0, 3160.0, user_id="user-a")
+    r2 = pt.place_order("TCS", "SHORT", 1, 3200.0, 3230.0, 3160.0, user_id="user-a")
     pt.fill_order(r2["order_id"], user_id="user-a")
     exits2 = pt.check_stops({"TCS": 3140.0}, user_id="user-a")
     assert len(exits2) == 1
     assert exits2[0]["trade"]["exit_price"] == 3140.0
-    assert exits2[0]["pnl"] == pytest.approx(300.0)
+    assert exits2[0]["exit_reason"] == "T1_PARTIAL"
+    # T1 partial = 50% of 1 share → 0.5 at +60 = +30; remainder stays open.
+    assert exits2[0]["pnl"] == pytest.approx(30.0)
+    remaining = pt.get_positions(user_id="user-a")
+    assert len(remaining) == 1 and remaining[0]["quantity"] == pytest.approx(0.5)
 
 
 def test_phase4_update_prices_marks_before_autoclose():
@@ -206,21 +229,25 @@ def test_phase4_update_prices_marks_before_autoclose():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0, user_id="user-a")
     pt.fill_order(r["order_id"], user_id="user-a")
 
     pt.update_prices({"RELIANCE": 2470.0}, user_id="user-a")
     pos = pt.get_positions(user_id="user-a")[0]
     assert pos["current_price"] == 2470.0
-    assert pos["unrealized_pnl"] == pytest.approx(200.0)
-    assert pt.get_portfolio_summary(user_id="user-a")["unrealized_pnl"] == pytest.approx(200.0)
+    assert pos["unrealized_pnl"] == pytest.approx(80.0)
+    assert pt.get_portfolio_summary(user_id="user-a")["unrealized_pnl"] == pytest.approx(80.0)
 
     exits = pt.check_stops({"RELIANCE": 2500.0}, user_id="user-a")
     assert len(exits) == 1
+    assert exits[0]["exit_reason"] == "T1_PARTIAL"
+    assert exits[0]["pnl"] == pytest.approx(100.0)
     s = pt.get_portfolio_summary(user_id="user-a")
-    assert s["unrealized_pnl"] == 0.0
-    assert s["total_pnl"] == pytest.approx(500.0)
-    assert s["total_value"] == pytest.approx(1_000_500.0)
+    # After the T1 partial the remaining 2 shares are marked at 2500 → unrealized
+    # 100 while the position stays open, so total_value keeps INIT + 200.
+    assert s["realized_pnl"] == pytest.approx(100.0)
+    assert s["unrealized_pnl"] == pytest.approx(100.0)
+    assert s["total_value"] == pytest.approx(settings.INITIAL_CAPITAL + 200.0)
 
 
 def test_phase4_autoclose_single_position_only():
@@ -228,16 +255,22 @@ def test_phase4_autoclose_single_position_only():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r1 = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
-    r2 = pt.place_order("TCS", "LONG", 5, 3200.0, 3180.0, 3250.0, user_id="user-a")
+    r1 = pt.place_order("RELIANCE", "LONG", 2, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    r2 = pt.place_order("TCS", "LONG", 1, 3200.0, 3180.0, 3250.0, user_id="user-a")
     pt.fill_order(r1["order_id"], user_id="user-a")
     pt.fill_order(r2["order_id"], user_id="user-a")
 
     exits = pt.check_stops({"RELIANCE": 2500.0, "TCS": 3249.0}, user_id="user-a")
     assert len(exits) == 1
     assert exits[0]["trade"]["symbol"] == "RELIANCE"
+    assert exits[0]["exit_reason"] == "T1_PARTIAL"
+    # RELIANCE half-exited → still open (remainder) alongside the untouched TCS.
     remaining = pt.get_positions(user_id="user-a")
-    assert len(remaining) == 1 and remaining[0]["symbol"] == "TCS"
+    assert len(remaining) == 2
+    reli = next(p for p in remaining if p["symbol"] == "RELIANCE")
+    tcs = next(p for p in remaining if p["symbol"] == "TCS")
+    assert reli["quantity"] == 1 and reli["exit_stage"] == "T1_EXECUTED"
+    assert tcs["quantity"] == 1
 
 
 def test_phase4_monitor_close_records_user_id():
@@ -245,7 +278,7 @@ def test_phase4_monitor_close_records_user_id():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0, user_id="user-a")
     pt.fill_order(r["order_id"], user_id="user-a")
     exits = pt.check_stops({"RELIANCE": 2500.0}, user_id="user-a")
     assert exits[0]["trade"]["user_id"] == "user-a"
@@ -256,7 +289,7 @@ def test_phase4_account_close_inherits_user_id():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0, user_id="user-a")
     pt.fill_order(r["order_id"], user_id="user-a")
     acc = pt.accounts["user-a"]
     res = acc.close_position(r["order_id"], 2500.0)
@@ -271,7 +304,7 @@ def test_phase4_monitor_cycle_autocloses_and_finalizes():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0, user_id="user-a")
     pt.fill_order(r["order_id"], user_id="user-a")
 
     async def fake_quote(symbol):
@@ -292,7 +325,14 @@ def test_phase4_monitor_cycle_autocloses_and_finalizes():
     assert uid == "user-a"
     assert result["trade"]["exit_price"] == 2500.0
     assert result["trade"]["result"] == "WIN"
-    assert pt.get_positions(user_id="user-a") == []
+    # Target-1 hit now finalizes the controlled T1 partial (50%); the remainder
+    # stays open under the protective/trailing stop.
+    assert result["exit_reason"] == "T1_PARTIAL"
+    assert result["partial"] is True
+    remaining = pt.get_positions(user_id="user-a")
+    assert len(remaining) == 1
+    assert remaining[0]["quantity"] == 2
+    assert remaining[0]["exit_stage"] == "T1_EXECUTED"
 
 
 def test_phase4_monitor_skips_accounts_without_positions():
@@ -330,8 +370,8 @@ def test_phase4_monitor_resilient_to_failed_quote():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r1 = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
-    r2 = pt.place_order("TCS", "LONG", 5, 3200.0, 3180.0, 3250.0, user_id="user-a")
+    r1 = pt.place_order("RELIANCE", "LONG", 2, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    r2 = pt.place_order("TCS", "LONG", 1, 3200.0, 3180.0, 3250.0, user_id="user-a")
     pt.fill_order(r1["order_id"], user_id="user-a")
     pt.fill_order(r2["order_id"], user_id="user-a")
 
@@ -351,8 +391,13 @@ def test_phase4_monitor_resilient_to_failed_quote():
 
     assert len(finalized) == 1
     assert finalized[0]["trade"]["symbol"] == "TCS"
+    assert finalized[0]["exit_reason"] == "T1_PARTIAL"
     remaining = pt.get_positions(user_id="user-a")
-    assert len(remaining) == 1 and remaining[0]["symbol"] == "RELIANCE"
+    assert len(remaining) == 2
+    by_sym = {p["symbol"]: p for p in remaining}
+    # TCS half-exited (0.5 of 1 share left); RELIANCE quote failed → untouched.
+    assert by_sym["TCS"]["quantity"] == pytest.approx(0.5)
+    assert by_sym["RELIANCE"]["quantity"] == 2
 
 
 def test_phase4_monitor_bad_price_skipped():
@@ -362,7 +407,7 @@ def test_phase4_monitor_bad_price_skipped():
     from app.services.paper_trading import PaperTradingEngine
 
     pt = PaperTradingEngine()
-    r = pt.place_order("RELIANCE", "LONG", 10, 2450.0, 2420.0, 2500.0, user_id="user-a")
+    r = pt.place_order("RELIANCE", "LONG", 4, 2450.0, 2420.0, 2500.0, user_id="user-a")
     pt.fill_order(r["order_id"], user_id="user-a")
 
     async def fake_quote(symbol):
