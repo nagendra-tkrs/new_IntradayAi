@@ -6,7 +6,15 @@ from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy import select
 from app.services.paper_trading import PaperTradingEngine
-from app.services.position_sizing import SOURCE_MANUAL, SOURCE_RISK_ENGINE
+from app.services.position_sizing import (
+    SOURCE_MANUAL,
+    SOURCE_RISK_ENGINE,
+    SIZING_MANUAL,
+    SIZING_RISK_ENGINE,
+    SizingModeError,
+    risk_preview,
+    resolve_sizing_mode,
+)
 from app.services.risk_engine import RiskEngine, RiskConfig
 from app.services import signal_store
 from app.services.performance_comparison import compare_legacy_vs_profit_capture
@@ -44,7 +52,7 @@ def _parse_dt(value):
 class OrderRequest(BaseModel):
     symbol: str
     direction: str
-    quantity: int
+    quantity: Optional[int] = None
     entry_price: Optional[float] = None
     stop_loss: Optional[float] = None
     target_1: Optional[float] = None
@@ -59,6 +67,26 @@ class OrderRequest(BaseModel):
     # scanner pages send it so Signal → Paper Order → Position → Exit → P&L can
     # be joined. Legacy/manual orders omit it (None) and are unaffected.
     signal_id: Optional[str] = None
+    # How `quantity` will be decided: "RISK_ENGINE" (engine sizes it) or
+    # "MANUAL" (honour the caller's number). Omit it and the mode is inferred
+    # from the quantity - absent/non-positive means RISK_ENGINE, a real number
+    # means MANUAL. The explicit field exists so a UI can state intent rather
+    # than have it inferred from a default it filled in accidentally.
+    sizing_mode: Optional[str] = None
+
+
+class OrderPreviewRequest(BaseModel):
+    """Read-only sizing preview. Never places, sizes or blocks an order."""
+
+    symbol: Optional[str] = None
+    direction: Optional[str] = None
+    entry_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    target_1: Optional[float] = None
+    requested_quantity: Optional[float] = None
+    sizing_mode: Optional[str] = None
+    setup_quality: Optional[str] = None
+    signal_strength: Optional[str] = None
 
 
 class OrderEditRequest(BaseModel):
@@ -242,18 +270,31 @@ async def place_paper_order(order: OrderRequest, user: User = Depends(get_curren
     if not valid:
         raise HTTPException(status_code=400, detail=msg)
 
-    # ── Sizing-path provenance (measurement only) ──────────────────────────
-    # `qty = order.quantity` means the risk engine is consulted ONLY when the
-    # caller sends quantity <= 0. The paper-trading UI always sends a quantity
-    # (`orderQty[sym] || 1` / `useState(1)`, default 1 share), so in practice
-    # calculate_position_size() below is unreachable from the UI and the
-    # configured risk budget is bypassed. This records which branch ACTUALLY
-    # ran so risk utilization can be attributed rather than inferred. It does
-    # not alter the branch, the quantity, or any validation.
-    quantity_source = SOURCE_RISK_ENGINE if order.quantity <= 0 else SOURCE_MANUAL
+    # ── Sizing path ─────────────────────────────────────────────────────────
+    # Previously `qty = order.quantity` then `if qty <= 0: <risk engine>`, so the
+    # engine ran ONLY for a non-positive quantity. Because every UI path sent a
+    # positive quantity (`orderQty[sym] || 1` / `useState(1)`), the configured
+    # risk budget was unreachable from the UI and every paper order silently
+    # became a one-share manual trade.
+    #
+    # The mode is now explicit and resolved in one place
+    # (position_sizing.resolve_sizing_mode): a MISSING quantity means
+    # "size me from the risk engine", never "trade one share by hand". A
+    # MANUAL request with no number is a contradiction and is rejected rather
+    # than defaulted - failing loudly is the whole point of the fix.
+    #
+    # Everything above this block (duplicate-symbol, max positions, can_trade,
+    # R:R, validate_setup) runs unchanged for BOTH modes: a manual quantity is
+    # not a licence to skip any existing safety control.
+    try:
+        sizing_mode = resolve_sizing_mode(order.sizing_mode, order.quantity)
+    except SizingModeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    qty = order.quantity
-    if qty <= 0:
+    quantity_source = SIZING_RISK_ENGINE if sizing_mode == SIZING_RISK_ENGINE else SIZING_MANUAL
+
+    qty = int(order.quantity or 0)
+    if sizing_mode == SIZING_RISK_ENGINE:
         qty = risk_engine.calculate_position_size(
             entry_price,
             stop_loss,
@@ -268,6 +309,30 @@ async def place_paper_order(order: OrderRequest, user: User = Depends(get_curren
                       " (REJECTED/WEAK quality never trades by default)",
             )
         raise HTTPException(status_code=400, detail="Position size is zero")
+
+    # ── Sizing summary (returned to the caller, not enforced here) ───────────
+    # For MANUAL this reports what the chosen quantity actually risks against
+    # the configured budget. It is deliberately INFORMATIONAL: rejecting a
+    # manual quantity that exceeds the per-trade budget would be a behaviour
+    # change (it would refuse orders the system accepts today), and silently
+    # clamping it would violate "never silently increase/change the user's
+    # quantity" in the other direction. The budget is shown, not enforced.
+    #
+    # Every hard control remains exactly as it was and all of them run BEFORE
+    # this point for BOTH modes: max simultaneous positions, duplicate symbol,
+    # can_trade() (daily loss %, daily trade count, loss cooldown) and
+    # validate_setup() (R:R). Capital is enforced by place_order's existing
+    # available-cash gate below, with its cap untouched.
+    sizing_summary = risk_preview(
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        account_capital=risk_engine.config.account_capital,
+        risk_pct=risk_engine.effective_risk_per_trade_pct(
+            order.setup_quality, order.signal_strength
+        ),
+        requested_quantity=qty,
+        sizing_mode=sizing_mode,
+    )
 
     result = paper_engine.place_order(
         symbol=order.symbol,
@@ -301,7 +366,79 @@ async def place_paper_order(order: OrderRequest, user: User = Depends(get_curren
         except Exception:
             risk_pct = None
         signal_store.update_signal_usage(order.signal_id, qty, total_risk, risk_pct)
+    # Report back exactly what was placed and how it was sized, so the caller
+    # never has to guess which branch ran.
+    if isinstance(result, dict):
+        result["sizing_mode"] = sizing_mode
+        result["quantity_source"] = quantity_source
+        result["sizing"] = sizing_summary
     return result
+
+
+@router.post("/paper/orders/preview")
+async def preview_paper_order(payload: OrderPreviewRequest, user: User = Depends(get_current_user)):
+    """Risk-sizing preview for an order the user is about to place.
+
+    Read-only. It places nothing, persists nothing, and is never consulted by
+    the execution path - ``place_paper_order`` recomputes through the live
+    ``RiskEngine``, which remains the single sizing authority. The purpose is
+    to make the calculation visible BEFORE the order exists, including the
+    manual quantity's real rupee risk, so neither path is hidden.
+
+    Uses the same defaults as ``place_paper_order`` for entry and stop when the
+    caller omits them, so the preview cannot disagree with the real order.
+    """
+    entry_price = payload.entry_price
+    if entry_price is None and payload.symbol:
+        quote = await _get_provider().get_quote(payload.symbol)
+        entry_price = quote["price"]
+    if not entry_price or entry_price <= 0:
+        return risk_preview(
+            entry_price=None,
+            stop_loss=payload.stop_loss,
+            account_capital=risk_engine.config.account_capital,
+            risk_pct=risk_engine.effective_risk_per_trade_pct(
+                payload.setup_quality, payload.signal_strength
+            ),
+            requested_quantity=payload.requested_quantity,
+            sizing_mode=payload.sizing_mode,
+        )
+
+    direction = (payload.direction or "LONG").upper()
+    stop_loss = payload.stop_loss or (
+        entry_price * 0.97 if direction in ("LONG", "BUY") else entry_price * 1.03
+    )
+    target_1 = payload.target_1 or (
+        entry_price * 1.04 if direction in ("LONG", "BUY") else entry_price * 0.96
+    )
+
+    preview = risk_preview(
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        account_capital=risk_engine.config.account_capital,
+        risk_pct=risk_engine.effective_risk_per_trade_pct(
+            payload.setup_quality, payload.signal_strength
+        ),
+        requested_quantity=payload.requested_quantity,
+        sizing_mode=payload.sizing_mode,
+    )
+    preview["symbol"] = payload.symbol
+    preview["direction"] = payload.direction
+    preview["target_1"] = target_1
+
+    # A preview must not imply a tradeable order when the real endpoint would
+    # refuse it. Report the same verdict, without placing anything.
+    direction_label = "BUY" if direction in ("LONG", "BUY") else "SELL"
+    setup_result = compute_risk_reward(
+        entry_price, stop_loss, target_1, direction=direction_label
+    )
+    valid, msg = risk_engine.validate_setup(
+        entry_price, stop_loss, target_1, payload.direction or "LONG"
+    )
+    blockers = list(setup_result.errors) + ([] if valid else [msg])
+    preview["order_would_be_accepted"] = not blockers
+    preview["blockers"] = blockers
+    return preview
 
 
 @router.patch("/paper/orders/{order_id}")

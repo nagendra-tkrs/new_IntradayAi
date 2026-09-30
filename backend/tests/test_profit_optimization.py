@@ -61,8 +61,9 @@ from app.services.position_sizing import (  # noqa: E402
     SOURCE_MANUAL, SOURCE_RISK_ENGINE,
     STOP_SOURCE_SIGNAL, EntryRiskGeometry, capital_based_quantity,
     capture_entry_geometry, captured_geometry_fields, classify_order,
-    production_quantity, risk_based_quantity, risk_budget_for,
-    shadow_sizing_comparison, sizing_breakdown, sizing_report,
+    production_quantity, resolve_sizing_mode, risk_based_quantity, risk_budget_for,
+    risk_preview, shadow_sizing_comparison, sizing_breakdown, sizing_report,
+    SIZING_MANUAL, SIZING_RISK_ENGINE, SizingModeError,
 )
 from app.services.position_sizing_store import (  # noqa: E402
     GEOMETRY_TABLE, SOURCE_ORDER_FILL, ensure_geometry_schema, load_all_geometry,
@@ -2487,11 +2488,12 @@ class TestEntryGeometryIsCapturedAtFill:
         """Capture at FILL, not at place: the levels that matter are the ones
         the position actually opened with.
 
-        Also pins a pre-existing accounting quirk that measurement must not
-        inherit: ``edit_order`` rewrites ``quantity`` but leaves
-        ``initial_quantity`` at the pre-edit size, so at fill the live
-        ``quantity`` - not ``initial_quantity`` - is the size that was actually
-        bought. Fixing that quirk in the trade ledger is out of scope here.
+        This test previously pinned a pre-existing accounting quirk - it
+        asserted the position's ``initial_quantity`` stayed at the PRE-edit
+        size (10) after editing to 20. That quirk is now fixed, so the
+        assertion is inverted: bought quantity == position quantity ==
+        trade quantity == geometry quantity, all 20. Inverting it is a
+        strengthening; nothing was removed.
         """
         pt = _geom_engine(tmp_path)
         r = pt.place_order("EDITX", "LONG", 10, 100.0, 98.0, 105.0, 107.0,
@@ -2505,10 +2507,11 @@ class TestEntryGeometryIsCapturedAtFill:
         assert g["initial_risk_per_share"] == pytest.approx(3.0)
         assert g["initial_risk_amount"] == pytest.approx(60.0)
         assert g["risk_budget_utilization"] == pytest.approx(30.0)
-        # the position's own pre-edit `initial_quantity` is still 10 (the
-        # pre-existing quirk); only the geometry capture got it right
-        assert pt.get_position(r["order_id"])["initial_quantity"] == 10
-        assert pt.get_position(r["order_id"])["quantity"] == 20
+        # The fixed accounting: the persisted initial size is the size bought.
+        pos = pt.get_position(r["order_id"])
+        assert pos["quantity"] == 20
+        assert pos["initial_quantity"] == 20
+        assert pos["remaining_quantity"] == 20
 
     def test_the_auto_fill_path_captures_geometry_too(self, tmp_path):
         """check_entry_triggers is the live fill path - it must not be a hole."""
@@ -2885,7 +2888,16 @@ class TestGeometryLedgerIsAdditive:
 
 
 class TestOrderFlowIsUnchanged:
-    """The capture is measurement only: order flow must behave identically."""
+    """Order flow must behave identically EXCEPT for the sizing branch itself.
+
+    History: this class was written during the measurement-only phase, when
+    ``place_paper_order`` was contractually untouchable and the accidental
+    ``|| 1`` bypass was deliberately left in place to be reported rather than
+    fixed. A later, explicitly-requested task inverted that single decision -
+    the risk engine had to become reachable from the UI - so the assertion that
+    pinned the OLD branch selection was rewritten rather than deleted. The
+    invariants that protect the rest of the flow are untouched and remain.
+    """
 
     def test_place_order_gains_only_a_new_optional_key(self):
         import inspect
@@ -2898,18 +2910,34 @@ class TestOrderFlowIsUnchanged:
         assert sig.parameters["stop_loss"].default == 0
         assert sig.parameters["signal_id"].default is None
 
-    def test_the_api_records_the_branch_it_actually_taken_without_changing_it(
-            self):
+    def test_the_only_order_flow_change_is_the_sizing_branch(self):
+        """The sizing decision is now explicit; the live engine is still the
+        single authority that computes a RISK_ENGINE quantity, and MANUAL never
+        reaches it at all.
+        """
         import inspect
 
         from app.api import trading
         src = inspect.getsource(trading.place_paper_order)
-        # the sizing decision itself is untouched
-        assert "qty = order.quantity" in src
-        assert "if qty <= 0:" in src
+        # mode is resolved in one place, not guessed inline
+        assert "resolve_sizing_mode(order.sizing_mode, order.quantity)" in src
+        # the live risk engine - not a reimplementation - sizes RISK_ENGINE
         assert "risk_engine.calculate_position_size(" in src
-        # and the provenance is a pure record of that branch
-        assert "SOURCE_RISK_ENGINE if order.quantity <= 0 else SOURCE_MANUAL" in src
+        assert "if sizing_mode == SIZING_RISK_ENGINE:" in src
+        # MANUAL must not be able to reach the engine's sizing function: the
+        # call is guarded by the mode, and the requested number is seeded
+        # verbatim before the branch.
+        assert "qty = int(order.quantity or 0)" in src
+        head, _, tail = src.partition("if sizing_mode == SIZING_RISK_ENGINE:")
+        assert "calculate_position_size" not in head
+        assert "calculate_position_size" in tail.split("if qty <= 0:")[0]
+        # and the provenance recorded is a faithful record of that branch
+        assert ("SIZING_RISK_ENGINE if sizing_mode == SIZING_RISK_ENGINE"
+                " else SIZING_MANUAL") in src
+        # every pre-existing safety gate still runs before sizing
+        for gate in ("risk_engine.can_trade()", "risk_engine.validate_setup(",
+                     "compute_risk_reward(", "max_simultaneous_positions"):
+            assert gate in src
 
     def test_a_geometry_capture_does_not_change_the_filled_quantity(self, tmp_path):
         pt = _geom_engine(tmp_path)
@@ -2933,3 +2961,639 @@ class TestOrderFlowIsUnchanged:
                  "stop_loss": stop, "quantity": max(engine_qty, 1)},
                 account_capital=10_000.0, risk_pct=2.0)
             assert g.allowed_quantity == engine_qty, (entry, stop)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Risk-engine order integration
+#
+# The accidental-default bypass: every UI path sent a positive quantity
+# (`orderQty[sym] || 1`, `useState(1)`) and the endpoint only consulted the
+# risk engine when `quantity <= 0`, so the configured budget was unreachable
+# from the UI. These tests pin the replacement contract.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestSizingModeResolution:
+    """A missing quantity must mean 'size me from the risk engine', never
+    'trade one share by hand'."""
+
+    def test_a_missing_quantity_resolves_to_risk_engine(self):
+        assert resolve_sizing_mode(None, None) == SIZING_RISK_ENGINE
+        assert resolve_sizing_mode("", None) == SIZING_RISK_ENGINE
+        assert resolve_sizing_mode(None, 0) == SIZING_RISK_ENGINE
+        assert resolve_sizing_mode(None, -5) == SIZING_RISK_ENGINE
+
+    def test_a_supplied_quantity_resolves_to_manual(self):
+        assert resolve_sizing_mode(None, 1) == SIZING_MANUAL
+        assert resolve_sizing_mode(None, 250) == SIZING_MANUAL
+
+    def test_an_explicit_mode_always_wins(self):
+        assert resolve_sizing_mode(SIZING_RISK_ENGINE, 40) == SIZING_RISK_ENGINE
+        assert resolve_sizing_mode(SIZING_MANUAL, 40) == SIZING_MANUAL
+        # and is case/whitespace tolerant
+        assert resolve_sizing_mode("  manual  ", 40) == SIZING_MANUAL
+        assert resolve_sizing_mode("risk_engine") == SIZING_RISK_ENGINE
+
+    def test_manual_without_a_number_is_rejected_not_defaulted(self):
+        """The bypass in its purest form. Failing loudly is the only safe
+        reading: defaulting is precisely what created the bug."""
+        for qty in (None, 0, -1):
+            with pytest.raises(SizingModeError):
+                resolve_sizing_mode(SIZING_MANUAL, qty)
+
+    def test_an_unknown_mode_is_rejected(self):
+        with pytest.raises(SizingModeError):
+            resolve_sizing_mode("AUTO", 10)
+
+    def test_the_mode_values_reuse_the_provenance_vocabulary(self):
+        """No parallel abstraction: sizing mode and quantity source are the
+        same two facts."""
+        assert SIZING_RISK_ENGINE == SOURCE_RISK_ENGINE == "RISK_ENGINE"
+        assert SIZING_MANUAL == SOURCE_MANUAL == "MANUAL"
+
+
+class TestRiskPreview:
+    """The preview must show the whole calculation, not just the answer."""
+
+    def test_it_reproduces_the_documented_worked_example(self):
+        """Capital 10,000, risk 2% -> budget 200. Entry 100, SL 98 ->
+        risk/share 2, risk qty 100, capital qty 95, allowed 95, expected risk
+        190, utilization 95%."""
+        p = risk_preview(100.0, 98.0, 10_000.0, 2.0)
+        assert p["risk_budget"] == pytest.approx(200.0)
+        assert p["risk_per_share"] == pytest.approx(2.0)
+        assert p["risk_based_quantity"] == 100
+        assert p["capital_based_quantity"] == 95
+        assert p["allowed_quantity"] == 95
+        assert p["expected_initial_risk"] == pytest.approx(190.0)
+        assert p["risk_utilization_percent"] == pytest.approx(95.0)
+        assert p["binding_constraint"] == BINDING_CAPITAL
+
+    def test_a_wide_stop_is_risk_constrained_and_reported_as_such(self):
+        p = risk_preview(100.0, 80.0, 10_000.0, 2.0)
+        assert p["risk_based_quantity"] == 10
+        assert p["allowed_quantity"] == 10
+        assert p["binding_constraint"] == BINDING_RISK_BUDGET
+        assert p["expected_initial_risk"] == pytest.approx(200.0)
+        assert p["risk_utilization_percent"] == pytest.approx(100.0)
+
+    def test_the_preview_agrees_with_the_live_risk_engine_everywhere(self):
+        """One authority. The preview must never promise a quantity the
+        execution path would not produce."""
+        from app.services.risk_engine import RiskConfig, RiskEngine
+        eng = RiskEngine(RiskConfig(account_capital=10_000.0))
+        for entry, stop in ((100.0, 98.0), (100.0, 80.0), (2500.0, 2460.0),
+                            (100.0, 99.9), (50.0, 1.0), (10_000.0, 9_000.0)):
+            p = risk_preview(entry, stop, 10_000.0, 2.0)
+            assert p["allowed_quantity"] == eng.calculate_position_size(entry, stop), \
+                (entry, stop)
+
+    def test_it_reports_the_manual_quantity_real_risk_too(self):
+        """Manual is not hidden: the chosen number's actual rupee risk is
+        reported next to what the engine would have done."""
+        p = risk_preview(100.0, 98.0, 10_000.0, 2.0, requested_quantity=250)
+        assert p["sizing_mode"] == SIZING_MANUAL
+        assert p["manual_initial_risk"] == pytest.approx(500.0)
+        assert p["manual_utilization_percent"] == pytest.approx(250.0)
+        assert p["manual_exceeds_risk_budget"] is True
+        assert p["manual_capital_usage"] == pytest.approx(25_000.0)
+        assert p["manual_affordable"] is False
+        # and the engine's own answer is still reported alongside
+        assert p["allowed_quantity"] == 95
+
+    def test_a_breakeven_stop_reports_no_rather_than_a_fake_zero(self):
+        p = risk_preview(100.0, 100.0, 10_000.0, 2.0)
+        assert p["risk_per_share"] is None
+        assert p["allowed_quantity"] == 0
+        assert p["sizing_available"] is False
+
+    def test_a_non_positive_entry_yields_no_sizing(self):
+        p = risk_preview(0.0, 98.0, 10_000.0, 2.0)
+        assert p["risk_budget"] == pytest.approx(200.0)     # budget is known
+        assert p["allowed_quantity"] == 0
+        assert p["sizing_available"] is False
+
+    def test_it_is_pure(self):
+        """A preview places nothing, persists nothing, writes no file."""
+        before = os.listdir(".")
+        risk_preview(100.0, 98.0, 10_000.0, 2.0, requested_quantity=7)
+        assert os.listdir(".") == before
+
+
+class TestEditOrderQuantityAccounting:
+    """Phase 8: bought quantity == trade quantity == persisted quantity.
+
+    Before the fix, ``edit_order`` rewrote ``quantity`` but left
+    ``initial_quantity`` at the pre-edit size, so a position filled from an
+    edited order reported a size that was never bought. This is the regression
+    test for that, run exactly as specified.
+    """
+
+    def test_the_specified_regression_scenario(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        r = pt.place_order("EDITQ", "LONG", 10, 100.0, 98.0, 105.0, 107.0,
+                           quantity_source=SOURCE_MANUAL)
+        assert r["position"]["quantity"] == 10
+        assert r["position"]["initial_quantity"] == 10
+
+        e = pt.edit_order(r["order_id"], quantity=20)
+        assert "error" not in e
+        assert e["position"]["quantity"] == 20
+
+        pt.fill_order(r["order_id"])
+        pos = pt.get_position(r["order_id"])
+
+        # 4. actual position quantity == 20
+        assert pos["quantity"] == pytest.approx(20.0)
+        assert pos["initial_quantity"] == pytest.approx(20.0)
+        assert pos["remaining_quantity"] == pytest.approx(20.0)
+        # 7. initial-risk geometry uses the actual filled quantity
+        g = _geo(str(tmp_path / "geom.db"), r["order_id"])
+        assert g["actual_quantity"] == pytest.approx(20.0)
+        assert g["initial_quantity"] == pytest.approx(20.0)
+        assert g["initial_risk_amount"] == pytest.approx(40.0)   # 20 x 2.0
+
+        # 5 + 6. the realized trade and its P&L both use 20
+        closed = pt.close_position(r["order_id"], 105.0)
+        trade = closed["trade"]
+        assert trade["exit_quantity"] == pytest.approx(20.0)
+        assert trade["initial_quantity"] == pytest.approx(20.0)
+        assert trade["pnl"] == pytest.approx(20.0 * 5.0)          # 20 x (105-100)
+
+    def test_an_edit_that_does_not_touch_quantity_changes_nothing(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        r = pt.place_order("EDITS", "LONG", 10, 100.0, 98.0, 105.0, 107.0,
+                           quantity_source=SOURCE_MANUAL)
+        pt.edit_order(r["order_id"], stop_loss=97.0)
+        pt.fill_order(r["order_id"])
+        pos = pt.get_position(r["order_id"])
+        assert pos["quantity"] == pytest.approx(10.0)
+        assert pos["initial_quantity"] == pytest.approx(10.0)
+
+    def test_two_successive_edits_track_the_last_size(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        r = pt.place_order("EDIT2", "LONG", 10, 100.0, 98.0, 105.0, 107.0,
+                           quantity_source=SOURCE_MANUAL)
+        pt.edit_order(r["order_id"], quantity=20)
+        pt.edit_order(r["order_id"], quantity=7)
+        pt.fill_order(r["order_id"])
+        pos = pt.get_position(r["order_id"])
+        assert pos["quantity"] == pytest.approx(7.0)
+        assert pos["initial_quantity"] == pytest.approx(7.0)
+        g = _geo(str(tmp_path / "geom.db"), r["order_id"])
+        assert g["actual_quantity"] == pytest.approx(7.0)
+        assert g["initial_risk_amount"] == pytest.approx(14.0)
+
+    def test_a_rejected_quantity_edit_leaves_the_order_untouched(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        r = pt.place_order("EDITR", "LONG", 10, 100.0, 98.0, 105.0, 107.0,
+                           quantity_source=SOURCE_MANUAL)
+        # 99999 shares cannot be reserved against 10,000 of buying power
+        e = pt.edit_order(r["order_id"], quantity=99_999)
+        assert "error" in e
+        assert pt.get_pending_order(r["order_id"])["quantity"] == 10
+        assert pt.get_pending_order(r["order_id"])["initial_quantity"] == 10
+
+
+class TestSizingModeThroughTheApi:
+    """The endpoint contract, exercised through FastAPI's own test client.
+
+    Isolation is total. Three separate live resources would otherwise be
+    written by a naive TestClient POST here, and all three are redirected to a
+    throwaway directory first:
+
+      * ``trading.paper_engine`` is a module-level persistent singleton bound to
+        the LIVE ``intradayai.db`` -> replaced with a tmp_path engine;
+      * ``signal_store.update_signal_usage`` writes to the LIVE ``signals``
+        table -> replaced with a recorder;
+      * ``app.core.database.async_session`` is the LIVE SQLAlchemy session ->
+        replaced with a temp-database session factory.
+
+    Auth is NOT bypassed. ``AuthMiddleware`` returns 401 for any unauthenticated
+    ``/api/`` request before routing even happens, so these tests present a real
+    signed token for a real (temp-database) user. The middleware and the
+    ``get_current_user`` dependency both run exactly as they do in production.
+    """
+
+    @pytest.fixture()
+    def env(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+        from app.api import trading
+        from app.api.auth import create_token
+        from app.core.database import Base, get_db
+        from app.main import app
+        from app.models.models import User
+        from app.services.paper_trading import PaperTradingEngine
+        from app.services.risk_engine import RiskConfig, RiskEngine
+        import app.core.database as database_mod
+        from sqlalchemy import create_engine
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.orm import Session as SyncSession
+
+        user_id, email = "sizing-user", "sizing@test.local"
+        db_file = tmp_path / "sizing_api.db"
+        sync_engine = create_engine(f"sqlite:///{db_file.as_posix()}")
+        Base.metadata.create_all(sync_engine)
+        with SyncSession(sync_engine) as s:
+            s.add(User(id=user_id, email=email, name="Sizing"))
+            s.commit()
+        sync_engine.dispose()
+
+        async_engine = create_async_engine(f"sqlite+aiosqlite:///{db_file.as_posix()}")
+        Session = async_sessionmaker(async_engine, expire_on_commit=False)
+
+        async def _override_get_db():
+            async with Session() as session:
+                yield session
+
+        app.dependency_overrides[get_db] = _override_get_db
+        monkeypatch.setattr(database_mod, "async_session", Session)
+
+        engine = PaperTradingEngine(db_path=str(tmp_path / "api.db"))
+        monkeypatch.setattr(trading, "paper_engine", engine)
+        # A deterministic, fresh risk engine: the module singleton carries
+        # mutable daily-trade state that would leak between tests.
+        monkeypatch.setattr(
+            trading, "risk_engine",
+            RiskEngine(RiskConfig(account_capital=10_000.0)))
+
+        used = []
+        monkeypatch.setattr(
+            trading.signal_store, "update_signal_usage",
+            lambda sid, q, r, p: used.append(
+                {"signal_id": sid, "quantity": q, "risk": r, "pct": p}))
+
+        async def _quote(symbol):
+            return {"price": 100.0}
+
+        monkeypatch.setattr(
+            trading, "_get_provider",
+            lambda: SimpleNamespace(get_quote=_quote))
+
+        yield {
+            "client": TestClient(app),
+            "engine": engine,
+            "usage": used,
+            "headers": {"Authorization": f"Bearer {create_token(user_id, email)}"},
+        }
+        app.dependency_overrides.clear()
+
+    def test_missing_quantity_now_reaches_the_risk_engine(self, env, monkeypatch):
+        """The bypass, closed. A POST with no quantity used to become 1 share;
+        it must now be sized by the configured budget."""
+        from app.api import trading
+        seen = {}
+
+        def _spy(entry, stop, setup_quality=None, signal_strength=None):
+            seen["called"] = (entry, stop)
+            return 95
+
+        monkeypatch.setattr(trading.risk_engine, "calculate_position_size", _spy)
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "BYPASS1", "direction": "LONG", "entry_price": 100.0,
+            "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 200, r.text
+        assert seen.get("called") == (100.0, 98.0)
+        body = r.json()
+        assert body["sizing_mode"] == SIZING_RISK_ENGINE
+        assert body["position"]["quantity"] == 95
+        assert body["quantity_source"] == SOURCE_RISK_ENGINE
+
+    def test_an_explicit_quantity_still_honours_the_requested_number(self, env, monkeypatch):
+        from app.api import trading
+
+        def _must_not_run(*a, **k):
+            raise AssertionError("manual sizing must not call the risk engine")
+
+        monkeypatch.setattr(trading.risk_engine, "calculate_position_size", _must_not_run)
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "MANUAL1", "direction": "LONG", "quantity": 3,
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["sizing_mode"] == SIZING_MANUAL
+        assert body["position"]["quantity"] == 3
+        assert body["quantity_source"] == SOURCE_MANUAL
+
+    def test_explicit_risk_engine_mode_overrides_a_supplied_quantity(self, env, monkeypatch):
+        from app.api import trading
+        monkeypatch.setattr(
+            trading.risk_engine, "calculate_position_size",
+            lambda *a, **k: 42)
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "OVERRIDE", "direction": "LONG", "quantity": 3,
+            "sizing_mode": SIZING_RISK_ENGINE, "entry_price": 100.0,
+            "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 200, r.text
+        assert r.json()["position"]["quantity"] == 42
+        assert r.json()["quantity_source"] == SOURCE_RISK_ENGINE
+
+    def test_manual_mode_with_no_quantity_is_a_400_not_one_share(self, env):
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "NOCONTR", "direction": "LONG", "sizing_mode": SIZING_MANUAL,
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 400
+        assert "MANUAL requires an explicit quantity" in r.json()["detail"]
+
+    def test_an_unknown_sizing_mode_is_a_400(self, env):
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "BADMODE", "direction": "LONG", "sizing_mode": "AUTO",
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 400
+        assert "Unknown sizing_mode" in r.json()["detail"]
+
+    def test_the_response_reports_the_whole_sizing_breakdown(self, env):
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "BREAKDWN", "direction": "LONG", "quantity": 1,
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 200, r.text
+        s = r.json()["sizing"]
+        assert s["risk_budget"] == pytest.approx(200.0)
+        assert s["risk_per_share"] == pytest.approx(2.0)
+        assert s["allowed_quantity"] == 95
+        assert s["expected_initial_risk"] == pytest.approx(190.0)
+        assert s["risk_utilization_percent"] == pytest.approx(95.0)
+        assert s["binding_constraint"] == BINDING_CAPITAL
+        # a 1-share manual order really does risk 1% of the budget
+        assert s["manual_initial_risk"] == pytest.approx(2.0)
+        assert s["manual_utilization_percent"] == pytest.approx(1.0)
+
+    def test_a_manual_order_the_engine_would_reduce_is_not_silently_reduced(self, env):
+        """The budget is SHOWN for manual orders, not enforced. Rejecting an
+        oversized manual order would be a behaviour change (it would refuse
+        orders accepted today); clamping it would violate 'never change the
+        user's quantity'."""
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "BIGMAN", "direction": "LONG", "quantity": 30,
+            "entry_price": 100.0, "stop_loss": 80.0, "target_1": 130.0})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["position"]["quantity"] == 30          # not clamped to 10
+        s = body["sizing"]
+        assert s["allowed_quantity"] == 10                 # engine would say 10
+        assert s["manual_initial_risk"] == pytest.approx(600.0)
+        assert s["manual_utilization_percent"] == pytest.approx(300.0)
+        assert s["manual_exceeds_risk_budget"] is True     # flagged, not applied
+
+    def test_insufficient_capital_still_rejects_a_manual_order(self, env):
+        """Capital is a hard control and is unchanged."""
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "NOCASH", "direction": "LONG", "quantity": 5000,
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 400
+        assert "cash" in r.json()["detail"].lower()
+
+    def test_a_manual_order_cannot_bypass_the_duplicate_symbol_gate(self, env):
+        c = env["client"]
+        first = c.post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "DUPMAN", "direction": "LONG", "quantity": 2,
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert first.status_code == 200, first.text
+        second = c.post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "DUPMAN", "direction": "LONG", "quantity": 2,
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert second.status_code == 400
+        assert "already have an open or pending position" in second.json()["detail"]
+
+    def test_the_maximum_positions_gate_applies_to_both_modes(self, env, monkeypatch):
+        from app.api import trading
+        monkeypatch.setattr(trading.risk_engine.config, "max_simultaneous_positions", 1)
+        c = env["client"]
+        first = c.post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "MAXPOS", "direction": "LONG", "quantity": 2,
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert first.status_code == 200, first.text
+        # The gate counts OPEN positions, so the first order must be filled
+        # first - a merely pending order does not consume a position slot.
+        # (That is pre-existing behaviour and is deliberately not changed here.)
+        filled = c.post(f"/api/paper/orders/{first.json()['order_id']}/fill",
+                        headers=env["headers"], json={"fill_price": 100.0})
+        assert filled.status_code == 200, filled.text
+        second = c.post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "MAXPOS2", "direction": "LONG", "sizing_mode": SIZING_RISK_ENGINE,
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert second.status_code == 400
+        assert "Maximum simultaneous positions" in second.json()["detail"]
+
+    def test_the_daily_loss_gate_applies_to_both_modes(self, env, monkeypatch):
+        from app.api import trading
+        monkeypatch.setattr(trading.risk_engine.state, "daily_pnl", -9999.0)
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "DAILYL", "direction": "LONG", "sizing_mode": SIZING_RISK_ENGINE,
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 400
+        assert "daily" in r.json()["detail"].lower()
+
+    def test_signal_id_survives_both_sizing_paths(self, env):
+        c = env["client"]
+        a = c.post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "SIGMAN", "direction": "LONG", "quantity": 2,
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0,
+            "signal_id": "sig-manual-1"})
+        b = c.post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "SIGENG", "direction": "LONG", "sizing_mode": SIZING_RISK_ENGINE,
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0,
+            "signal_id": "sig-engine-1"})
+        assert a.status_code == 200, a.text
+        assert b.status_code == 200, b.text
+        assert a.json()["position"]["signal_id"] == "sig-manual-1"
+        assert b.json()["position"]["signal_id"] == "sig-engine-1"
+        assert a.json()["position"]["quantity"] == 2
+        assert b.json()["position"]["quantity"] == 95
+        # and the signal usage row records the size that was actually placed
+        assert [u["signal_id"] for u in env["usage"]] == ["sig-manual-1", "sig-engine-1"]
+        assert env["usage"][0]["quantity"] == 2
+        assert env["usage"][1]["quantity"] == 95
+
+    def test_an_edited_order_keeps_one_consistent_quantity_through_the_api(self, env):
+        c = env["client"]
+        placed = c.post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "APIEDIT", "direction": "LONG", "quantity": 10,
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert placed.status_code == 200, placed.text
+        oid = placed.json()["order_id"]
+        edited = c.patch(f"/api/paper/orders/{oid}", headers=env["headers"],
+                         json={"quantity": 20})
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["position"]["initial_quantity"] == 20
+        filled = c.post(f"/api/paper/orders/{oid}/fill", headers=env["headers"],
+                        json={"fill_price": 100.0})
+        assert filled.status_code == 200, filled.text
+        pos = filled.json()["position"]
+        assert pos["quantity"] == 20
+        assert pos["initial_quantity"] == 20
+        assert pos["initial_risk_amount"] == pytest.approx(40.0)
+
+    def test_auth_is_still_required_on_both_endpoints(self, env):
+        """The new endpoint is not a way around AuthMiddleware."""
+        c = env["client"]
+        assert c.post("/api/paper/orders/preview", json={
+            "symbol": "NOAUTH", "direction": "LONG", "entry_price": 100.0,
+            "stop_loss": 98.0, "target_1": 105.0}).status_code == 401
+        assert c.post("/api/paper/orders", json={
+            "symbol": "NOAUTH2", "direction": "LONG", "quantity": 2,
+            "entry_price": 100.0, "stop_loss": 98.0,
+            "target_1": 105.0}).status_code == 401
+
+
+class TestPreviewEndpoint:
+    @pytest.fixture()
+    def env(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+        from app.api import trading
+        from app.api.auth import create_token
+        from app.core.database import Base, get_db
+        from app.main import app
+        from app.models.models import User
+        from app.services.paper_trading import PaperTradingEngine
+        from app.services.risk_engine import RiskConfig, RiskEngine
+        import app.core.database as database_mod
+        from sqlalchemy import create_engine
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.orm import Session as SyncSession
+
+        user_id, email = "preview-user", "preview@test.local"
+        db_file = tmp_path / "preview_api.db"
+        sync_engine = create_engine(f"sqlite:///{db_file.as_posix()}")
+        Base.metadata.create_all(sync_engine)
+        with SyncSession(sync_engine) as s:
+            s.add(User(id=user_id, email=email, name="Preview"))
+            s.commit()
+        sync_engine.dispose()
+
+        async_engine = create_async_engine(f"sqlite+aiosqlite:///{db_file.as_posix()}")
+        Session = async_sessionmaker(async_engine, expire_on_commit=False)
+
+        async def _override_get_db():
+            async with Session() as session:
+                yield session
+
+        app.dependency_overrides[get_db] = _override_get_db
+        monkeypatch.setattr(database_mod, "async_session", Session)
+
+        engine = PaperTradingEngine(db_path=str(tmp_path / "prev.db"))
+        monkeypatch.setattr(trading, "paper_engine", engine)
+        monkeypatch.setattr(
+            trading, "risk_engine",
+            RiskEngine(RiskConfig(account_capital=10_000.0)))
+
+        async def _quote(symbol):
+            return {"price": 100.0}
+
+        monkeypatch.setattr(
+            trading, "_get_provider", lambda: SimpleNamespace(get_quote=_quote))
+        yield {
+            "client": TestClient(app),
+            "engine": engine,
+            "headers": {"Authorization": f"Bearer {create_token(user_id, email)}"},
+        }
+        app.dependency_overrides.clear()
+
+    def test_the_preview_reproduces_the_documented_example_over_http(self, env):
+        r = env["client"].post("/api/paper/orders/preview", headers=env["headers"],
+                               json={
+            "symbol": None, "direction": "LONG", "entry_price": 100.0,
+            "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 200, r.text
+        p = r.json()
+        assert p["risk_budget"] == pytest.approx(200.0)
+        assert p["risk_per_share"] == pytest.approx(2.0)
+        assert p["risk_based_quantity"] == 100
+        assert p["capital_based_quantity"] == 95
+        assert p["allowed_quantity"] == 95
+        assert p["expected_initial_risk"] == pytest.approx(190.0)
+        assert p["risk_utilization_percent"] == pytest.approx(95.0)
+        assert p["binding_constraint"] == BINDING_CAPITAL
+        assert p["order_would_be_accepted"] is True
+
+    def test_the_preview_places_no_order(self, env):
+        before = len(env["engine"].get_pending_orders())
+        r = env["client"].post("/api/paper/orders/preview", headers=env["headers"],
+                               json={
+            "symbol": "PREVIEWONLY", "direction": "LONG", "entry_price": 100.0,
+            "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 200, r.text
+        assert len(env["engine"].get_pending_orders()) == before
+        assert env["engine"].get_positions() == []
+
+    def test_it_reports_a_blocker_the_real_order_would_hit(self, env):
+        """A preview must not imply a tradeable order the endpoint refuses."""
+        r = env["client"].post("/api/paper/orders/preview", headers=env["headers"],
+                               json={
+            "symbol": "BADPRE", "direction": "LONG", "entry_price": 100.0,
+            "stop_loss": 105.0, "target_1": 110.0})
+        assert r.status_code == 200, r.text
+        p = r.json()
+        assert p["order_would_be_accepted"] is False
+        assert p["blockers"]
+
+    def test_it_agrees_with_what_the_real_endpoint_sizes(self, env):
+        """Preview and execution must not disagree."""
+        c = env["client"]
+        p = c.post("/api/paper/orders/preview", headers=env["headers"], json={
+            "symbol": "AGREE", "direction": "LONG", "entry_price": 100.0,
+            "stop_loss": 80.0, "target_1": 130.0}).json()
+        r = c.post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "AGREE", "direction": "LONG", "sizing_mode": SIZING_RISK_ENGINE,
+            "entry_price": 100.0, "stop_loss": 80.0, "target_1": 130.0})
+        assert r.status_code == 200, r.text
+        assert r.json()["position"]["quantity"] == p["allowed_quantity"]
+        assert r.json()["sizing"]["risk_utilization_percent"] == pytest.approx(
+            p["risk_utilization_percent"])
+
+    def test_it_surfaces_a_manual_mode_contradiction_instead_of_hiding_it(self, env):
+        r = env["client"].post("/api/paper/orders/preview", headers=env["headers"],
+                               json={
+            "symbol": "MANPRE", "direction": "LONG", "entry_price": 100.0,
+            "stop_loss": 98.0, "target_1": 105.0, "sizing_mode": SIZING_MANUAL})
+        assert r.status_code == 200, r.text
+        p = r.json()
+        assert p["sizing_mode"] is None
+        assert "MANUAL requires an explicit quantity" in p["sizing_mode_error"]
+
+
+class TestNoStrategyParameterChanged:
+    """The load-bearing guard for this whole phase: connecting the risk engine
+    to the UI must not have moved any strategy knob."""
+
+    def test_the_risk_config_values_are_unchanged(self):
+        from app.services.risk_engine import RiskConfig
+        c = RiskConfig()
+        assert c.max_risk_per_trade_pct == 2.0
+        assert c.max_daily_loss_pct == 5.0
+        assert c.max_trades_per_day == 10
+        assert c.max_simultaneous_positions == 10
+        assert c.min_risk_reward == 1.2
+        assert c.base_risk_per_trade_pct == 2.0
+        assert c.cooldown_after_losses == 3
+
+    def test_the_default_entry_stop_and_target_multipliers_are_unchanged(self):
+        """3% stop / 4% target-1 / 6% target-2, exactly as before."""
+        import inspect
+
+        from app.api import trading
+        src = inspect.getsource(trading.place_paper_order)
+        assert "entry_price * 0.97" in src
+        assert "entry_price * 1.03" in src
+        assert "entry_price * 1.04" in src
+        assert "entry_price * 0.96" in src
+        assert "entry_price * 1.06" in src
+        assert "entry_price * 0.94" in src
+
+    def test_profit_capture_is_not_referenced_by_the_order_path(self):
+        import inspect
+
+        from app.api import trading
+        src = inspect.getsource(trading.place_paper_order)
+        assert "profit_capture" not in src.lower()
+        assert "apply_t1" not in src
+        assert "trailing" not in src.lower()
+
+    def test_signal_generation_and_scoring_are_not_imported_by_the_order_path(self):
+        import inspect
+
+        from app.api import trading
+        src = inspect.getsource(trading.place_paper_order)
+        for module in ("signal_generator", "signal_scoring", "scanner",
+                       "direction_band", "signal_weights"):
+            assert module not in src.lower()

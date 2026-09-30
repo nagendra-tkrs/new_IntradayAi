@@ -799,6 +799,27 @@ class PaperAccount:
             order["target_2"] = target_2
         if quantity is not None and quantity > 0:
             order["quantity"] = quantity
+            # ── Edit-order quantity accounting fix ───────────────────────────
+            # `initial_quantity` and `remaining_quantity` were left at the
+            # pre-edit size, so a position filled from an edited order reported
+            # an `initial_quantity` (and therefore an entry-time risk, a trade
+            # row, and a geometry row) for a size that was never bought:
+            #
+            #     order qty 10 -> edit to 20 -> fill
+            #       quantity            = 20   (bought)
+            #       initial_quantity    = 10   (wrong: nothing bought 10)
+            #       realized P&L        = 20 x move   (correct)
+            #
+            # So the three could disagree, and the recorded risk geometry did
+            # not match the actual position. The order is still PENDING and
+            # UNFILLED here, so nothing has been bought and no history exists
+            # yet: correcting the size at edit time is the only point at which
+            # the persisted quantity can still be made to match reality.
+            #
+            # Historical trade rows are untouched - this only affects orders
+            # edited after the fix, and no realized P&L is recomputed.
+            order["initial_quantity"] = quantity
+            order["remaining_quantity"] = quantity
         self._dirty = True
         return {"order_id": position_id, "status": "pending", "position": order}
 

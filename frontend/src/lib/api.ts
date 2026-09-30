@@ -13,6 +13,8 @@ import type {
   Performance,
   PlaceOrderResult,
   Portfolio,
+  OrderPreviewRequest,
+  RiskPreview,
   ScannerResponse,
   StockChartResponse,
   StockDetailResponse,
@@ -21,6 +23,7 @@ import type {
   LegacyProfitCompareResponse,
   ContextComparison,
   AiDecisionResponse,
+  SizingMode,
 } from "./types";
 
 const API_BASE = "/api";
@@ -120,7 +123,11 @@ export async function getPortfolio(): Promise<Portfolio> {
 export async function placePaperOrder(order: {
   symbol: string;
   direction: string;
-  quantity: number;
+  /**
+   * Omit for risk-engine sizing. There is intentionally no default of 1: a
+   * quantity the user never entered must not be sent as if they had.
+   */
+  quantity?: number | null;
   entry_price?: number;
   stop_loss?: number;
   target_1?: number;
@@ -129,10 +136,27 @@ export async function placePaperOrder(order: {
   signal_strength?: string;
   atr?: number;
   signal_id?: string;
+  sizing_mode?: SizingMode | null;
 }): Promise<PlaceOrderResult> {
   return fetchAPI("/paper/orders", {
     method: "POST",
     body: JSON.stringify(order),
+  });
+}
+
+/**
+ * Risk-sizing preview for an order that has not been placed yet.
+ *
+ * Read-only. Returns the whole calculation - risk budget, risk per share, both
+ * constraints, allowed quantity, expected initial risk and budget utilization -
+ * so the user can see exactly what each sizing path would do before choosing.
+ */
+export async function previewPaperOrder(
+  payload: OrderPreviewRequest,
+): Promise<RiskPreview> {
+  return fetchAPI("/paper/orders/preview", {
+    method: "POST",
+    body: JSON.stringify(payload),
   });
 }
 

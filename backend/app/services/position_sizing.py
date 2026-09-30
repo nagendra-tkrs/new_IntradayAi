@@ -1,11 +1,16 @@
-"""Risk-budget utilization analysis and SHADOW sizing comparison.
+"""Risk-budget sizing arithmetic, order-preview, and SHADOW sizing comparison.
 
-**Measurement only.** Nothing in this module places, resizes, blocks or closes
-an order, and nothing here writes to the realized ledger. It exists to answer
-one narrow question with real numbers:
+**This module never places, resizes, blocks or closes an order, and never
+writes to the realized ledger.** It holds the sizing *arithmetic* in one place
+so the live risk engine, the order preview the UI shows, and the offline
+measurement report cannot drift apart.
 
-    Is the account actually risking the 2% it is configured to risk, and if
-    not, what is capping it?
+It answers two questions with real numbers:
+
+    1. If the user asks for risk-engine sizing, what exactly will the engine
+       do, and what will it cost them in risk and cash?  (:func:`risk_preview`)
+    2. Is the account actually risking the 2% it is configured to risk, and if
+       not, what is capping it?  (:func:`sizing_report`)
 
 The live formula (``RiskEngine.calculate_position_size``) is
 
@@ -748,6 +753,156 @@ def captured_geometry_fields() -> dict:
         "initial_risk_utilization": "risk_budget_utilization",
         "initial_order_classification": "order_classification",
         "initial_geometry_reliable": "geometry_reliable",
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# ORDER PREVIEW + SIZING MODE
+#
+# The accidental-default bypass
+# -----------------------------
+# Every UI order path used to send a positive quantity (scanner
+# `orderQty[sym] || 1`, stock detail `useState(1)`), and the order endpoint only
+# consulted the risk engine when `quantity <= 0`. The configured 2% budget was
+# therefore unreachable from the UI and every paper order silently became a
+# one-share manual trade.
+#
+# The fix is not "default to a bigger number" - it is to make the choice
+# explicit. A caller now states SIZING MODE, and a *missing* quantity means
+# "size me from the risk engine" rather than "trade one share by hand".
+# ────────────────────────────────────────────────────────────────────────────
+
+#: Reuse the provenance constants rather than inventing a parallel vocabulary:
+#: the sizing mode and the quantity source are the same two facts.
+SIZING_RISK_ENGINE = SOURCE_RISK_ENGINE   # "RISK_ENGINE"
+SIZING_MANUAL = SOURCE_MANUAL             # "MANUAL"
+SIZING_MODES = (SIZING_RISK_ENGINE, SIZING_MANUAL)
+
+
+class SizingModeError(ValueError):
+    """Raised when a request cannot be resolved to a usable sizing decision.
+
+    The distinction that matters, and the reason this is not a silent default:
+    a MANUAL order with no quantity is a *contradiction*, not an instruction to
+    buy one share. Failing loudly is the only safe reading - it is precisely
+    the default that caused the bypass being fixed here.
+    """
+
+
+def resolve_sizing_mode(
+    sizing_mode: Optional[str] = None,
+    quantity: Optional[float] = None,
+) -> str:
+    """Decide how an order's quantity will be determined.
+
+    Precedence:
+
+    1. An explicit ``sizing_mode`` always wins. ``MANUAL`` with no usable
+       quantity raises :class:`SizingModeError` rather than defaulting.
+    2. Otherwise a missing or non-positive quantity means RISK_ENGINE - this is
+       the contract change that removes the ``|| 1`` bypass.
+    3. Otherwise MANUAL: the caller supplied a real number, so honour it.
+
+    Never silently upgrades a caller's number and never invents one.
+    """
+    if sizing_mode is not None and str(sizing_mode).strip():
+        mode = str(sizing_mode).strip().upper()
+        if mode not in SIZING_MODES:
+            raise SizingModeError(
+                f"Unknown sizing_mode {sizing_mode!r}; expected one of "
+                f"{', '.join(SIZING_MODES)}"
+            )
+        if mode == SIZING_MANUAL and (quantity is None or quantity <= 0):
+            raise SizingModeError(
+                "sizing_mode=MANUAL requires an explicit quantity > 0. "
+                "Use sizing_mode=RISK_ENGINE to have the risk engine size it."
+            )
+        return mode
+    if quantity is None or quantity <= 0:
+        return SIZING_RISK_ENGINE
+    return SIZING_MANUAL
+
+
+def risk_preview(
+    entry_price: Optional[float],
+    stop_loss: Optional[float],
+    account_capital: float = 10_000.0,
+    risk_pct: float = 2.0,
+    requested_quantity: Optional[float] = None,
+    sizing_mode: Optional[str] = None,
+) -> dict:
+    """Full, unhidden sizing breakdown for an order the user is about to place.
+
+    Pure and side-effect free: it computes what WILL happen, and is never
+    consulted by the execution path (the endpoint recomputes through the live
+    ``RiskEngine`` so there is exactly one authority). Its job is to make the
+    calculation visible *before* the order exists.
+
+    Returns both sizing paths side by side - what RISK_ENGINE would do, and
+    what the requested MANUAL quantity would actually cost in rupee risk - so
+    neither is hidden and neither is silently applied to the other.
+    """
+    entry = _finite(entry_price) or 0.0
+    stop = _finite(stop_loss)
+    capital = _finite(account_capital) or 0.0
+    pct = _finite(risk_pct) or 0.0
+    budget = risk_budget_for(capital, pct)
+
+    # A stop on entry carries no risk information (breakeven or absent).
+    rps = abs(entry - stop) if (entry > 0 and stop is not None and stop > 0
+                               and abs(entry - stop) > 0) else None
+
+    risk_q = risk_based_quantity(budget, rps) if rps else 0
+    cap_q = capital_based_quantity(capital, entry) if entry > 0 else 0
+    allowed = min(risk_q, cap_q)
+    binding = binding_constraint(risk_q, cap_q, None)
+
+    expected_risk = allowed * rps if (allowed and rps) else None
+    util = (expected_risk / budget * 100.0) if (expected_risk and budget > 0) else None
+
+    requested = _finite(requested_quantity)
+    manual_risk = requested * rps if (requested and requested > 0 and rps) else None
+    manual_util = (manual_risk / budget * 100.0) if (manual_risk and budget > 0) else None
+    capital_used = requested * entry if (requested and entry > 0) else None
+
+    try:
+        mode = resolve_sizing_mode(sizing_mode, requested)
+        mode_error = None
+    except SizingModeError as e:
+        mode = None
+        mode_error = str(e)
+
+    return {
+        "entry_price": entry,
+        "stop_loss": stop,
+        "account_capital": capital,
+        "configured_risk_percent": pct,
+        "risk_budget": budget,
+        "risk_per_share": rps,
+        "risk_based_quantity": risk_q,
+        "capital_based_quantity": cap_q,
+        "allowed_quantity": allowed,
+        "expected_initial_risk": expected_risk,
+        "risk_utilization_percent": util,
+        "binding_constraint": binding,
+        "sizing_mode": mode,
+        "sizing_mode_error": mode_error,
+        "requested_quantity": requested,
+        "manual_initial_risk": manual_risk,
+        "manual_utilization_percent": manual_util,
+        "manual_exceeds_risk_budget": bool(
+            manual_risk is not None and budget > 0 and manual_risk > budget
+        ),
+        "manual_capital_usage": capital_used,
+        "manual_affordable": (
+            None if capital_used is None
+            else bool(capital_used <= capital * CAPITAL_HEADROOM + 1e-9)
+        ),
+        "sizing_available": bool(rps and allowed > 0),
+        "note": (
+            "Preview only. The order endpoint recomputes through the live "
+            "RiskEngine, which remains the single sizing authority."
+        ),
     }
 
 

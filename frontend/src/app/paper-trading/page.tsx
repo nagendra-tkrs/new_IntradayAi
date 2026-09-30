@@ -118,7 +118,11 @@ export default function PaperTradingPage() {
       entry_price: String(order.entry_price || ""),
       stop_loss: String(order.stop_loss || ""),
       target_1: String(order.target_1 || ""),
-      quantity: String(order.quantity || 1),
+      // Pre-filled with the order's ACTUAL size so the box shows reality. The
+      // old `|| 1` would have displayed 1 for a genuinely 0-quantity order; the
+      // `?? ""` keeps an unknown quantity visibly unknown instead of inventing
+      // a number, and an edit must supply a real one.
+      quantity: order.quantity != null ? String(order.quantity) : "",
     });
     setEditMsg(null);
   }
@@ -135,9 +139,16 @@ export default function PaperTradingPage() {
       const ep = parseFloat(editFields.entry_price);
       const sl = parseFloat(editFields.stop_loss);
       const t1 = parseFloat(editFields.target_1);
-      const qty = parseInt(editFields.quantity) || 1;
-      if (!ep || !sl || !t1 || qty <= 0) {
-        setEditMsg({ id: orderId, type: "error", text: "All fields must be valid positive numbers." });
+      // No `|| 1` fallback: clearing the field must not become a 1-share order.
+      // A quantity is either a real positive integer or the edit is refused.
+      const qty = parseInt(editFields.quantity);
+      const qtyValid = Number.isInteger(qty) && qty > 0;
+      if (!ep || !sl || !t1 || !qtyValid) {
+        setEditMsg({
+          id: orderId,
+          type: "error",
+          text: "All fields must be valid positive numbers, and quantity a whole number of shares.",
+        });
         setSaving(null);
         return;
       }

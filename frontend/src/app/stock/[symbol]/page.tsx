@@ -6,9 +6,10 @@ import Header from "@/components/Header";
 import MiniChart from "@/components/MiniChart";
 import IndicatorPanel from "@/components/IndicatorPanel";
 import SignalCard from "@/components/SignalCard";
+import OrderSizingPanel from "@/components/OrderSizingPanel";
 import { getStockDetail, getStockChart, placePaperOrder, saveTradeSetup, clearTradeSetup } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import type { ChartPoint, Quote, SignalSetup, StockDetailResponse } from "@/lib/types";
+import type { ChartPoint, Quote, SignalSetup, SizingMode, StockDetailResponse } from "@/lib/types";
 
 const DATE_RANGES = [
   { value: 1, label: "1D" },
@@ -95,7 +96,13 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
   const [loading, setLoading] = useState(true);
   const [days, setDays] = useState(1);
   const [interval, setInterval] = useState("5m");
-  const [orderQty, setOrderQty] = useState(1);
+  // Manual quantity is a STRING and starts empty. The old `useState(1)` meant
+  // every order arrived with a positive quantity, so the risk engine was
+  // unreachable from this page. An empty box is now an explicit request for
+  // risk-engine sizing, never an implicit "trade one share".
+  const [orderQty, setOrderQty] = useState("");
+  // Default MANUAL keeps day-one behaviour identical; the engine is opt-in.
+  const [orderSizingMode, setOrderSizingMode] = useState<SizingMode>("MANUAL");
   const [orderMsg, setOrderMsg] = useState<string | null>(null);
   const [quickRange, setQuickRange] = useState("auto");
   const [customFrom, setCustomFrom] = useState("");
@@ -344,17 +351,34 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
         return;
       }
 
-      await placePaperOrder({
+      // The quantity is never defaulted. MANUAL requires a number the user
+      // typed; RISK_ENGINE sends none and lets the backend decide.
+      const rawQty = orderQty.trim();
+      const parsed = rawQty === "" ? null : Number(rawQty);
+      const manualQty = parsed !== null && Number.isFinite(parsed) && parsed > 0
+        ? Math.trunc(parsed)
+        : null;
+      if (orderSizingMode === "MANUAL" && manualQty === null) {
+        setOrderMsg("Error: enter a quantity, or switch to risk-engine sizing.");
+        return;
+      }
+
+      const result = await placePaperOrder({
         symbol,
         direction,
-        quantity: orderQty,
+        sizing_mode: orderSizingMode,
+        quantity: orderSizingMode === "MANUAL" ? manualQty : undefined,
         entry_price: useEntry,
         stop_loss: useSL,
         target_1: useTarget,
         target_2: useTarget2,
         signal_id: detail?.signal?.id ?? undefined,
       });
-      setOrderMsg(`${direction} order placed for ${orderQty} shares of ${symbol}`);
+      const placedQty = result?.position?.quantity ?? manualQty;
+      setOrderMsg(
+        `${direction} order placed for ${placedQty} shares of ${symbol}`
+        + (result?.sizing_mode === "RISK_ENGINE" ? " (risk-engine sized)" : ""),
+      );
     } catch (e) {
       setOrderMsg(`Error: ${e instanceof Error ? e.message : "Order failed"}`);
     }
@@ -375,6 +399,19 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
   const signal = detail?.signal;
   const indicators = detail?.indicators || {};
   const setup: Partial<SignalSetup> = signal?.setup || {};
+
+  // The exact levels the order will use, derived the same way handlePaperOrder
+  // derives them, so the sizing preview describes the order that will actually
+  // be placed rather than the raw AI levels.
+  const useEntryForPreview = overrideActive && activeSetup.entry != null
+    ? activeSetup.entry
+    : (setup.entry || detail?.quote?.price || null);
+  const useSLForPreview = overrideActive && activeSetup.entry != null
+    ? (activeSetup.stopLoss ?? null)
+    : (setup.stop_loss ?? null);
+  const useTargetForPreview = overrideActive && activeSetup.entry != null
+    ? (activeSetup.target ?? null)
+    : (setup.target_1 ?? null);
 
   return (
     <div className="min-h-screen bg-[#0a0e17]">
@@ -398,20 +435,35 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-xs text-gray-500">Paper Trade Qty:</span>
-            <input
-              type="number"
-              value={orderQty}
-              onChange={(e) => setOrderQty(parseInt(e.target.value) || 1)}
-              className="w-20 px-2 py-1 bg-[#111827] border border-[#2d3548] rounded text-white text-sm"
-            />
-            <button onClick={() => handlePaperOrder("LONG")} className="px-3 py-1.5 bg-green-600 hover:bg-green-500 text-white text-sm font-bold rounded-lg">
+            <button
+              onClick={() => handlePaperOrder("LONG")}
+              disabled={orderSizingMode === "MANUAL" && orderQty.trim() === ""}
+              className="px-3 py-1.5 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white text-sm font-bold rounded-lg"
+            >
               BUY
             </button>
-            <button onClick={() => handlePaperOrder("SHORT")} className="px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white text-sm font-bold rounded-lg">
+            <button
+              onClick={() => handlePaperOrder("SHORT")}
+              disabled={orderSizingMode === "MANUAL" && orderQty.trim() === ""}
+              className="px-3 py-1.5 bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white text-sm font-bold rounded-lg"
+            >
               SELL
             </button>
           </div>
+        </div>
+
+        <div className="mb-4 max-w-md">
+          <OrderSizingPanel
+            symbol={symbol}
+            direction="LONG"
+            entryPrice={useEntryForPreview}
+            stopLoss={useSLForPreview}
+            target1={useTargetForPreview}
+            manualQuantity={orderQty}
+            onManualQuantityChange={setOrderQty}
+            mode={orderSizingMode}
+            onModeChange={setOrderSizingMode}
+          />
         </div>
 
         {orderMsg && (

@@ -256,10 +256,26 @@ export interface SetupRequest {
   direction?: string | null;
 }
 
+/**
+ * How an order's quantity is decided.
+ *
+ * `RISK_ENGINE` - the configured risk budget sizes the position.
+ * `MANUAL` - the caller's number is used exactly as given.
+ *
+ * These are the same two strings the backend records as `quantity_source`, so
+ * there is no second vocabulary to keep in sync.
+ */
+export type SizingMode = "RISK_ENGINE" | "MANUAL";
+
 export interface OrderRequest {
   symbol: string;
   direction: string;
-  quantity: number;
+  /**
+   * Omit (or send null) to have the risk engine size the order. A positive
+   * number means MANUAL. There is deliberately no "default to 1" fallback
+   * anywhere in the UI: a quantity the user never chose must not be invented.
+   */
+  quantity?: number | null;
   entry_price?: number | null;
   stop_loss?: number | null;
   target_1?: number | null;
@@ -270,6 +286,57 @@ export interface OrderRequest {
   atr?: number | null;
   /** Traceability: the AI signal (SignalInfo.id) this order originates from. */
   signal_id?: string | null;
+  /**
+   * States the sizing intent explicitly instead of leaving the backend to infer
+   * it from a number the UI filled in on the user's behalf.
+   */
+  sizing_mode?: SizingMode | null;
+}
+
+export interface OrderPreviewRequest {
+  symbol?: string | null;
+  direction?: string | null;
+  entry_price?: number | null;
+  stop_loss?: number | null;
+  target_1?: number | null;
+  requested_quantity?: number | null;
+  sizing_mode?: SizingMode | null;
+  setup_quality?: string | null;
+  signal_strength?: string | null;
+}
+
+/**
+ * The full, unhidden sizing breakdown returned by `POST /paper/orders/preview`
+ * and echoed on a placed order. Nothing here is inferred client-side.
+ */
+export interface RiskPreview {
+  entry_price: number;
+  stop_loss: number | null;
+  account_capital: number;
+  configured_risk_percent: number;
+  risk_budget: number;
+  risk_per_share: number | null;
+  risk_based_quantity: number;
+  capital_based_quantity: number;
+  allowed_quantity: number;
+  expected_initial_risk: number | null;
+  risk_utilization_percent: number | null;
+  binding_constraint: string;
+  sizing_mode: SizingMode | null;
+  sizing_mode_error: string | null;
+  requested_quantity: number | null;
+  manual_initial_risk: number | null;
+  manual_utilization_percent: number | null;
+  manual_exceeds_risk_budget: boolean;
+  manual_capital_usage: number | null;
+  manual_affordable: boolean | null;
+  sizing_available: boolean;
+  note: string;
+  symbol?: string | null;
+  direction?: string | null;
+  target_1?: number | null;
+  order_would_be_accepted?: boolean;
+  blockers?: string[];
 }
 
 export interface ClosePositionRequest {
@@ -656,6 +723,11 @@ export interface PlaceOrderResult {
   order_id: string;
   status: "pending";
   position: PendingOrder;
+  /** Which sizing path actually ran. Never inferred client-side. */
+  sizing_mode?: SizingMode;
+  quantity_source?: SizingMode;
+  /** The full sizing breakdown as applied. */
+  sizing?: RiskPreview;
 }
 
 export interface EditOrderResult {

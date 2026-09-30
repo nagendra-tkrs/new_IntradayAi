@@ -4,6 +4,7 @@ import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import Header from "@/components/Header";
 import TopSignals from "@/components/TopSignals";
+import OrderSizingPanel from "@/components/OrderSizingPanel";
 import {
   runScanner,
   getAllUserSetups,
@@ -12,7 +13,7 @@ import {
   placePaperOrder,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import type { ScannerResponse, ScannerResult, SignalSetup, TradeSetup } from "@/lib/types";
+import type { ScannerResponse, ScannerResult, SignalSetup, SizingMode, TradeSetup } from "@/lib/types";
 
 type FilterType = "all" | "long" | "short" | "strong" | "qualified" | "high_volume" | "no_trade";
 
@@ -75,7 +76,11 @@ export default function ScannerPage() {
   const [expandedSymbol, setExpandedSymbol] = useState<string | null>(null);
   const [userSetups, setUserSetups] = useState<Record<string, TradeSetup>>({});
   const [editingFields, setEditingFields] = useState<Record<string, { entry: string; stopLoss: string; target: string }>>({});
-  const [orderQty, setOrderQty] = useState<Record<string, number>>({});
+  const [orderQty, setOrderQty] = useState<Record<string, string>>({});
+  // Sizing intent is explicit per symbol. Default is MANUAL, which reproduces
+  // the pre-existing behaviour exactly - switching to RISK_ENGINE is a
+  // deliberate, per-symbol choice, never a silent default.
+  const [orderSizingMode, setOrderSizingMode] = useState<Record<string, SizingMode>>({});
   const [orderMsg, setOrderMsg] = useState<Record<string, { type: "success" | "error"; text: string }>>({});
   const [saving, setSaving] = useState<Record<string, boolean>>({});
 
@@ -125,16 +130,18 @@ export default function ScannerPage() {
     if (authLoading || !user) return;
     isMountedRef.current = true;
     loadUserSetupsRef.current();
-    loadScannerRef.current();
+    // Do NOT auto-load scanner on mount - it takes 30s cold.
+    // User clicks "Refresh Scan" button to trigger a scan.
     const id = window.setInterval(() => {
-      loadScannerRef.current(true);
+      // Only auto-refresh if a scan has already been done (scanner state exists)
+      if (scanner) loadScannerRef.current(true);
     }, SCANNER_REFRESH_INTERVAL);
     intervalRef.current = id;
     return () => {
       isMountedRef.current = false;
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [authLoading, user]);
+  }, [authLoading, user, scanner]);
 
   function getSignalDir(stock: ScannerResult): string {
     const sig = stock.signal as string | { direction?: string } | null | undefined;
@@ -276,7 +283,6 @@ export default function ScannerPage() {
     const entryNum = parseFloat(fields.entry);
     const slNum = parseFloat(fields.stopLoss);
     const tgtNum = parseFloat(fields.target);
-    const qty = orderQty[sym] || 1;
 
     const long = direction === "LONG";
     const errors = validateSetup(
@@ -290,20 +296,46 @@ export default function ScannerPage() {
       return;
     }
 
+    // The quantity is NEVER defaulted here. An empty box is not "1 share" - it
+    // is a request for the risk engine to size the order, and MANUAL without a
+    // number is refused rather than guessed.
+    const sizingMode = orderSizingMode[sym] ?? "MANUAL";
+    const rawQty = (orderQty[sym] ?? "").trim();
+    const parsedQty = rawQty === "" ? null : Number(rawQty);
+    const manualQty = parsedQty !== null && Number.isFinite(parsedQty) && parsedQty > 0
+      ? Math.trunc(parsedQty)
+      : null;
+
+    if (sizingMode === "MANUAL" && manualQty === null) {
+      setOrderMsg((prev) => ({
+        ...prev,
+        [sym]: { type: "error", text: "Enter a quantity, or switch to risk-engine sizing." },
+      }));
+      return;
+    }
+
     setSaving((prev) => ({ ...prev, [sym]: true }));
     try {
-      await placePaperOrder({
+      const result = await placePaperOrder({
         symbol: sym,
         direction,
-        quantity: qty,
+        sizing_mode: sizingMode,
+        // MANUAL sends the user's number; RISK_ENGINE sends none, so the backend
+        // risk engine decides. The field is never fabricated.
+        quantity: sizingMode === "MANUAL" ? manualQty : undefined,
         entry_price: entryNum,
         stop_loss: slNum,
         target_1: tgtNum,
         signal_id: stock.signal_data?.id ?? undefined,
       });
+      const placedQty = result?.position?.quantity ?? manualQty;
       setOrderMsg((prev) => ({
         ...prev,
-        [sym]: { type: "success", text: `${direction} order placed: ${qty} qty @ ₹${entryNum}` },
+        [sym]: {
+          type: "success",
+          text: `${direction} order placed: ${placedQty} qty @ ₹${entryNum}`
+            + (result?.sizing_mode === "RISK_ENGINE" ? " (risk-engine sized)" : ""),
+        },
       }));
     } catch (e) {
       setOrderMsg((prev) => ({ ...prev, [sym]: { type: "error", text: e instanceof Error && e.message ? e.message : "Order failed." } }));
@@ -458,7 +490,6 @@ export default function ScannerPage() {
                   const msg = orderMsg[sym];
                   const isSaving = saving[sym];
                   const canTrade = sigDir !== "NO_TRADE" && sigDir !== "ERROR";
-                  const qty = orderQty[sym] || 1;
 
                   return (
                     <tr key={sym} className="cursor-pointer hover:bg-[#151b2b]" onClick={() => {
@@ -561,7 +592,9 @@ export default function ScannerPage() {
           const isSaving = saving[sym];
           const canTrade = sigDir !== "NO_TRADE" && sigDir !== "ERROR";
           const long = isLong(stock);
-          const qty = orderQty[sym] || 1;
+          const sizingMode = orderSizingMode[sym] ?? "MANUAL";
+          const rawQty = (orderQty[sym] ?? "").trim();
+          const manualQtyOk = rawQty !== "" && Number.isFinite(Number(rawQty)) && Number(rawQty) > 0;
 
           return (
             <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={() => setExpandedSymbol(null)}>
@@ -678,29 +711,30 @@ export default function ScannerPage() {
                   </div>
 
                   {canTrade && (
-                    <div className="bg-[#111827] rounded-lg p-3">
-                      <p className="text-[10px] text-gray-500 uppercase tracking-wider mb-2">Paper Order</p>
-                      <div className="flex items-center gap-2 mb-3">
-                        <label className="text-xs text-gray-400">Qty:</label>
-                        <input
-                          type="number"
-                          value={qty}
-                          onChange={(e) => setOrderQty((prev) => ({ ...prev, [sym]: parseInt(e.target.value) || 1 }))}
-                          className="w-20 px-2 py-1 bg-[#111827] border border-[#2d3548] rounded text-white text-sm"
-                        />
-                        <span className="text-[10px] text-gray-600 ml-1">@ ₹{fields.entry || "N/A"}</span>
-                      </div>
+                    <div className="space-y-2">
+                      <OrderSizingPanel
+                        symbol={sym}
+                        direction={long ? "LONG" : "SHORT"}
+                        entryPrice={isFinitePositive(parseFloat(fields.entry)) ? parseFloat(fields.entry) : null}
+                        stopLoss={isFinitePositive(parseFloat(fields.stopLoss)) ? parseFloat(fields.stopLoss) : null}
+                        target1={isFinitePositive(parseFloat(fields.target)) ? parseFloat(fields.target) : null}
+                        manualQuantity={orderQty[sym] ?? ""}
+                        onManualQuantityChange={(v) => setOrderQty((prev) => ({ ...prev, [sym]: v }))}
+                        mode={sizingMode}
+                        onModeChange={(m) => setOrderSizingMode((prev) => ({ ...prev, [sym]: m }))}
+                        disabled={isSaving}
+                      />
                       <div className="flex gap-2">
                         <button
                           onClick={() => handleOrder(stock, "LONG")}
-                          disabled={isSaving || !fields.entry}
+                          disabled={isSaving || !fields.entry || (sizingMode === "MANUAL" && !manualQtyOk)}
                           className="flex-1 px-3 py-2 bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white text-sm font-bold rounded-lg"
                         >
                           BUY
                         </button>
                         <button
                           onClick={() => handleOrder(stock, "SHORT")}
-                          disabled={isSaving || !fields.entry}
+                          disabled={isSaving || !fields.entry || (sizingMode === "MANUAL" && !manualQtyOk)}
                           className="flex-1 px-3 py-2 bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white text-sm font-bold rounded-lg"
                         >
                           SELL
