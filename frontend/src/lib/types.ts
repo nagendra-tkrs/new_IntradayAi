@@ -321,6 +321,8 @@ export interface RiskPreview {
   allowed_quantity: number;
   expected_initial_risk: number | null;
   risk_utilization_percent: number | null;
+  engine_capital_usage?: number | null;
+  capital_utilization_percent?: number | null;
   binding_constraint: string;
   sizing_mode: SizingMode | null;
   sizing_mode_error: string | null;
@@ -329,6 +331,7 @@ export interface RiskPreview {
   manual_utilization_percent: number | null;
   manual_exceeds_risk_budget: boolean;
   manual_capital_usage: number | null;
+  manual_capital_utilization_percent?: number | null;
   manual_affordable: boolean | null;
   sizing_available: boolean;
   note: string;

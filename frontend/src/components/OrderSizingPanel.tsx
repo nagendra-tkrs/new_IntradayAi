@@ -7,16 +7,20 @@ import type { OrderPreviewRequest, RiskPreview, SizingMode } from "@/lib/types";
 /**
  * Risk-aware order sizing control.
  *
- * Replaces the old `qty || 1` quantity box. Two things changed and both are
+ * Replaces the old `qty || 1` quantity box. Three things changed and all are
  * deliberate:
  *
- *  1. The default is MANUAL, so day-one behaviour is identical to before -
- *     nothing grows unless the user asks for it. Switching to RISK_ENGINE is a
- *     single, explicit click.
- *  2. The whole calculation is shown before the order exists: risk budget, risk
- *     per share, both constraints, the quantity the engine would pick, the
- *     initial risk that implies, and budget utilization. Nothing is hidden and
- *     nothing is applied without being displayed first.
+ *  1. The sizing mode is EXPLICIT. Signal-driven orders (scanner rows, stock
+ *     detail reached from a signal) default to RISK_ENGINE, which sizes the
+ *     position from the configured 2% budget instead of the old accidental
+ *     one-share default. Clicking "Manual qty" switches it and the quantity box
+ *     appears; that choice is respected and never silently converted back.
+ *  2. MANUAL is never guessed. A manual order with no number is a contradiction
+ *     the backend rejects, so the UI says so rather than sending a 1.
+ *  3. The whole calculation is shown before the order exists: entry, initial
+ *     stop, risk %, risk budget, risk per share, both constraints, allowed
+ *     quantity, the binding constraint, initial risk, and BOTH utilization
+ *     axes. Nothing is hidden and nothing is applied without being shown first.
  *
  * The panel never computes a size itself. Every number comes from the backend
  * preview endpoint, which is the same arithmetic the execution path uses.
@@ -34,6 +38,11 @@ interface OrderSizingPanelProps {
   mode: SizingMode;
   onModeChange: (mode: SizingMode) => void;
   disabled?: boolean;
+  /**
+   * True when the order originates from a signal. Purely presentational: it
+   * labels the default, and changes nothing about the arithmetic.
+   */
+  signalDriven?: boolean;
 }
 
 /**
@@ -104,6 +113,7 @@ export default function OrderSizingPanel({
   mode,
   onModeChange,
   disabled = false,
+  signalDriven = false,
 }: OrderSizingPanelProps) {
   const [preview, setPreview] = useState<RiskPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -174,10 +184,18 @@ export default function OrderSizingPanel({
   const overBudget = preview?.manual_exceeds_risk_budget === true;
   const unaffordable = preview?.manual_affordable === false;
 
+  // The order's sizing mode, always on screen. The default for a signal-driven
+  // order is the risk engine, so this line is how the user sees that before
+  // clicking BUY rather than after.
+  const modeLabel = mode === "RISK_ENGINE" ? "RISK ENGINE" : "MANUAL";
+
   return (
     <div className="bg-[#111827] rounded-lg p-3 space-y-3">
       <div className="flex items-center justify-between">
-        <p className="text-[10px] text-gray-500 uppercase tracking-wider">Position Sizing</p>
+        <p className="text-[10px] text-gray-500 uppercase tracking-wider">
+          Position Sizing
+          {signalDriven ? <span className="ml-2 text-blue-400">Signal-driven order</span> : null}
+        </p>
         <button
           type="button"
           onClick={() => setShowDetail((v) => !v)}
@@ -288,8 +306,33 @@ export default function OrderSizingPanel({
           ) : (
             <>
               <Row
+                label="Sizing mode"
+                value={modeLabel}
+                tone={mode === "RISK_ENGINE" ? "default" : "warn"}
+                title={
+                  mode === "RISK_ENGINE"
+                    ? "The backend risk engine decides the quantity"
+                    : "The quantity you typed is used exactly as entered"
+                }
+              />
+              <Row
+                label="Entry price"
+                value={inr(preview.entry_price)}
+                title="The price this order will use"
+              />
+              <Row
+                label="Initial stop loss"
+                value={inr(preview.stop_loss)}
+                title="Frozen at fill; Profit Capture moves the live stop later, never this"
+              />
+              <Row
+                label="Risk %"
+                value={pct(preview.configured_risk_percent)}
+                title="Configured per-trade risk percentage - unchanged by this panel"
+              />
+              <Row
                 label="Risk budget"
-                value={`${inr(preview.risk_budget, 0)} (${pct(preview.configured_risk_percent)})`}
+                value={inr(preview.risk_budget, 0)}
                 title="account_capital × configured_risk_percent"
               />
               <Row
@@ -308,6 +351,11 @@ export default function OrderSizingPanel({
                 title="95% of capital ÷ entry"
               />
               <Row
+                label="Allowed quantity"
+                value={`${qtyText(preview.allowed_quantity)} sh`}
+                title="The smaller of the two constraints - what the engine would use"
+              />
+              <Row
                 label="Binding"
                 value={preview.binding_constraint}
                 tone={preview.binding_constraint === "RISK_BUDGET" ? "warn" : "default"}
@@ -320,23 +368,41 @@ export default function OrderSizingPanel({
                 title="allowed_quantity × risk_per_share"
               />
               <Row
-                label="Utilization"
+                label="Risk utilization"
                 value={pct(preview.risk_utilization_percent)}
                 tone="warn"
                 title="initial risk ÷ risk budget"
               />
+              <Row
+                label="Capital utilization"
+                value={pct(preview.capital_utilization_percent)}
+                title="allowed_quantity × entry ÷ account capital"
+              />
+              <Row
+                label="Capital used"
+                value={inr(preview.engine_capital_usage, 0)}
+                title="Buying power the recommended size occupies"
+              />
               {mode === "MANUAL" && manualUsable && (
                 <>
                   <div className="pt-1 mt-1 border-t border-[#2d3548]">
+                    <Row
+                      label="Your quantity"
+                      value={`${qtyText(preview.requested_quantity)} sh`}
+                    />
                     <Row
                       label="Your initial risk"
                       value={inr(preview.manual_initial_risk)}
                       tone={overBudget ? "bad" : "default"}
                     />
                     <Row
-                      label="Your utilization"
+                      label="Your risk utilization"
                       value={pct(preview.manual_utilization_percent)}
                       tone={overBudget ? "bad" : "default"}
+                    />
+                    <Row
+                      label="Your capital util."
+                      value={pct(preview.manual_capital_utilization_percent)}
                     />
                     <Row
                       label="Capital used"

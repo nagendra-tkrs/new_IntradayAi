@@ -20,6 +20,8 @@ from app.services import signal_store
 from app.services.performance_comparison import compare_legacy_vs_profit_capture
 from app.services.context_report import build_context_comparison
 from app.services.trade_setup import compute_risk_reward
+from app.services.trade_measurement import build_measurement_report
+from app.services.position_sizing_store import load_geometry_for_user
 from app.core.config import settings
 from app.services.market_data.provider_factory import get_provider
 from app.core.market_session import now_ist, is_market_hours, IST
@@ -115,6 +117,10 @@ def _paper_details(trade_dict: dict) -> str:
         "remaining_quantity", "t1_exit_price", "t1_exit_quantity",
         "t1_realized_pnl", "realized_pnl", "trailing_active", "atr_ref",
         "exit_stage",
+        # Sizing provenance travels with the trade row itself so attribution
+        # (RISK_ENGINE vs MANUAL) never depends on a join to the geometry ledger
+        # that might be absent. Additive: historical rows are not rewritten.
+        "quantity_source",
     )
     details = {k: trade_dict.get(k) for k in keys if trade_dict.get(k) is not None}
     if not details:
@@ -839,6 +845,94 @@ async def get_trade_history(limit: int = 50, date: Optional[str] = None, user: U
     """
     full = await _load_trades_from_db(user.id)
     return _build_trade_history_response(full, limit, _parse_filter_date(date) if date else None)
+
+
+async def _load_measurement_rows(user_id: str) -> tuple[list[dict], dict, dict]:
+    """Read-only inputs for the measurement report: raw ledger rows (with
+    ``details_json`` intact), their signals, and the user's frozen entry
+    geometry.
+
+    Deliberately a separate loader from ``_load_trades_from_db``: the
+    measurement collapses Profit-Capture slices through
+    ``details_json.position_id``, so it needs the raw column rather than the
+    flattened, API-facing view. Nothing is written."""
+    from app.core.database import async_session
+    from app.models.models import Signal, Trade
+
+    async with async_session() as db:
+        result = await db.execute(
+            select(Trade).where(Trade.user_id == user_id).order_by(Trade.exit_time.desc())
+        )
+        db_trades = result.scalars().all()
+        rows = [
+            {
+                "id": t.id,
+                "signal_id": getattr(t, "signal_id", None),
+                "symbol": t.symbol,
+                "direction": t.direction,
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "quantity": t.quantity,
+                # The LIVE stop at exit time (Profit Capture has moved it). The
+                # entry-time stop comes from the geometry, never from here.
+                "stop_loss": t.stop_loss,
+                "target_1": t.target_1,
+                "target_2": t.target_2,
+                "entry_time": str(t.entry_time) if t.entry_time else "",
+                "exit_time": str(t.exit_time) if t.exit_time else "",
+                "status": t.status,
+                "pnl": t.pnl,
+                "details_json": getattr(t, "details_json", None),
+            }
+            for t in db_trades
+        ]
+        signal_ids = {r["signal_id"] for r in rows if r.get("signal_id")}
+        signals: dict = {}
+        if signal_ids:
+            sigs = (
+                await db.execute(select(Signal).where(Signal.id.in_(signal_ids)))
+            ).scalars().all()
+            signals = {s.id: _measurement_signal_row(s) for s in sigs}
+    geometry = load_geometry_for_user(user_id)
+    return rows, signals, geometry
+
+
+def _measurement_signal_row(signal) -> dict:
+    """Flatten a signals row into the plain-dict shape the measurement join
+    expects. Stored values only - never re-derived from live market data."""
+    return {
+        "id": signal.id,
+        "symbol": signal.symbol,
+        "timestamp": str(signal.timestamp) if signal.timestamp else None,
+        "direction": signal.direction,
+        "signal_score": signal.signal_score,
+        "confidence": signal.confidence,
+        "risk_reward": signal.risk_reward,
+        "signal_quality": signal.signal_quality,
+        "strategy_version": signal.strategy_version,
+        "atr": signal.atr,
+    }
+
+
+@router.get("/paper/trades/measurement")
+async def get_trade_measurement(user: User = Depends(get_current_user)):
+    """Read-only measurement report for properly-captured realized trades.
+
+    Joins the realized ledger to the frozen entry-time geometry so each trade
+    reports the risk it was OPENED with, separately from the live stop it was
+    closed with. Nothing is written, no order is placed, and shadow sizing
+    figures are reported alongside - never summed into realized P&L.
+
+    A trade with no captured geometry is reported as NOT properly captured with
+    a reason; it is never counted as zero risk.
+    """
+    rows, signals, geometry = await _load_measurement_rows(user.id)
+    return build_measurement_report(
+        rows,
+        signals_by_id=signals,
+        geometry_by_position=geometry,
+        generated_at=now_ist().isoformat(timespec="seconds"),
+    )
 
 
 def _ai_execution_view(trade: dict) -> dict:

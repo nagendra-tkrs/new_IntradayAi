@@ -197,6 +197,36 @@ def load_geometry_for(
         conn.close()
 
 
+def load_geometry_for_user(
+    user_id: str, db_path: Optional[str] = None
+) -> dict:
+    """All captured entry geometry for one user, keyed by ``position_id``.
+
+    Read-only, scoped to one user so a measurement endpoint never serves another
+    account's rows. Returns {} when the user has no captured geometry - the
+    caller must treat that as "never captured", not as "zero risk".
+    """
+    if not user_id:
+        return {}
+    ensure_geometry_schema(db_path)
+    conn = _conn(db_path)
+    if conn is None:
+        return {}
+    try:
+        conn.row_factory = sqlite3.Row
+        return {
+            r["position_id"]: dict(r)
+            for r in conn.execute(
+                f"SELECT * FROM {GEOMETRY_TABLE} WHERE user_id = ?", (user_id,)
+            )
+        }
+    except Exception as e:
+        logger.warning("load_geometry_for_user failed: %s", e)
+        return {}
+    finally:
+        conn.close()
+
+
 def load_all_geometry(db_path: Optional[str] = None) -> dict:
     """All captured entry-time geometry, keyed by ``position_id``.
 

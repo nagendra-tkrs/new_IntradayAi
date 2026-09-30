@@ -299,7 +299,13 @@ export default function ScannerPage() {
     // The quantity is NEVER defaulted here. An empty box is not "1 share" - it
     // is a request for the risk engine to size the order, and MANUAL without a
     // number is refused rather than guessed.
-    const sizingMode = orderSizingMode[sym] ?? "MANUAL";
+    // A scanner row IS a signal-driven order, so the default sizing mode is the
+    // risk engine: it sizes the position from the configured 2% budget instead
+    // of the old accidental one-share default. The user can switch to Manual,
+    // and once they have, their choice is respected - `orderSizingMode[sym]` is
+    // only consulted when they have not made one. Nothing is ever silently
+    // converted in either direction.
+    const sizingMode = orderSizingMode[sym] ?? "RISK_ENGINE";
     const rawQty = (orderQty[sym] ?? "").trim();
     const parsedQty = rawQty === "" ? null : Number(rawQty);
     const manualQty = parsedQty !== null && Number.isFinite(parsedQty) && parsedQty > 0
@@ -592,7 +598,7 @@ export default function ScannerPage() {
           const isSaving = saving[sym];
           const canTrade = sigDir !== "NO_TRADE" && sigDir !== "ERROR";
           const long = isLong(stock);
-          const sizingMode = orderSizingMode[sym] ?? "MANUAL";
+          const sizingMode = orderSizingMode[sym] ?? "RISK_ENGINE";
           const rawQty = (orderQty[sym] ?? "").trim();
           const manualQtyOk = rawQty !== "" && Number.isFinite(Number(rawQty)) && Number(rawQty) > 0;
 
@@ -722,6 +728,7 @@ export default function ScannerPage() {
                         onManualQuantityChange={(v) => setOrderQty((prev) => ({ ...prev, [sym]: v }))}
                         mode={sizingMode}
                         onModeChange={(m) => setOrderSizingMode((prev) => ({ ...prev, [sym]: m }))}
+                        signalDriven
                         disabled={isSaving}
                       />
                       <div className="flex gap-2">

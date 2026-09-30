@@ -865,6 +865,19 @@ def risk_preview(
     manual_util = (manual_risk / budget * 100.0) if (manual_risk and budget > 0) else None
     capital_used = requested * entry if (requested and entry > 0) else None
 
+    # Capital utilization is a second, independent utilisation axis from risk
+    # utilization. A size can sit far inside the rupee-risk budget while still
+    # tying up most of the buying power (tight-stop, high-priced names), so both
+    # are reported - neither alone describes the exposure.
+    engine_capital_used = allowed * entry if (allowed and entry > 0) else None
+    capital_util = (
+        (engine_capital_used / capital * 100.0)
+        if (engine_capital_used and capital > 0) else None
+    )
+    manual_capital_util = (
+        (capital_used / capital * 100.0) if (capital_used and capital > 0) else None
+    )
+
     try:
         mode = resolve_sizing_mode(sizing_mode, requested)
         mode_error = None
@@ -884,6 +897,8 @@ def risk_preview(
         "allowed_quantity": allowed,
         "expected_initial_risk": expected_risk,
         "risk_utilization_percent": util,
+        "engine_capital_usage": engine_capital_used,
+        "capital_utilization_percent": capital_util,
         "binding_constraint": binding,
         "sizing_mode": mode,
         "sizing_mode_error": mode_error,
@@ -894,6 +909,7 @@ def risk_preview(
             manual_risk is not None and budget > 0 and manual_risk > budget
         ),
         "manual_capital_usage": capital_used,
+        "manual_capital_utilization_percent": manual_capital_util,
         "manual_affordable": (
             None if capital_used is None
             else bool(capital_used <= capital * CAPITAL_HEADROOM + 1e-9)

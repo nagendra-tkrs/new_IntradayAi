@@ -101,8 +101,12 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
   // unreachable from this page. An empty box is now an explicit request for
   // risk-engine sizing, never an implicit "trade one share".
   const [orderQty, setOrderQty] = useState("");
-  // Default MANUAL keeps day-one behaviour identical; the engine is opt-in.
-  const [orderSizingMode, setOrderSizingMode] = useState<SizingMode>("MANUAL");
+  // Reaching this page from a signal (top signal / scanner) makes the order
+  // signal-driven, so the default sizing mode is the risk engine: the size comes
+  // from the configured 2% budget, not from the old accidental one-share
+  // default. Clicking "Manual qty" switches the mode AND the state with it, so
+  // a manual choice is never silently converted back.
+  const [orderSizingMode, setOrderSizingMode] = useState<SizingMode>("RISK_ENGINE");
   const [orderMsg, setOrderMsg] = useState<string | null>(null);
   const [quickRange, setQuickRange] = useState("auto");
   const [customFrom, setCustomFrom] = useState("");
@@ -463,6 +467,7 @@ export default function StockDetailPage({ params }: { params: Promise<{ symbol: 
             onManualQuantityChange={setOrderQty}
             mode={orderSizingMode}
             onModeChange={setOrderSizingMode}
+            signalDriven
           />
         </div>
 

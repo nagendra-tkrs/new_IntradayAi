@@ -3597,3 +3597,1368 @@ class TestNoStrategyParameterChanged:
         for module in ("signal_generator", "signal_scoring", "scanner",
                        "direction_band", "signal_weights"):
             assert module not in src.lower()
+# ════════════════════════════════════════════════════════════════════════════
+# LIVE RISK-ENGINE MEASUREMENT & PROFIT ATTRIBUTION
+#
+# Nothing in this block may change the strategy. These tests pin the behaviour
+# the measurement phase depends on: the risk engine is reachable and correctly
+# sized, MANUAL is never guessed or converted, entry geometry is frozen at fill,
+# every new trade is attributable end to end, and the report keeps REALIZED and
+# SHADOW strictly apart.
+#
+# Every test here writes to a throwaway database under tmp_path. None of them
+# touches the production ledger - see TestMeasurementSafety.
+# ════════════════════════════════════════════════════════════════════════════
+
+from app.services.trade_measurement import (  # noqa: E402
+    NOT_AVAILABLE, PROMOTION_INSUFFICIENT, PROMOTION_SUFFICIENT, UNKNOWN,
+    build_measurement_report, build_measured_trades, performance_metrics,
+    sizing_mode_split,
+)
+
+_FRONTEND = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "frontend", "src",
+)
+
+
+def _front(rel: str) -> str:
+    with open(os.path.join(_FRONTEND, rel), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _front_code(rel: str) -> str:
+    """Frontend source with line comments stripped.
+
+    Several pages *describe* the old ``|| 1`` / ``useState(1)`` bug in a
+    comment. Asserting on the raw text would read that documentation as the bug
+    still being present, so comment text is removed first and only real code is
+    inspected.
+    """
+    out = []
+    for line in _front(rel).splitlines():
+        # Naive but sufficient: these files have no string literal containing
+        # "//" followed by one of the tokens under test.
+        out.append(line.split("//", 1)[0])
+    return "\n".join(out)
+
+
+#: Symbols used only by this block. If any of them ever appears in the
+#: production ledger, a test leaked a fixture into live data.
+_TEST_SYMBOLS = ("MEASRISK", "MEASMAN", "MEASEDIT", "MEASOPEN", "MEASGEO")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# A. Risk engine
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestRiskEngineSizingAndConstraints:
+    """A: RISK_ENGINE selected, quantity computed, both constraints and both
+    utilizations reported."""
+
+    def test_risk_engine_is_the_mode_when_no_quantity_is_supplied(self):
+        assert resolve_sizing_mode(None, None) == SIZING_RISK_ENGINE
+
+    def test_quantity_is_computed_from_the_configured_budget(self):
+        p = risk_preview(100.0, 98.0, 10_000.0, 2.0)
+        assert p["risk_budget"] == pytest.approx(200.0)
+        assert p["risk_based_quantity"] == 100
+        assert p["allowed_quantity"] == 95        # capital-bound, not risk-bound
+        assert p["binding_constraint"] == BINDING_CAPITAL
+        assert p["expected_initial_risk"] == pytest.approx(190.0)
+        assert p["risk_utilization_percent"] == pytest.approx(95.0)
+
+    def test_capital_constraint_binds_on_a_tight_stop(self):
+        """Capital 10,000, entry 100 -> 95% headroom caps the size at 95 even
+        though the risk budget would allow 100 shares."""
+        p = risk_preview(100.0, 98.0, 10_000.0, 2.0)
+        assert p["capital_based_quantity"] == 95
+        assert p["risk_based_quantity"] == 100
+        assert p["allowed_quantity"] == min(p["risk_based_quantity"],
+                                            p["capital_based_quantity"])
+
+    def test_risk_constraint_binds_on_a_wide_stop(self):
+        p = risk_preview(100.0, 80.0, 10_000.0, 2.0)
+        assert p["risk_based_quantity"] == 10
+        assert p["allowed_quantity"] == 10
+        assert p["binding_constraint"] == BINDING_RISK_BUDGET
+        assert p["risk_utilization_percent"] == pytest.approx(100.0)
+
+    def test_capital_utilization_is_reported_separately_from_risk(self):
+        """Section 3 requires BOTH axes. A position can sit far inside the
+        rupee-risk budget while tying up most of the buying power, so neither
+        number alone describes the exposure."""
+        p = risk_preview(100.0, 98.0, 10_000.0, 2.0)
+        assert p["engine_capital_usage"] == pytest.approx(95 * 100.0)
+        assert p["capital_utilization_percent"] == pytest.approx(95.0)
+
+        wide = risk_preview(100.0, 80.0, 10_000.0, 2.0)
+        # risk-bound: full risk budget used, only a tenth of the capital
+        assert wide["risk_utilization_percent"] == pytest.approx(100.0)
+        assert wide["capital_utilization_percent"] == pytest.approx(10.0)
+        assert (wide["capital_utilization_percent"]
+                != wide["risk_utilization_percent"])
+
+    def test_capital_utilization_is_not_available_rather_than_zero(self):
+        p = risk_preview(0.0, None, 10_000.0, 2.0)
+        assert p["capital_utilization_percent"] is None
+        assert p["risk_utilization_percent"] is None
+
+    def test_manual_capital_utilization_is_reported_too(self):
+        p = risk_preview(100.0, 98.0, 10_000.0, 2.0, requested_quantity=40)
+        assert p["manual_capital_usage"] == pytest.approx(4_000.0)
+        assert p["manual_capital_utilization_percent"] == pytest.approx(40.0)
+
+    def test_the_live_engine_stays_the_only_authority(self):
+        from app.services.risk_engine import RiskConfig, RiskEngine
+        eng = RiskEngine(RiskConfig(account_capital=10_000.0))
+        for entry, stop in ((100.0, 98.0), (100.0, 80.0), (2500.0, 2460.0),
+                            (10_000.0, 9_000.0), (37.5, 35.0)):
+            assert risk_preview(entry, stop, 10_000.0, 2.0)["allowed_quantity"] \
+                == eng.calculate_position_size(entry, stop), (entry, stop)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Signal-driven default
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestSignalDrivenOrdersDefaultToTheRiskEngine:
+    """Section 2: a signal-driven / top-signal order defaults to RISK_ENGINE.
+
+    The default is a *visible* default, not a silent conversion: the mode is
+    rendered on the order panel, and an explicit MANUAL choice is stored and
+    never flipped back by the fallback.
+    """
+
+    def test_the_scanner_defaults_to_risk_engine_not_manual(self):
+        code = _front_code("app/scanner/page.tsx")
+        assert 'orderSizingMode[sym] ?? "RISK_ENGINE"' in code
+        assert 'orderSizingMode[sym] ?? "MANUAL"' not in code
+
+    def test_the_stock_detail_page_defaults_to_risk_engine(self):
+        code = _front_code("app/stock/[symbol]/page.tsx")
+        assert 'useState<SizingMode>("RISK_ENGINE")' in code
+        assert 'useState<SizingMode>("MANUAL")' not in code
+
+    def test_the_fallback_only_applies_before_the_user_has_chosen(self):
+        """`orderSizingMode[sym] ?? ...` reads the user's stored choice, so once
+        they pick MANUAL the risk-engine default cannot overwrite it."""
+        code = _front_code("app/scanner/page.tsx")
+        assert code.count('orderSizingMode[sym] ?? "RISK_ENGINE"') >= 2
+        assert "setOrderSizingMode((prev) => ({ ...prev, [sym]: m }))" in code
+
+    def test_the_mode_is_rendered_on_the_order_panel(self):
+        src = _front("components/OrderSizingPanel.tsx")
+        assert 'label="Sizing mode"' in src
+        assert "signalDriven" in src
+
+    def test_the_panel_shows_every_field_section_3_requires(self):
+        src = _front("components/OrderSizingPanel.tsx")
+        for label in (
+            'label="Entry price"',
+            'label="Initial stop loss"',
+            'label="Risk %"',
+            'label="Risk budget"',
+            'label="Risk / share"',
+            'label="Risk constraint"',
+            'label="Capital constraint"',
+            'label="Allowed quantity"',
+            'label="Binding"',
+            'label="Initial risk"',
+            'label="Risk utilization"',
+            'label="Capital utilization"',
+            'label="Sizing mode"',
+        ):
+            assert label in src, label
+
+    def test_the_frontend_never_recomputes_the_size(self):
+        """The backend is the single source of truth; the panel only renders."""
+        src = _front("components/OrderSizingPanel.tsx")
+        body = src.split("export default function OrderSizingPanel", 1)[1]
+        for forbidden in ("risk_budget *", "Math.floor(", "Math.trunc("):
+            assert forbidden not in body, forbidden
+        assert "previewPaperOrder(payload)" in src
+
+    def test_no_ui_path_fabricates_a_quantity_of_one(self):
+        """The order-quantity state must start empty, never at 1. Scoped to the
+        quantity binding itself so unrelated `useState(1)` (e.g. the chart's day
+        count) is not a false positive."""
+        for rel in ("app/scanner/page.tsx", "app/stock/[symbol]/page.tsx"):
+            code = _front_code(rel)
+            assert "|| 1" not in code, rel
+            assert "orderQty, setOrderQty] = useState(1)" not in code, rel
+            assert "orderQty] = useState(1)" not in code, rel
+        paper = _front_code("app/paper-trading/page.tsx")
+        assert "|| 1" not in paper
+        assert "parseInt(editFields.quantity) || 1" not in paper
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# B. Manual
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestManualSizingIsNeverGuessed:
+    """B: manual stays manual, never reaches the engine, and never defaults."""
+
+    def test_a_manual_quantity_resolves_to_manual_and_is_left_alone(self):
+        assert resolve_sizing_mode(None, 7) == SIZING_MANUAL
+        assert resolve_sizing_mode(SIZING_MANUAL, 7) == SIZING_MANUAL
+        assert resolve_sizing_mode(SIZING_MANUAL, 1000) == SIZING_MANUAL
+
+    def test_manual_without_a_quantity_is_rejected_at_every_level(self):
+        for qty in (None, 0, -1):
+            with pytest.raises(SizingModeError):
+                resolve_sizing_mode(SIZING_MANUAL, qty)
+
+    def test_manual_never_silently_becomes_risk_engine(self):
+        """An explicit MANUAL with a real number must survive resolution."""
+        for qty in (1, 2, 50, 5000):
+            assert resolve_sizing_mode(SIZING_MANUAL, qty) == SIZING_MANUAL
+
+    def test_manual_never_silently_becomes_risk_engine_when_unstated(self):
+        """Stating a number IS the manual decision; it must not be discarded."""
+        assert resolve_sizing_mode(None, 1) == SIZING_MANUAL
+
+
+class TestManualSizingThroughTheApi:
+    """B, over HTTP. MANUAL must not call the risk engine, and MANUAL with no
+    number must be a 400 - never a silent one share."""
+
+    @pytest.fixture()
+    def env(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+        from app.api import trading
+        from app.api.auth import create_token
+        from app.core.database import Base, get_db
+        from app.main import app
+        from app.models.models import User
+        from app.services.paper_trading import PaperTradingEngine
+        from app.services.risk_engine import RiskConfig, RiskEngine
+        import app.core.database as database_mod
+        from sqlalchemy import create_engine
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.orm import Session as SyncSession
+
+        user_id, email = "manual-user", "manual@test.local"
+        db_file = tmp_path / "manual_api.db"
+        sync_engine = create_engine(f"sqlite:///{db_file.as_posix()}")
+        Base.metadata.create_all(sync_engine)
+        with SyncSession(sync_engine) as s:
+            s.add(User(id=user_id, email=email, name="Manual"))
+            s.commit()
+        sync_engine.dispose()
+
+        async_engine = create_async_engine(f"sqlite+aiosqlite:///{db_file.as_posix()}")
+        Session = async_sessionmaker(async_engine, expire_on_commit=False)
+
+        async def _override_get_db():
+            async with Session() as session:
+                yield session
+
+        app.dependency_overrides[get_db] = _override_get_db
+        monkeypatch.setattr(database_mod, "async_session", Session)
+
+        engine = PaperTradingEngine(db_path=str(tmp_path / "manual.db"))
+        monkeypatch.setattr(trading, "paper_engine", engine)
+        monkeypatch.setattr(
+            trading, "risk_engine",
+            RiskEngine(RiskConfig(account_capital=10_000.0)))
+        monkeypatch.setattr(
+            trading.signal_store, "update_signal_usage",
+            lambda *a, **k: None)
+
+        async def _quote(symbol):
+            return {"price": 100.0}
+
+        monkeypatch.setattr(
+            trading, "_get_provider", lambda: SimpleNamespace(get_quote=_quote))
+        yield {
+            "client": TestClient(app),
+            "engine": engine,
+            "headers": {"Authorization": f"Bearer {create_token(user_id, email)}"},
+        }
+        app.dependency_overrides.clear()
+
+    def test_a_manual_quantity_does_not_call_the_risk_engine(self, env, monkeypatch):
+        from app.api import trading
+        calls = []
+
+        def _spy(entry, stop, setup_quality=None, signal_strength=None):
+            calls.append((entry, stop))
+            return 95
+
+        monkeypatch.setattr(trading.risk_engine, "calculate_position_size", _spy)
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "MEASMAN", "direction": "LONG", "sizing_mode": "MANUAL",
+            "quantity": 3, "entry_price": 100.0, "stop_loss": 98.0,
+            "target_1": 105.0})
+        assert r.status_code == 200, r.text
+        assert calls == []
+        assert r.json()["position"]["quantity"] == 3
+        assert r.json()["sizing_mode"] == "MANUAL"
+        assert r.json()["quantity_source"] == SOURCE_MANUAL
+
+    def test_a_risk_engine_order_uses_the_engine_quantity(self, env, monkeypatch):
+        from app.api import trading
+        calls = []
+
+        def _spy(entry, stop, setup_quality=None, signal_strength=None):
+            calls.append((entry, stop))
+            return 95
+
+        monkeypatch.setattr(trading.risk_engine, "calculate_position_size", _spy)
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "MEASRISK", "direction": "LONG", "sizing_mode": "RISK_ENGINE",
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 200, r.text
+        assert len(calls) == 1
+        assert r.json()["position"]["quantity"] == 95
+        assert r.json()["sizing_mode"] == "RISK_ENGINE"
+
+    def test_a_missing_manual_quantity_is_a_400_not_one_share(self, env):
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "MEASMAN", "direction": "LONG", "sizing_mode": "MANUAL",
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 400, r.text
+        assert "quantity" in r.json()["detail"].lower()
+        # and nothing was placed
+        assert env["engine"].get_positions() == []
+
+    def test_a_zero_manual_quantity_is_a_400_not_one_share(self, env):
+        for qty in (0, -3):
+            r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+                "symbol": "MEASMAN", "direction": "LONG", "sizing_mode": "MANUAL",
+                "quantity": qty, "entry_price": 100.0, "stop_loss": 98.0,
+                "target_1": 105.0})
+            assert r.status_code == 400, (qty, r.text)
+        assert env["engine"].get_positions() == []
+
+    def test_an_unknown_mode_is_a_400(self, env):
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "MEASMAN", "direction": "LONG", "sizing_mode": "AUTO",
+            "quantity": 5, "entry_price": 100.0, "stop_loss": 98.0,
+            "target_1": 105.0})
+        assert r.status_code == 400
+        assert "sizing_mode" in r.json()["detail"]
+
+    def test_the_response_carries_the_full_sizing_summary(self, env):
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "MEASRISK", "direction": "LONG", "sizing_mode": "RISK_ENGINE",
+            "entry_price": 100.0, "stop_loss": 98.0, "target_1": 105.0})
+        assert r.status_code == 200, r.text
+        sizing = r.json()["sizing"]
+        for key in ("risk_budget", "risk_per_share", "risk_based_quantity",
+                    "capital_based_quantity", "allowed_quantity",
+                    "expected_initial_risk", "risk_utilization_percent",
+                    "capital_utilization_percent", "binding_constraint",
+                    "sizing_mode", "configured_risk_percent"):
+            assert key in sizing, key
+        assert sizing["sizing_mode"] == "RISK_ENGINE"
+
+    def test_manual_still_passes_every_existing_gate(self, env, monkeypatch):
+        """A manual quantity is not a licence to skip any safety control."""
+        from app.api import trading
+        monkeypatch.setattr(
+            trading.risk_engine, "can_trade", lambda: (False, "daily loss limit"))
+        r = env["client"].post("/api/paper/orders", headers=env["headers"], json={
+            "symbol": "MEASMAN", "direction": "LONG", "sizing_mode": "MANUAL",
+            "quantity": 2, "entry_price": 100.0, "stop_loss": 98.0,
+            "target_1": 105.0})
+        assert r.status_code == 400
+        assert "daily loss limit" in r.json()["detail"]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# C. Geometry
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestGeometryIsCreatedOnceAtFillAndFrozen:
+    """C: exactly one geometry record per valid fill, carrying every required
+    field, which Profit Capture can never rewrite."""
+
+    #: Section 4's required capture fields, mapped to their geometry columns.
+    REQUIRED = {
+        "position_id": "position_id",
+        "signal_id": "signal_id",
+        "symbol": "symbol",
+        "direction": "direction",
+        "entry_price": "entry_price",
+        "initial_stop_loss": "initial_stop_loss",
+        "initial_target_1": "initial_target_1",
+        "initial_target_2": "initial_target_2",
+        "initial_risk_per_share": "initial_risk_per_share",
+        "initial_risk_amount": "initial_risk_amount",
+        "actual_quantity": "actual_quantity",
+        "configured_risk_percent": "configured_risk_percent",
+        "risk_budget": "risk_budget",
+        "risk_constraint_quantity": "risk_constraint_quantity",
+        "capital_constraint_quantity": "capital_constraint_quantity",
+        "allowed_quantity": "allowed_quantity",
+        "intended_risk": "intended_risk",
+        "actual_risk": "actual_risk",
+        "risk_budget_utilization": "risk_budget_utilization",
+        "binding_constraint": "binding_constraint",
+        "quantity_source": "quantity_source",
+    }
+
+    #: Every required column must exist AND carry a value - except the two facts
+    #: that are legitimately absent for some orders: ``signal_id`` (a manual
+    #: order can originate from no signal) and ``order_classification``
+    #: (an EXPLICIT manual order has no binding constraint).
+    ALWAYS_PRESENT = tuple(
+        c for c in REQUIRED.values()
+        if c not in ("signal_id", "order_classification")
+    )
+
+    def test_one_valid_fill_creates_exactly_one_geometry_row(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        db = str(tmp_path / "geom.db")
+        _open_long(pt, symbol="MEASGEO")
+        assert len(load_all_geometry(db_path=db)) == 1
+
+    def test_every_section_4_field_is_captured(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        oid = _open_long(pt, symbol="MEASGEO", qty=95,
+                         source=SOURCE_RISK_ENGINE)
+        g = _geo(str(tmp_path / "geom.db"), oid)
+        for label, column in self.REQUIRED.items():
+            assert column in g, f"{label} ({column}) missing from the row"
+        for column in self.ALWAYS_PRESENT:
+            assert g[column] is not None, f"{column} is NULL"
+
+    def test_a_signal_linked_order_captures_its_signal_id(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        r = pt.place_order("MEASGEO", "LONG", 95, 100.0, 98.0, 105.0, 107.0,
+                           quantity_source=SOURCE_RISK_ENGINE,
+                           signal_id="sigmeas0000001")
+        pt.fill_order(r["order_id"])
+        g = _geo(str(tmp_path / "geom.db"), r["order_id"])
+        assert g["signal_id"] == "sigmeas0000001"
+
+    def test_the_captured_numbers_are_the_entry_time_numbers(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        oid = _open_long(pt, symbol="MEASGEO", entry=100.0, sl=98.0, t1=105.0,
+                         t2=107.0, qty=95, source=SOURCE_RISK_ENGINE)
+        g = _geo(str(tmp_path / "geom.db"), oid)
+        assert g["entry_price"] == pytest.approx(100.0)
+        assert g["initial_stop_loss"] == pytest.approx(98.0)
+        assert g["initial_target_1"] == pytest.approx(105.0)
+        assert g["initial_target_2"] == pytest.approx(107.0)
+        assert g["initial_risk_per_share"] == pytest.approx(2.0)
+        assert g["actual_quantity"] == pytest.approx(95.0)
+        assert g["initial_risk_amount"] == pytest.approx(190.0)   # 95 x 2.0
+        assert g["risk_budget"] == pytest.approx(200.0)
+        assert g["risk_constraint_quantity"] == 100
+        assert g["capital_constraint_quantity"] == 95
+        assert g["allowed_quantity"] == 95
+        assert g["binding_constraint"] == BINDING_CAPITAL
+        assert g["configured_risk_percent"] == pytest.approx(2.0)
+        assert g["quantity_source"] == SOURCE_RISK_ENGINE
+
+    def test_a_second_fill_cannot_mutate_the_captured_row(self, tmp_path):
+        """The ledger is INSERT-only by position_id, so re-filling an already
+        filled order can neither add a row nor change one."""
+        pt = _geom_engine(tmp_path)
+        db = str(tmp_path / "geom.db")
+        oid = _open_long(pt, symbol="MEASGEO")
+        first = _geo(db, oid)
+
+        again = pt.fill_order(oid)                  # already filled
+        assert again.get("status") != "filled" or again.get("position") is not None
+        assert "error" in again or pt.get_position(oid) is not None
+        assert _geo(db, oid) == first
+        assert len(load_all_geometry(db_path=db)) == 1
+
+    def test_profit_capture_moving_the_stop_does_not_touch_the_geometry(self, tmp_path):
+        """SL -> breakeven -> trailing must leave the entry record byte-equal."""
+        pt = _geom_engine(tmp_path)
+        db = str(tmp_path / "geom.db")
+        oid = _open_long(pt, symbol="MEASGEO", entry=100.0, sl=98.0, t1=105.0,
+                         t2=130.0, qty=10)
+        before = dict(_geo(db, oid))
+
+        pt.check_stops({"MEASGEO": 105.5})      # T1 partial -> stop to breakeven
+        assert pt.get_position(oid)["stop_loss"] == pytest.approx(103.0)
+        pt.check_stops({"MEASGEO": 112.0})      # trailing ratchets further up
+        assert pt.get_position(oid)["stop_loss"] == pytest.approx(109.5)
+
+        after = dict(_geo(db, oid))
+        for key in ("initial_stop_loss", "initial_target_1",
+                    "initial_target_2", "entry_price",
+                    "initial_risk_per_share", "initial_risk_amount",
+                    "actual_quantity", "risk_budget", "allowed_quantity",
+                    "risk_budget_utilization", "quantity_source"):
+            assert after[key] == before[key], key
+        assert after == before
+
+    def test_the_measured_initial_risk_is_the_frozen_one_not_the_moved_stop(self, tmp_path):
+        """A profit-captured trade's R multiple must use the ENTRY risk. Here the
+        live stop ends at 109.5 (a 9.5/share profit lock); measuring against it
+        would report the position as having taken almost no risk."""
+        pt = _geom_engine(tmp_path)
+        db = str(tmp_path / "geom.db")
+        oid = _open_long(pt, symbol="MEASGEO", entry=100.0, sl=98.0, t1=105.0,
+                         t2=130.0, qty=10)
+        pt.check_stops({"MEASGEO": 105.5})      # T1 partial, stop -> 103.0
+        pt.check_stops({"MEASGEO": 112.0})      # trailing ratchets to 109.5
+        pt.close_position(oid, 112.0)           # close the remainder
+        rows, signals, geo = _ledger_rows(pt, db)
+        slices = [r for r in rows
+                  if json.loads(r["details_json"] or "{}")["position_id"] == oid]
+        assert len(slices) >= 2, slices
+
+        m = build_measured_trades(rows, signals, geo)
+        assert len(m) == 1, "the two slices must collapse to one position"
+        measured = m[0]
+        assert measured.properly_captured is True
+
+        # The collapsed P&L is the sum of the slices, and the risk denominator is
+        # the FROZEN entry risk - never the live stop the position carried out on.
+        assert measured.position.pnl == pytest.approx(sum(s["pnl"] for s in slices))
+        assert measured.initial_risk == pytest.approx(20.0)      # 10 x 2.0
+        assert measured.r_multiple == pytest.approx(
+            measured.position.pnl / 20.0)
+
+        # Why the frozen geometry is not optional. `close_position` locks the
+        # live stop to breakeven, so the ledger row's stop_loss is 100.0 - the
+        # entry price. Any risk multiple derived from the trade row would divide
+        # by 10 x (100.0 - 100.0) = 0 and report an infinite or meaningless R.
+        # The measurement reports 1.85R on the real 20.0 of entry risk instead.
+        assert measured.position.stop_loss == pytest.approx(100.0)
+        assert measured.initial_risk == pytest.approx(10.0 * 2.0)
+        ledger_denominator = 10.0 * abs(
+            measured.position.entry_price - measured.position.stop_loss)
+        assert ledger_denominator == pytest.approx(0.0)
+        assert measured.r_multiple not in (None, 0.0)
+
+        # and the entry-time stop is still exactly where it was at fill
+        assert _geo(db, oid)["initial_stop_loss"] == pytest.approx(98.0)
+        assert measured._stop_moved() == "YES_FAVOURABLE"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# D. Attribution
+# ────────────────────────────────────────────────────────────────────────────
+
+
+#: The keys ``app.api.trading._paper_details`` serialises into
+#: ``trades.details_json``. Mirrored here so a directly-driven engine's trade is
+#: shaped exactly like one the endpoint would have persisted.
+_DETAIL_KEYS = (
+    "exit_reason", "position_id", "exit_quantity", "initial_quantity",
+    "remaining_quantity", "t1_exit_price", "t1_exit_quantity",
+    "t1_realized_pnl", "realized_pnl", "trailing_active", "atr_ref",
+    "exit_stage", "quantity_source",
+)
+
+
+def _ledger_rows(pt, db_path, signals=None):
+    """Closed ledger rows + signals + geometry for a temp-DB paper engine.
+
+    The engine holds realized trades in memory; persisting them to the
+    ``trades`` table is the API layer's job (``_finalize_paper_trade``). This
+    helper therefore renders the engine's ``closed_trades`` through exactly the
+    same column mapping the endpoint uses, so the measurement sees the real
+    ledger shape - including ``details_json`` - without writing anything.
+    """
+    rows = []
+    for i, t in enumerate(pt.get_closed_trades()):
+        details = {k: t.get(k) for k in _DETAIL_KEYS if t.get(k) is not None}
+        rows.append({
+            "id": f"trd{i:014d}",
+            "signal_id": t.get("signal_id"),
+            "symbol": t.get("symbol"),
+            "direction": t.get("direction"),
+            "entry_price": t.get("entry_price"),
+            "exit_price": t.get("exit_price"),
+            # `trades.quantity` stores the EXIT slice, per _finalize_paper_trade.
+            "quantity": t.get("exit_quantity") or t.get("quantity"),
+            "stop_loss": t.get("stop_loss"),
+            "target_1": t.get("target_1"),
+            "target_2": t.get("target_2"),
+            "entry_time": t.get("opened_at") or t.get("entry_time"),
+            "exit_time": t.get("exit_time"),
+            "status": "closed",
+            "pnl": t.get("pnl"),
+            "details_json": json.dumps(details) if details else None,
+        })
+    return rows, dict(signals or {}), load_all_geometry(db_path=db_path)
+
+
+class TestTradeAttribution:
+    """D: signal -> order -> position -> geometry -> trade -> realized P&L."""
+
+    def test_every_link_survives_from_signal_to_pnl(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        db = str(tmp_path / "geom.db")
+        oid = _open_long(pt, symbol="MEASGEO", qty=95,
+                         source=SOURCE_RISK_ENGINE)
+        pt.close_position(oid, 105.0)
+
+        rows, signals, geo = _ledger_rows(pt, db)
+        assert len(rows) == 1
+        rep = build_measurement_report(rows, signals, geo)
+        assert rep["capture"]["properly_captured"] == 1
+
+        t = rep["trades"][0]
+        # A. identity
+        assert t["position_id"] == oid
+        assert t["trade_id"] == rows[0]["id"]
+        # D. order -> geometry linkage is exact
+        assert geo[oid]["position_id"] == t["position_id"]
+        assert t["sizing"]["sizing_mode"] == "RISK_ENGINE"
+        assert t["sizing"]["actual_quantity"] == pytest.approx(95.0)
+        # E. realized P&L is the ledger's own value
+        assert t["exit"]["realized_pnl"] == pytest.approx(rows[0]["pnl"])
+
+    def test_signal_level_attributes_are_recovered_by_the_join(self, tmp_path):
+        """signal_id, strategy_version and setup_quality live on the signals
+        row; attribution joins to it rather than storing them twice."""
+        pt = _geom_engine(tmp_path)
+        db = str(tmp_path / "geom.db")
+        signal = {
+            "id": "sigmeas0000001", "symbol": "MEASGEO", "timestamp":
+            "2026-09-30 10:15:00", "direction": "LONG", "signal_score": 72.5,
+            "confidence": 81.0, "risk_reward": 2.5, "signal_quality": "PREMIUM",
+            "strategy_version": "v1", "atr": 3.2,
+        }
+        oid = _open_long(pt, symbol="MEASGEO", qty=95,
+                         source=SOURCE_RISK_ENGINE)
+        pt.close_position(oid, 105.0)
+
+        rows, _, geo = _ledger_rows(pt, db)
+        for r in rows:
+            r["signal_id"] = signal["id"]
+        rep = build_measurement_report(rows, {signal["id"]: signal}, geo)
+        t = rep["trades"][0]
+        assert t["signal_id"] == signal["id"]
+        assert t["ai_linked"] is True
+        assert t["strategy_version"] == "v1"
+        assert t["signal"]["setup_quality"] == "PREMIUM"
+        assert t["signal"]["score"] == pytest.approx(72.5)
+        assert t["signal"]["confidence"] == pytest.approx(81.0)
+        assert t["signal"]["signal_timestamp"] == "2026-09-30 10:15:00"
+        assert t["signal"]["direction"] == "LONG"
+        assert t["signal"]["atr"] == pytest.approx(3.2)
+
+    def test_a_nested_signal_score_object_still_yields_the_total(self, tmp_path):
+        """`signal_score` is a scalar on some rows and an object on others."""
+        pt = _geom_engine(tmp_path)
+        db = str(tmp_path / "geom.db")
+        oid = _open_long(pt, symbol="MEASGEO")
+        pt.close_position(oid, 105.0)
+        rows, _, geo = _ledger_rows(pt, db)
+        sig = {"id": "sigmeas0000002", "signal_score": {"total": 66.25,
+                                                       "momentum": 40.0}}
+        rows[0]["signal_id"] = sig["id"]
+        rep = build_measurement_report(rows, {sig["id"]: sig}, geo)
+        assert rep["trades"][0]["signal"]["score"] == pytest.approx(66.25)
+
+    def test_a_trade_without_a_signal_reports_not_available_not_zero(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        db = str(tmp_path / "geom.db")
+        oid = _open_long(pt, symbol="MEASGEO")
+        pt.close_position(oid, 105.0)
+        rep = build_measurement_report(*_ledger_rows(pt, db))
+        t = rep["trades"][0]
+        assert t["signal_id"] == UNKNOWN
+        assert t["ai_linked"] is False
+        assert t["strategy_version"] == UNKNOWN
+        assert t["signal"]["score"] == NOT_AVAILABLE
+        assert t["signal"]["setup_quality"] == NOT_AVAILABLE
+
+    def test_the_sizing_mode_travels_on_the_trade_row_too(self, tmp_path):
+        """Provenance must not depend on a join that might be missing: the close
+        path mirrors `quantity_source` into `trades.details_json`."""
+        from app.api.trading import _paper_details
+        details = json.loads(
+            _paper_details({"exit_reason": "T2_FINAL", "quantity_source":
+                            SOURCE_RISK_ENGINE, "position_id": "p1"}))
+        assert details["quantity_source"] == "RISK_ENGINE"
+        assert details["exit_reason"] == "T2_FINAL"
+
+    def test_the_attribution_report_names_every_join_key(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        db = str(tmp_path / "geom.db")
+        oid = _open_long(pt, symbol="MEASGEO", qty=95,
+                         source=SOURCE_RISK_ENGINE)
+        pt.close_position(oid, 105.0)
+        rep = build_measurement_report(*_ledger_rows(pt, db))
+        attr = rep["attribution"]
+        assert "->" in attr["chain"]
+        for key in attr["join_keys"].values():
+            assert key
+        coverage = attr["field_coverage"]
+        for field in ("signal_id", "strategy_version", "sizing_mode",
+                      "initial_stop_loss", "initial_risk_amount",
+                      "actual_quantity", "binding_constraint", "exit_reason",
+                      "realized_pnl"):
+            assert field in coverage, field
+        # present-but-unlinked fields are counted missing, not zero
+        assert coverage["signal_id"]["missing"] == coverage["signal_id"]["total"]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# E. Edit order
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestEditOrderReachesEveryNewRecord:
+    """E: 10 -> edit 20 -> fill -> geometry, position and P&L all use 20."""
+
+    def test_the_specified_chain_end_to_end(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        db = str(tmp_path / "geom.db")
+        r = pt.place_order("MEASEDIT", "LONG", 10, 100.0, 98.0, 105.0, 107.0,
+                           quantity_source=SOURCE_MANUAL)
+        assert r["position"]["quantity"] == 10
+
+        e = pt.edit_order(r["order_id"], quantity=20)
+        assert "error" not in e
+        pt.fill_order(r["order_id"])
+
+        pos = pt.get_position(r["order_id"])
+        assert pos["quantity"] == pytest.approx(20.0)
+        assert pos["initial_quantity"] == pytest.approx(20.0)
+        assert pos["remaining_quantity"] == pytest.approx(20.0)
+
+        g = _geo(db, r["order_id"])
+        assert g["actual_quantity"] == pytest.approx(20.0)
+        assert g["initial_quantity"] == pytest.approx(20.0)
+        assert g["initial_risk_amount"] == pytest.approx(40.0)   # 20 x 2.0
+
+        pt.close_position(r["order_id"], 105.0)
+        rows, _, geo = _ledger_rows(pt, db)
+        assert rows[0]["pnl"] == pytest.approx(20.0 * 5.0)        # 20 x (105-100)
+
+        rep = build_measurement_report(rows, {}, geo)
+        t = rep["trades"][0]
+        assert t["entry_geometry"]["quantity"] == pytest.approx(20.0)
+        assert t["entry_geometry"]["initial_risk"] == pytest.approx(40.0)
+        assert t["sizing"]["actual_quantity"] == pytest.approx(20.0)
+        assert t["exit"]["realized_pnl"] == pytest.approx(100.0)
+        assert t["exit"]["r_multiple"] == pytest.approx(2.5)      # 100 / 40
+
+    def test_a_partial_close_uses_the_filled_quantity_for_pnl(self, tmp_path):
+        """Closing half of 20 shares books half the P&L; the geometry still
+        reports the 20 that were actually bought."""
+        pt = _geom_engine(tmp_path)
+        db = str(tmp_path / "geom.db")
+        r = pt.place_order("MEASEDIT", "LONG", 10, 100.0, 98.0, 105.0, 107.0,
+                           quantity_source=SOURCE_MANUAL)
+        pt.edit_order(r["order_id"], quantity=20)
+        pt.fill_order(r["order_id"])
+
+        pt.check_stops({"MEASEDIT": 105.0})          # T1 partial at 105
+        slices = [c for c in pt.get_closed_trades()
+                  if c.get("position_id") == r["order_id"]]
+        assert slices, "expected a T1 partial slice"
+        partial = slices[-1]
+        assert partial["exit_quantity"] == pytest.approx(10.0)
+        assert partial["pnl"] == pytest.approx(50.0)              # 10 x 5.0
+        assert _geo(db, r["order_id"])["actual_quantity"] == pytest.approx(20.0)
+
+    def test_historical_rows_are_never_rewritten_by_an_edit(self, tmp_path):
+        """An edit applies to a PENDING order only. A position that has already
+        been filled cannot be resized, so no realized history can change."""
+        pt = _geom_engine(tmp_path)
+        db = str(tmp_path / "geom.db")
+        r = pt.place_order("MEASEDIT", "LONG", 10, 100.0, 98.0, 105.0, 107.0,
+                           quantity_source=SOURCE_MANUAL)
+        pt.fill_order(r["order_id"])
+        before = _ledger_rows(pt, db)[0]
+        e = pt.edit_order(r["order_id"], quantity=999)
+        assert "error" in e
+        assert _ledger_rows(pt, db)[0] == before
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# F. Measurement
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _closed_trade_rows():
+    """Two completed trades: one risk-engine sized, one manual, both winners
+    with different exposure - the exact mix section 9 must keep apart."""
+    rows = [
+        {"id": "trd000000000001", "signal_id": "sig000000000001",
+         "symbol": "MEASRISK", "direction": "LONG", "entry_price": 100.0,
+         "exit_price": 106.0, "quantity": 95, "stop_loss": 100.0,
+         "target_1": 105.0, "target_2": 107.0,
+         "entry_time": "2026-09-30 10:00:00", "exit_time": "2026-09-30 11:00:00",
+         "status": "closed", "pnl": 570.0,
+         "details_json": json.dumps({
+             "exit_reason": "T2_FINAL", "position_id": "pos000000000001",
+             "initial_quantity": 95, "exit_quantity": 95,
+             "quantity_source": "RISK_ENGINE"})},
+        {"id": "trd000000000002", "signal_id": None,
+         "symbol": "MEASMAN", "direction": "SHORT", "entry_price": 200.0,
+         "exit_price": 198.0, "quantity": 2, "stop_loss": 200.0,
+         "target_1": 192.0, "target_2": 188.0,
+         "entry_time": "2026-09-30 12:00:00", "exit_time": "2026-09-30 12:30:00",
+         "status": "closed", "pnl": 4.0,
+         "details_json": json.dumps({
+             "exit_reason": "TARGET_1", "position_id": "pos000000000002",
+             "initial_quantity": 2, "exit_quantity": 2,
+             "quantity_source": "MANUAL"})},
+    ]
+    geo = {
+        "pos000000000001": {
+            "position_id": "pos000000000001", "user_id": "u1",
+            "signal_id": "sig000000000001", "symbol": "MEASRISK",
+            "direction": "LONG", "captured_at": "2026-09-30 10:00:00",
+            "capture_source": SOURCE_ORDER_FILL, "entry_price": 100.0,
+            "initial_stop_loss": 98.0, "initial_target_1": 105.0,
+            "initial_target_2": 107.0, "initial_risk_per_share": 2.0,
+            "initial_risk_amount": 190.0, "initial_quantity": 95,
+            "account_capital": 10_000.0, "configured_risk_percent": 2.0,
+            "risk_budget": 200.0, "risk_constraint_quantity": 100,
+            "capital_constraint_quantity": 95, "allowed_quantity": 95,
+            "actual_quantity": 95.0, "intended_risk": 200.0,
+            "actual_risk": 190.0, "risk_budget_utilization": 95.0,
+            "order_classification": CLASS_CAPITAL_CONSTRAINED,
+            "binding_constraint": BINDING_CAPITAL,
+            "quantity_source": SOURCE_RISK_ENGINE,
+            "shadow_quantity": 100, "shadow_exposure": 10_000.0,
+            "shadow_initial_risk": 200.0, "shadow_utilization": 100.0,
+            "current_exposure": 9_500.0, "geometry_reliable": 1,
+        },
+        "pos000000000002": {
+            "position_id": "pos000000000002", "user_id": "u1",
+            "signal_id": None, "symbol": "MEASMAN", "direction": "SHORT",
+            "captured_at": "2026-09-30 12:00:00",
+            "capture_source": SOURCE_ORDER_FILL, "entry_price": 200.0,
+            "initial_stop_loss": 204.0, "initial_target_1": 192.0,
+            "initial_target_2": 188.0, "initial_risk_per_share": 4.0,
+            "initial_risk_amount": 8.0, "initial_quantity": 2,
+            "account_capital": 10_000.0, "configured_risk_percent": 2.0,
+            "risk_budget": 200.0, "risk_constraint_quantity": 50,
+            "capital_constraint_quantity": 47, "allowed_quantity": 47,
+            "actual_quantity": 2.0, "intended_risk": 8.0, "actual_risk": 8.0,
+            "risk_budget_utilization": 4.0,
+            "order_classification": CLASS_MANUAL_QUANTITY,
+            "binding_constraint": BINDING_EXPLICIT,
+            "quantity_source": SOURCE_MANUAL,
+            "shadow_quantity": 50, "shadow_exposure": 10_000.0,
+            "shadow_initial_risk": 200.0, "shadow_utilization": 100.0,
+            "current_exposure": 400.0, "geometry_reliable": 1,
+        },
+    }
+    signals = {
+        "sig000000000001": {
+            "id": "sig000000000001", "symbol": "MEASRISK",
+            "timestamp": "2026-09-30 09:59:00", "direction": "LONG",
+            "signal_score": 74.0, "confidence": 80.0, "risk_reward": 2.5,
+            "signal_quality": "PREMIUM", "strategy_version": "v1", "atr": 3.0,
+        }
+    }
+    return rows, signals, geo
+
+
+class TestMeasurementReport:
+    """F: what the report must and must not contain."""
+
+    def test_a_completed_properly_captured_trade_appears(self):
+        rep = build_measurement_report(*_closed_trade_rows())
+        assert rep["capture"]["properly_captured"] == 2
+        assert rep["kind"] == "REALIZED"
+        assert {t["symbol"] for t in rep["trades"]} == {"MEASRISK", "MEASMAN"}
+        for t in rep["trades"]:
+            assert t["properly_captured"] is True
+            assert t["exclusion_reason"] is None
+
+    def test_an_incomplete_trade_is_excluded(self):
+        rows, signals, geo = _closed_trade_rows()
+        rows.append({
+            "id": "trd000000000003", "signal_id": None, "symbol": "MEASOPEN",
+            "direction": "LONG", "entry_price": 50.0, "exit_price": None,
+            "quantity": 5, "stop_loss": 49.0, "target_1": 53.0,
+            "target_2": 55.0, "entry_time": "2026-09-30 13:00:00",
+            "exit_time": None, "status": "open", "pnl": None,
+            "details_json": json.dumps({
+                "position_id": "pos000000000003", "initial_quantity": 5}),
+        })
+        geo["pos000000000003"] = dict(
+            geo["pos000000000001"], position_id="pos000000000003",
+            symbol="MEASOPEN")
+        rep = build_measurement_report(rows, signals, geo)
+        assert "MEASOPEN" not in {t["symbol"] for t in rep["trades"]}
+        assert rep["capture"]["properly_captured"] == 2
+
+    def test_a_position_without_geometry_is_excluded_with_a_reason(self):
+        """Never counted as zero risk."""
+        rows, signals, geo = _closed_trade_rows()
+        geo.pop("pos000000000001")
+        rep = build_measurement_report(rows, signals, geo)
+        assert rep["capture"]["properly_captured"] == 1
+        assert rep["capture"]["exclusion_reasons"] == {"NO_GEOMETRY_ROW": 1}
+        gap = next(t for t in rep["trades"] if t["symbol"] == "MEASRISK")
+        assert gap["properly_captured"] is False
+        assert gap["sizing"]["sizing_mode"] == NOT_AVAILABLE
+        assert gap["entry_geometry"]["initial_risk"] == NOT_AVAILABLE
+        assert gap["exit"]["r_multiple"] == NOT_AVAILABLE
+
+    def test_unreliable_geometry_is_excluded_rather_than_trusted(self):
+        rows, signals, geo = _closed_trade_rows()
+        geo["pos000000000001"] = dict(geo["pos000000000001"],
+                                      geometry_reliable=0)
+        rep = build_measurement_report(rows, signals, geo)
+        assert rep["capture"]["properly_captured"] == 1
+        assert "GEOMETRY_MARKED_UNRELIABLE" in rep["capture"]["exclusion_reasons"]
+
+    def test_profit_capture_slices_are_summed_into_one_trade(self):
+        rows, signals, geo = _closed_trade_rows()
+        rows.append({
+            "id": "trd000000000004", "signal_id": None, "symbol": "MEASGEO",
+            "direction": "LONG", "entry_price": 100.0, "exit_price": 107.0,
+            "quantity": 5, "stop_loss": 106.5, "target_1": 105.0,
+            "target_2": 107.0, "entry_time": "2026-09-30 10:00:00",
+            "exit_time": "2026-09-30 12:00:00", "status": "closed",
+            "pnl": 15.0,
+            "details_json": json.dumps({
+                "exit_reason": "T2_FINAL", "position_id": "pos000000000001",
+                "initial_quantity": 95, "exit_quantity": 5,
+                "quantity_source": "RISK_ENGINE"}),
+        })
+        rep = build_measurement_report(rows, signals, geo)
+        assert rep["capture"]["positions_after_collapse"] == 2
+        sliced = next(t for t in rep["trades"]
+                      if t["position_id"] == "pos000000000001")
+        assert sliced["exit"]["realized_pnl"] == pytest.approx(585.0)  # 570 + 15
+        assert sliced["exit"]["exit_reasons"] == ["T2_FINAL", "T2_FINAL"]
+        assert rep["performance"]["strategy_cohort"][
+            "total_completed_trades"] == 2
+
+    def test_manual_and_risk_engine_are_never_merged(self):
+        """Section 9: the two modes are separate populations."""
+        rep = build_measurement_report(*_closed_trade_rows())
+        split = rep["sizing_modes"]
+        assert split["RISK_ENGINE"]["trades"] == 1
+        assert split["MANUAL"]["trades"] == 1
+        assert split["RISK_ENGINE"]["total_pnl"] == pytest.approx(570.0)
+        assert split["MANUAL"]["total_pnl"] == pytest.approx(4.0)
+        # the combined figure is never presented as a mode result
+        assert 574.0 not in (split["RISK_ENGINE"]["total_pnl"],
+                             split["MANUAL"]["total_pnl"])
+        # exposure-normalized numbers make the two comparable
+        assert split["RISK_ENGINE"]["normalized"]["r_multiple_mean"] == \
+            pytest.approx(3.0)          # 570 / 190
+        assert split["MANUAL"]["normalized"]["r_multiple_mean"] == \
+            pytest.approx(0.5)          # 4 / 8
+        assert split["RISK_ENGINE"]["average_risk_utilization_percent"] == \
+            pytest.approx(95.0)
+        assert split["MANUAL"]["average_risk_utilization_percent"] == \
+            pytest.approx(4.0)
+
+    def test_both_modes_report_a_small_sample_as_insufficient(self):
+        rep = build_measurement_report(*_closed_trade_rows())
+        split = rep["sizing_modes"]
+        assert split["RISK_ENGINE"]["sample_sufficient"] is False
+        assert split["MANUAL"]["sample_sufficient"] is False
+        assert rep["promotion_verdict"] == PROMOTION_INSUFFICIENT
+
+    def test_the_required_performance_metrics_are_all_present(self):
+        stats = build_measurement_report(
+            *_closed_trade_rows())["performance"]["strategy_cohort"]
+        for key in ("total_completed_trades", "wins", "losses", "win_rate",
+                    "gross_profit", "gross_loss", "net_pnl",
+                    "average_pnl_per_trade", "average_winner", "average_loser",
+                    "expectancy", "profit_factor", "max_drawdown",
+                    "average_holding_minutes", "median_holding_minutes",
+                    "risk_utilization_percent_mean",
+                    "capital_utilization_percent_mean"):
+            assert key in stats, key
+
+    def test_the_required_breakdowns_are_all_present_with_sample_sizes(self):
+        groups = build_measurement_report(
+            *_closed_trade_rows())["breakdowns"]["strategy_cohort"]
+        for name in ("direction", "setup_quality", "symbol", "sizing_mode",
+                     "exit_reason", "strategy_version"):
+            assert name in groups, name
+            assert groups[name], name
+            for label, stats in groups[name].items():
+                assert "total_completed_trades" in stats
+                assert stats["data_status"], label
+        assert set(groups["direction"]) == {"LONG", "SHORT"}
+        assert set(groups["sizing_mode"]) == {"RISK_ENGINE", "MANUAL"}
+        assert "PREMIUM" in groups["setup_quality"]
+        assert "v1" in groups["strategy_version"]
+
+    def test_return_on_capital_is_a_percentage_of_the_account(self):
+        """Scale + denominator regression.
+
+        The trade realizes 570 on 10,000 of account capital, occupying 9,500 of
+        it. Return on ACCOUNT capital is 5.7%. Dividing by the position's own
+        exposure would give 6.0% and, worse, dividing by the utilization
+        *fraction* would give 600% - three different answers for one trade.
+        """
+        rep = build_measurement_report(*_closed_trade_rows())
+        t = next(x for x in rep["trades"] if x["symbol"] == "MEASRISK")
+        assert t["sizing"]["account_capital"] == pytest.approx(10_000.0)
+        assert t["sizing"]["exposure"] == pytest.approx(9_500.0)
+        assert t["sizing"]["capital_utilization_percent"] == pytest.approx(95.0)
+        assert t["exit"]["return_on_capital_percent"] == pytest.approx(5.7)
+        # the wrong-but-plausible alternatives, explicitly rejected
+        assert t["exit"]["return_on_capital_percent"] != pytest.approx(6.0)
+        assert t["exit"]["return_on_capital_percent"] != pytest.approx(600.0)
+
+    def test_return_on_capital_needs_account_capital_and_is_never_guessed(self):
+        """Utilization is a fraction OF capital, so with no capital recorded
+        there is no denominator. The report says NOT_AVAILABLE rather than
+        reconstructing one - an invented denominator yields a confident wrong
+        number, which is the specific failure this report exists to prevent.
+
+        The position's own exposure is still reported, clearly labelled as a
+        different measurement.
+        """
+        rows, signals, geo = _closed_trade_rows()
+        g = dict(geo["pos000000000001"])
+        g.pop("account_capital")
+        geo["pos000000000001"] = g
+        t = next(x for x in build_measurement_report(rows, signals, geo)["trades"]
+                 if x["symbol"] == "MEASRISK")
+        assert t["sizing"]["account_capital"] == NOT_AVAILABLE
+        assert t["sizing"]["capital_utilization_percent"] == NOT_AVAILABLE
+        assert t["exit"]["return_on_capital_percent"] == NOT_AVAILABLE
+        # 570 realized on the 9,500 the position itself occupied
+        assert t["exit"]["return_on_exposure_percent"] == pytest.approx(6.0)
+        assert t["exit"]["return_on_capital_percent"] != pytest.approx(6.0)
+
+    def test_both_return_figures_are_not_available_without_a_denominator(self):
+        rows, signals, geo = _closed_trade_rows()
+        g = dict(geo["pos000000000001"])
+        g.pop("account_capital")
+        g.pop("current_exposure")
+        g["entry_price"] = None
+        geo["pos000000000001"] = g
+        t = next(x for x in build_measurement_report(rows, signals, geo)["trades"]
+                 if x["symbol"] == "MEASRISK")
+        # Never 0%, which would read as "broke even".
+        assert t["sizing"]["capital_utilization_percent"] == NOT_AVAILABLE
+        assert t["sizing"]["exposure"] == NOT_AVAILABLE
+        assert t["exit"]["return_on_capital_percent"] == NOT_AVAILABLE
+        assert t["exit"]["return_on_exposure_percent"] == NOT_AVAILABLE
+
+    def test_geometry_tripwire_catches_an_overwritten_entry_stop(self):
+        """The immutability check must FAIL when the frozen stop is replaced by
+        the live one - otherwise it proves nothing.
+
+        Simulates a geometry row overwritten by a Profit Capture move, which the
+        INSERT-only store would not actually permit, and asserts the report says
+        so instead of printing a clean bill of health. The ledger row's live stop
+        for MEASRISK is 100.0, so writing that into ``initial_stop_loss`` is
+        precisely the corruption being guarded against.
+        """
+        rows, signals, geo = _closed_trade_rows()
+        assert rows[0]["stop_loss"] == 100.0 and geo["pos000000000001"][
+            "initial_stop_loss"] == 98.0
+        g = dict(geo["pos000000000001"])
+        g["initial_stop_loss"] = 100.0
+        geo["pos000000000001"] = g
+        gc = build_measurement_report(rows, signals, geo)[
+            "attribution"]["geometry_consistency"]
+        # 0.0 away from entry, but the row claims 2.0 of risk per share
+        assert gc["geometry_self_consistent"] is False
+        assert gc["incoherent_geometry_rows"] == 1
+        # and the corruption is now indistinguishable from "the stop never
+        # moved", which is exactly why the boolean is not the tripwire
+        assert gc["stop_moved_by_profit_capture"] == 1
+
+    def test_geometry_tripwire_catches_an_incoherent_geometry_row(self):
+        """A row that disagrees with ITSELF is incoherent even when it still
+        differs from the live stop - the stop was moved to a distance that does
+        not match the recorded risk-per-share."""
+        rows, signals, geo = _closed_trade_rows()
+        g = dict(geo["pos000000000001"])
+        g["initial_stop_loss"] = 110.0        # 10.0 away, but rps says 2.0
+        geo["pos000000000001"] = g
+        gc = build_measurement_report(rows, signals, geo)[
+            "attribution"]["geometry_consistency"]
+        assert gc["geometry_self_consistent"] is False
+        assert gc["incoherent_geometry_rows"] == 1
+
+    def test_geometry_tripwire_passes_on_the_untouched_ledger(self):
+        rows, signals, geo = _closed_trade_rows()
+        gc = build_measurement_report(rows, signals, geo)[
+            "attribution"]["geometry_consistency"]
+        assert gc["geometry_rows_read"] == 2
+        assert gc["positions_without_geometry"] == 0
+        # both fixture positions had their live stop ratcheted off the entry one
+        assert gc["stop_moved_by_profit_capture"] == 2
+        assert gc["geometry_self_consistent"] is True
+        assert gc["incoherent_geometry_rows"] == 0
+        assert gc["frozen_stop_differs_from_live"] == 2
+        assert gc["frozen_stop_equals_live"] == 0
+
+    def test_shadow_pnl_is_excluded_from_every_realized_number(self):
+        """The shadow columns are large (100 shares / ₹200 of risk on trade 1).
+        None of that may appear in realized P&L, win rate or expectancy."""
+        rows, signals, geo = _closed_trade_rows()
+        rep = build_measurement_report(rows, signals, geo)
+        stats = rep["performance"]["strategy_cohort"]
+        assert stats["net_pnl"] == pytest.approx(574.0)     # 570 + 4, nothing else
+        assert stats["gross_profit"] == pytest.approx(574.0)
+        assert stats["wins"] == 2
+        assert rep["shadow"]["booked_as_realized_pnl"] is False
+        assert rep["shadow"]["historical_promotable_unchanged"] is True
+        shadows = {t["symbol"]: t["shadow_reference_only"]
+                   for t in rep["trades"]}
+        for ref in shadows.values():
+            assert ref["booked_as_realized_pnl"] is False
+            assert ref["shadow_quantity"] is not NOT_AVAILABLE
+        assert shadows["MEASRISK"]["shadow_quantity"] == 100
+        assert shadows["MEASMAN"]["shadow_quantity"] == 50
+        # and the shadow size is never the realized size it is reported beside
+        assert shadows["MEASRISK"]["shadow_quantity"] != \
+            rep["trades"][0]["sizing"]["actual_quantity"]
+
+    def test_a_loss_is_measured_as_a_loss(self):
+        rows, signals, geo = _closed_trade_rows()
+        rows[0]["pnl"] = -190.0
+        rep = build_measurement_report(rows, signals, geo)
+        stats = rep["performance"]["strategy_cohort"]
+        assert stats["wins"] == 1
+        assert stats["losses"] == 1
+        assert stats["gross_loss"] == pytest.approx(190.0)
+        assert stats["net_pnl"] == pytest.approx(-186.0)
+        assert stats["win_rate"] == pytest.approx(0.5)
+        r0 = next(t for t in rep["trades"] if t["symbol"] == "MEASRISK")
+        assert r0["exit"]["r_multiple"] == pytest.approx(-1.0)
+        # -190 of P&L against 10,000 of ACCOUNT capital = -1.90%. Note the
+        # denominator is the account, not the 9,500 the position occupied: a
+        # return measured against its own exposure would be -2.00%, and the two
+        # would not be comparable across differently-sized positions.
+        assert r0["sizing"]["capital_utilization_percent"] == pytest.approx(95.0)
+        assert r0["exit"]["return_on_capital_percent"] == pytest.approx(-1.9)
+        assert r0["exit"]["return_on_exposure_percent"] == pytest.approx(-2.0)
+
+    def test_an_empty_ledger_reports_not_available_rather_than_zeroes(self):
+        rep = build_measurement_report([], {}, {})
+        stats = rep["performance"]["strategy_cohort"]
+        assert stats["total_completed_trades"] == 0
+        assert stats["win_rate"] is None
+        assert stats["expectancy"] is None
+        assert stats["average_winner"] is None
+        assert stats["average_holding_minutes"] is None
+        assert stats["median_holding_minutes"] is None
+        assert stats["risk_utilization_percent_mean"] is None
+        assert stats["capital_utilization_percent_mean"] is None
+        assert stats["initial_risk_total"] is None
+        assert stats["r_multiple_mean"] is None
+        assert rep["promotion_verdict"] == PROMOTION_INSUFFICIENT
+
+    def test_the_verdict_flips_only_past_the_sample_floor(self):
+        rows, signals, geo = _closed_trade_rows()
+        from app.services.trade_measurement import MIN_TRADES_FOR_CONCLUSION
+        n = MIN_TRADES_FOR_CONCLUSION
+        # Distinct position_ids, or the extra rows collapse into the first
+        # position instead of adding trades.
+        geo = dict(geo)
+        for i in range(n - 2):
+            pid = f"pos{i:014d}"
+            rows.append(dict(
+                rows[0], id=f"trd{i:014d}", pnl=1.0,
+                details_json=json.dumps({
+                    "exit_reason": "T2_FINAL", "position_id": pid,
+                    "initial_quantity": 95, "exit_quantity": 95,
+                    "quantity_source": "RISK_ENGINE"})))
+            geo[pid] = dict(geo["pos000000000001"], position_id=pid)
+        rep = build_measurement_report(rows, signals, geo)
+        assert rep["capture"]["properly_captured"] == n
+        assert rep["performance"]["strategy_cohort"]["total_completed_trades"] == n
+        assert rep["promotion_verdict"] == PROMOTION_SUFFICIENT
+
+    def test_the_report_is_read_only(self):
+        """Nothing it returns points back into a mutable input."""
+        rows, signals, geo = _closed_trade_rows()
+        before = json.dumps([rows, signals, geo], sort_keys=True, default=str)
+        build_measurement_report(rows, signals, geo)
+        after = json.dumps([rows, signals, geo], sort_keys=True, default=str)
+        assert before == after
+
+
+class TestMeasurementThroughTheApi:
+    """The endpoint is read-only, scoped to one user, and needs auth."""
+
+    @pytest.fixture()
+    def env(self, tmp_path, monkeypatch):
+        from fastapi.testclient import TestClient
+        from app.api import trading
+        from app.api.auth import create_token
+        from app.core.database import Base, get_db
+        from app.main import app
+        from app.models.models import User
+        import app.core.database as database_mod
+        from sqlalchemy import create_engine
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.orm import Session as SyncSession
+
+        user_id, email = "measure-user", "measure@test.local"
+        db_file = tmp_path / "measure_api.db"
+        sync_engine = create_engine(f"sqlite:///{db_file.as_posix()}")
+        Base.metadata.create_all(sync_engine)
+        with SyncSession(sync_engine) as s:
+            s.add(User(id=user_id, email=email, name="Measure"))
+            s.commit()
+        sync_engine.dispose()
+
+        async_engine = create_async_engine(f"sqlite+aiosqlite:///{db_file.as_posix()}")
+        Session = async_sessionmaker(async_engine, expire_on_commit=False)
+
+        async def _override_get_db():
+            async with Session() as session:
+                yield session
+
+        app.dependency_overrides[get_db] = _override_get_db
+        monkeypatch.setattr(database_mod, "async_session", Session)
+
+        # Geometry lives in the paper engine's SQLite file, NOT the SQLAlchemy
+        # one, so point the loader at the same temp directory.
+        from app.services.paper_trading import PaperTradingEngine
+        geom_db = tmp_path / "measure.db"
+        PaperTradingEngine(db_path=str(geom_db))
+        monkeypatch.setattr(
+            trading, "load_geometry_for_user",
+            lambda uid: load_all_geometry(db_path=str(geom_db)))
+        yield {
+            "client": TestClient(app),
+            "headers": {"Authorization": f"Bearer {create_token(user_id, email)}"},
+            "geom_db": geom_db,
+            "api_db": db_file,
+        }
+        app.dependency_overrides.clear()
+
+    def test_it_requires_authentication(self, env):
+        assert env["client"].get("/api/paper/trades/measurement").status_code == 401
+
+    def test_an_empty_ledger_returns_a_read_only_report(self, env):
+        r = env["client"].get("/api/paper/trades/measurement", headers=env["headers"])
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["read_only"] is True
+        assert body["kind"] == "REALIZED"
+        assert body["capture"]["properly_captured"] == 0
+        assert body["trades"] == []
+
+    def test_it_creates_no_rows_of_its_own(self, env):
+        import sqlite3
+        before = _table_counts(env["api_db"])
+        r = env["client"].get("/api/paper/trades/measurement", headers=env["headers"])
+        assert r.status_code == 200
+        assert _table_counts(env["api_db"]) == before
+
+
+def _table_counts(db_file):
+    import sqlite3
+    conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        names = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")]
+        return {n: conn.execute(f"SELECT COUNT(*) FROM {n}").fetchone()[0]
+                for n in names}
+    finally:
+        conn.close()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# G. Safety
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TestMeasurementSafety:
+    """G: production data is never written, fabricated or rewritten."""
+
+    @pytest.fixture()
+    def live_db(self):
+        from app.core.config import settings
+        url = str(getattr(settings, "DATABASE_URL", "") or "")
+        for prefix in ("sqlite+aiosqlite:///", "sqlite:///"):
+            if url.startswith(prefix):
+                url = url[len(prefix):]
+                break
+        else:
+            url = url[len("sqlite://"):] if url.startswith("sqlite://") else ""
+        path = url or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "intradayai.db")
+        if not os.path.exists(path):
+            pytest.skip("production ledger not present")
+        return path
+
+    def test_the_measurement_module_opens_no_database(self, monkeypatch):
+        """It is a pure function of rows handed to it."""
+        import sqlite3
+
+        def _forbidden(*a, **k):
+            raise AssertionError("the measurement module must not touch a DB")
+
+        monkeypatch.setattr(sqlite3, "connect", _forbidden)
+        rep = build_measurement_report(*_closed_trade_rows())
+        assert rep["capture"]["properly_captured"] == 2
+
+    def test_no_test_symbol_exists_in_the_production_ledger(self, live_db):
+        """This block's fixtures must never have reached live data."""
+        import sqlite3
+        conn = sqlite3.connect(f"file:{live_db}?mode=ro", uri=True, timeout=10)
+        try:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            for sym in _TEST_SYMBOLS:
+                for table in ("trades", "paper_positions",
+                              "paper_pending_orders", "position_risk_geometry"):
+                    if table not in tables:
+                        continue
+                    n = conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE symbol = ?",
+                        (sym,)).fetchone()[0]
+                    assert n == 0, f"{sym} leaked into {table}"
+        finally:
+            conn.close()
+
+    def test_the_historical_promotion_decision_is_untouched(self):
+        """Section 10: promotion stays blocked. This phase added a report, not
+        evidence, so the gate is exactly where it was: 29 real trades cannot
+        reach ENFORCE, and the sample the live ledger actually has cannot
+        either."""
+        from app.services.profit_selection import PromotionNotAllowed, assert_promotable
+        with pytest.raises(PromotionNotAllowed):
+            assert_promotable(29, 30)
+        with pytest.raises(PromotionNotAllowed):
+            assert_promotable(0, 30)          # the live ledger's real sample
+        assert_promotable(30, 30) is None    # the gate itself still works
+
+    def test_the_report_cannot_promote_anything(self):
+        """The measurement phase is measurement only: even a large sample does
+        not flip the promotion flag, it only reports a verdict string."""
+        rep = build_measurement_report(*_closed_trade_rows())
+        assert "promotable" not in rep
+        assert rep["promotion_verdict"] in (
+            PROMOTION_SUFFICIENT, PROMOTION_INSUFFICIENT)
+        assert rep["read_only"] is True
+
+    def test_the_strategy_parameters_are_still_untouched(self):
+        """Belt and braces: this phase added sizing defaults and a report, and
+        moved no strategy knob."""
+        from app.services.risk_engine import RiskConfig
+        c = RiskConfig()
+        assert c.max_risk_per_trade_pct == 2.0
+        assert c.base_risk_per_trade_pct == 2.0
+        assert c.max_daily_loss_pct == 5.0
+        assert c.max_trades_per_day == 10
+        assert c.max_simultaneous_positions == 10
+        assert c.min_risk_reward == 1.2
+        assert c.cooldown_after_losses == 3
+
+    def test_the_measurement_module_is_not_imported_by_the_order_path(self):
+        """The order endpoint must stay free of reporting concerns."""
+        import inspect
+
+        from app.api import trading
+        src = inspect.getsource(trading.place_paper_order)
+        assert "trade_measurement" not in src
+        assert "build_measurement_report" not in src
