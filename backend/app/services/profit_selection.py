@@ -275,6 +275,24 @@ def _minutes_into_session(entry_time: Any) -> Optional[int]:
     return dt.hour * 60 + dt.minute
 
 
+def _score_total(signal: dict) -> Optional[float]:
+    """Extract the SCALAR total score from ``signal['signal_score']``.
+
+    ``evaluate_signal`` returns ``signal_score`` as a ``SignalScore`` dump, i.e.
+    a nested dict (``{"total": .., "trend": .., ...}``) — NOT a float. Passing
+    that dict straight through a finite-coercion yields ``None``, which the
+    shadow ledger would persist as ``0.0``. That silently destroys the score
+    dimension of the measurement instrument (every row would read score=0), so
+    the scalar has to be unwrapped explicitly.
+
+    A bare float is still accepted (callers/tests may pass a flattened signal).
+    """
+    score = signal.get("signal_score")
+    if isinstance(score, dict):
+        return _finite(score.get("total"))
+    return _finite(score)
+
+
 def _setup_of(signal: dict) -> dict:
     """The engine nests entry/stop/targets/ATR inside ``signal['setup']``
     (a TradeSetup model or an already-dumped dict). Accept either, and also
@@ -319,7 +337,7 @@ def evaluate_selection(
         atr_pct = atr / entry * 100.0
 
     observed: dict[str, Optional[float]] = {
-        "signal_score": _finite(signal.get("signal_score")),
+        "signal_score": _score_total(signal),
         "confidence": _finite(signal.get("confidence")),
         "setup_quality_score": _finite(signal.get("setup_quality_score")),
         "adx": _finite(ind.get("adx_14")),
@@ -466,7 +484,7 @@ def shadow_record(
         "symbol": signal.get("symbol"),
         "timestamp": signal.get("timestamp"),
         "direction": signal.get("direction"),
-        "signal_score": _finite(signal.get("signal_score")),
+        "signal_score": _score_total(signal),
         "confidence": _finite(signal.get("confidence")),
         "setup_quality": signal.get("signal_quality"),
         "setup_quality_score": _finite(signal.get("setup_quality_score")),

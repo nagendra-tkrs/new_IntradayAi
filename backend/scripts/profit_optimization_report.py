@@ -19,6 +19,9 @@ Sections
    configuration, under BOTH intrabar assumptions.
 6. PROMOTION GATE - why each candidate stays CANDIDATE.
 7. SHADOW LEDGER - what the Profit Selection Layer has been recording.
+8. RISK-BUDGET UTILIZATION - which bound actually set each position's size, the
+   utilization of the configured 2% budget, and a SHADOW (never promoted)
+   comparison of current sizing against risk-budget-driven sizing.
 
 Every candidate table is labelled SIMULATED. Realized and simulated numbers are
 never placed in the same column, and no simulated figure is ever described as
@@ -51,6 +54,12 @@ from app.services.profit_baseline import (  # noqa: E402
 from app.services.trade_replay import (  # noqa: E402
     INTRABAR_CLOSE_ONLY, INTRABAR_PESSIMISTIC, Bar,
 )
+
+# The moment ``_run_profit_selection`` began deriving ``baseline_decision``
+# from the signal direction instead of hardcoding "TRADE". Shadow rows with an
+# earlier ``generated_at`` carry the old, mislabelled baseline and are excluded
+# from the candidate-vs-baseline comparison (never deleted or rewritten).
+BASELINE_DECISION_FIXED_AT = "2026-09-30T14:36:00"
 
 RULE = "=" * 100
 THIN = "-" * 100
@@ -263,6 +272,7 @@ def main() -> int:
     }
 
     if args.no_bars:
+        _print_sizing(positions, payload)
         _print_verdict(base)
         if args.json_out:
             _dump(payload, args.json_out)
@@ -379,29 +389,172 @@ def main() -> int:
     if shadow_rows:
         from collections import Counter
 
+        # Rows written before this timestamp were persisted with a hardcoded
+        # baseline_decision="TRADE", which mislabels every NO_TRADE signal as a
+        # baseline agreement on a trade that never happened. The rows are LEFT
+        # IN PLACE (the shadow ledger is append-only audit evidence and is never
+        # rewritten), but they are excluded from the candidate-vs-baseline
+        # comparison so no conclusion is drawn from known-wrong labels.
+        legacy = [r for r in shadow_rows
+                  if str(r.get("generated_at") or "") < BASELINE_DECISION_FIXED_AT]
+        current = [r for r in shadow_rows
+                   if str(r.get("generated_at") or "") >= BASELINE_DECISION_FIXED_AT]
+
         print(f"  candidate decisions : "
-              f"{dict(Counter(r.get('candidate_decision') for r in shadow_rows))}")
+              f"{dict(Counter(r.get('candidate_decision') for r in current))}")
         print(f"  baseline decisions  : "
-              f"{dict(Counter(r.get('baseline_decision') for r in shadow_rows))}")
-        disagree = [r for r in shadow_rows
+              f"{dict(Counter(r.get('baseline_decision') for r in current))}")
+        eligible = [r for r in current
+                    if str(r.get("direction") or "").upper() not in
+                    ("", "NO_TRADE", "NONE")]
+        print(f"  eligible signals (actionable direction): {len(eligible)}")
+        print(f"  NO_TRADE rows recorded (never tradable) : "
+              f"{len(current) - len(eligible)}")
+        scored = [r for r in eligible if r.get("signal_score") is not None]
+        print(f"  eligible rows carrying a signal score  : {len(scored)}"
+              f"   (NULL means the score was unavailable, not zero)")
+        disagree = [r for r in eligible
                     if r.get("candidate_decision") != r.get("baseline_decision")]
-        print(f"  rows where the layer would have differed: {len(disagree)}")
-        applied = [r for r in shadow_rows if r.get("applied_to_production")]
+        print(f"  eligible rows where the layer would have differed: {len(disagree)}")
+        applied = [r for r in current if r.get("applied_to_production")]
         print(f"  rows that were APPLIED to production: {len(applied)}"
               f"   (must be 0 in SHADOW mode)")
-        resolved = [r for r in shadow_rows if r.get("outcome")]
+        resolved = [r for r in current if r.get("outcome")]
         print(f"  rows with a realized outcome attached: {len(resolved)}")
+        if legacy:
+            print()
+            print(f"  NOTE: {len(legacy)} earlier rows predate the "
+                  f"baseline_decision fix ({BASELINE_DECISION_FIXED_AT}) and are")
+            print("  EXCLUDED from the comparison above. They are retained, not "
+                  "rewritten.")
     else:
         print("  no shadow rows yet - the layer records on the next scan")
     payload["shadow"] = {
         "mode": getattr(settings, "PROFIT_SELECTION_MODE", "SHADOW"),
         "rows": len(shadow_rows),
+        "eligible": len([r for r in shadow_rows
+                         if str(r.get("generated_at") or "") >= BASELINE_DECISION_FIXED_AT
+                         and str(r.get("direction") or "").upper() not in
+                         ("", "NO_TRADE", "NONE")]),
+        "legacy_rows_excluded": len([r for r in shadow_rows
+                                     if str(r.get("generated_at") or "")
+                                     < BASELINE_DECISION_FIXED_AT]),
+        "applied_to_production": len([r for r in shadow_rows
+                                      if r.get("applied_to_production")]),
     }
+
+    # ---------------------------------------------------------------- 8
+    _print_sizing(positions, payload)
 
     _print_verdict(base)
     if args.json_out:
         _dump(payload, args.json_out)
     return 0
+
+
+def _print_sizing(real_positions, payload: dict) -> None:
+    """Section 8: risk-budget utilization and the SHADOW sizing comparison."""
+    from app.services.position_sizing import sizing_report
+
+    print()
+    print(RULE)
+    print("8. RISK-BUDGET UTILIZATION  (measurement only - sizing is unchanged)")
+    print(RULE)
+
+    # Test-fixture rows (sub-second API smoke tests) are excluded, matching
+    # section 1's strategy cohort, so the two sections always agree on which
+    # positions are real.
+    real = [
+        p for p in (real_positions or [])
+        if p.cohort() in (COHORT_AI_LINKED, COHORT_STRATEGY_UNLINKED)
+    ]
+    if not real:
+        print("  no real positions available")
+        return
+
+    sizing = sizing_report(
+        real,
+        account_capital=float(getattr(settings, "INITIAL_CAPITAL", 10_000.0)),
+        risk_pct=float(getattr(settings, "MAX_RISK_PER_TRADE_PCT", 2.0)),
+    )
+    payload["sizing"] = sizing
+
+    def n(x, d=2):
+        return "-" if x is None else f"{x:.{d}f}"
+
+    print(f"  configured risk budget   : Rs {sizing['risk_budget']:.2f}"
+          f"  ({sizing['risk_pct']}% of Rs {sizing['account_capital']:.0f})")
+    print(f"  positions analysed       : {sizing['positions_usable']}"
+          f"  (of {sizing['positions_total']} real)")
+    print()
+    print("  HOW EACH POSITION GOT ITS SIZE")
+    print(f"    via RiskEngine.calculate_position_size : "
+          f"{sizing['via_risk_engine_formula']}")
+    print(f"    via a caller-supplied quantity         : "
+          f"{sizing['via_explicit_quantity']}"
+          f"   ({n(sizing['explicit_quantity_pct'], 1)}%)")
+    print()
+    print("  WHICH BOUND BINDS WHEN THE FORMULA RAN")
+    print(f"    capital / affordability cap : "
+          f"{sizing['capital_constrained']}"
+          f"   ({n(sizing['capital_constrained_pct'], 1)}% of all, "
+          f"{n(sizing['capital_constrained_pct_of_formula'], 1)}% of formula-sized)")
+    print(f"    risk budget                 : {sizing['risk_constrained']}")
+    print()
+    print("  RISK ACTUALLY CARRIED")
+    print(f"    mean intended risk          : Rs {n(sizing['mean_intended_risk'])}")
+    print(f"    mean actual risk            : Rs {n(sizing['mean_actual_risk'])}")
+    print(f"    mean budget utilization     : {n(sizing['mean_utilization_percent'])}%")
+    print(f"    mean formula utilization    : "
+          f"{n(sizing['mean_budget_utilization_percent'])}%")
+    rel, un = sizing["reliable_only"], sizing["unreliable_geometry_only"]
+    print()
+    print("  GEOMETRY PROVENANCE  (the two must not be read as one number)")
+    print(f"    exact (entry-time signal stop) : n={rel['n']}"
+          f"  mean actual risk Rs {n(rel['mean_actual_risk'])}"
+          f"  util {n(rel['mean_utilization_percent'])}%")
+    print(f"    ESTIMATE (trailed ledger stop) : n={un['n']}"
+          f"  mean actual risk Rs {n(un['mean_actual_risk'])}"
+          f"  util {n(un['mean_utilization_percent'])}%")
+    print("    an unlinked position has no signal row, so its stop is read from a")
+    print("    closed ledger row that Profit Capture may already have moved to")
+    print("    breakeven. Those rupee-risk figures are indicative, not exact.")
+    print()
+    print("  PER POSITION")
+    hdr = (f"    {'symbol':<11} {'entry':>9} {'rps':>7} {'riskQ':>6} {'capQ':>6} "
+           f"{'formQ':>6} {'actQ':>6} {'actRisk':>8} {'intRisk':>8} {'util%':>7}  path")
+    print(hdr)
+    print("    " + "-" * (len(hdr) - 4))
+    for b in sizing["breakdowns"]:
+        print(f"    {b['symbol'][:11]:<11} {b['entry_price']:>9.2f} "
+              f"{(b['risk_per_share'] or 0):>7.2f} "
+              f"{b['risk_based_quantity']:>6} {b['capital_based_quantity']:>6} "
+              f"{b['formula_quantity']:>6} {str(b['actual_quantity']):>6} "
+              f"{n(b['actual_rupee_risk']):>8} {n(b['intended_rupee_risk']):>8} "
+              f"{n(b['utilization_percent'], 2):>7}  {b['sizing_path']}")
+
+    sh = sizing["shadow"]
+    print()
+    print(RULE)
+    print("  SHADOW COMPARISON - CURRENT SIZING vs RISK-BUDGET-DRIVEN SIZING")
+    print(RULE)
+    print(f"  {sh['label']}")
+    print(f"  {sh['note']}")
+    print(f"    positions compared           : {sh['positions_compared']}"
+          f"   (of {sizing['positions_usable']} usable; baseline and shadow P&L"
+          f" below cover these only)")
+    print(f"    mean quantity multiple      : {n(sh['mean_quantity_multiple'])}x")
+    print(f"    mean exposure multiple      : {n(sh['mean_exposure_multiple'])}x")
+    print(f"    mean SHADOW rupee risk      : Rs {n(sh['mean_shadow_rupee_risk'])}")
+    print(f"    mean SHADOW utilization     : "
+          f"{n(sh['mean_shadow_utilization_percent'])}%")
+    print(f"    realized P&L (as traded)    : Rs {sh['baseline_pnl']:.2f}")
+    print(f"    SHADOW P&L (hypothetical)   : Rs {sh['shadow_pnl']:.2f}")
+    print(f"    SHADOW delta                : Rs {sh['shadow_pnl_delta']:.2f}")
+    print()
+    print(f"  NOT PROMOTED: {sh['reason']}")
+    print("  Sizing is a risk-INCREASING change. The real ledger is untouched and")
+    print("  no shadow figure above is recorded as realized P&L.")
 
 
 def _print_verdict(base: dict) -> None:

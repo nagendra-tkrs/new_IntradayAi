@@ -32,6 +32,7 @@ import os
 import sqlite3
 import sys
 from datetime import datetime, time, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -51,6 +52,14 @@ from app.services.profit_baseline import (  # noqa: E402
     profit_factor,
 )
 from app.services.profit_capture import TRAILING_RANGE  # noqa: E402
+from app.services.position_sizing import (  # noqa: E402
+    BINDING_CAPITAL, BINDING_EXPLICIT, BINDING_RISK_BUDGET, BINDING_TIE,
+    PATH_EXPLICIT, PATH_FORMULA, PATH_UNAVAILABLE, STOP_SOURCE_LEDGER_TRAILED,
+    BINDING_UNAVAILABLE,
+    STOP_SOURCE_SIGNAL, capital_based_quantity, production_quantity,
+    risk_based_quantity, risk_budget_for, shadow_sizing_comparison,
+    sizing_breakdown, sizing_report,
+)
 from app.services.profit_selection import (  # noqa: E402
     DECISION_SKIP, DECISION_TRADE, PromotionNotAllowed, Rule, RuleOutcome,
     SelectionConfig, ShadowMode, assert_promotable, evaluate_selection,
@@ -72,6 +81,16 @@ from app.services.trade_replay import (  # noqa: E402
 
 # Bars that must exist strictly BEFORE an entry for ATR-14 to be derivable.
 ATR_BARS_BEFORE = 18
+
+
+def _decision():
+    """A minimal SHADOW-mode TRADE decision, for tests that only need a
+    well-formed decision object to serialise."""
+    return evaluate_selection(
+        {"symbol": "SAIL", "direction": "LONG", "confidence": 0.5,
+         "signal_score": {"total": 50.0}, "setup": {}},
+        config=SelectionConfig(),
+    )
 
 
 def _row(**kw) -> dict:
@@ -1636,3 +1655,557 @@ class TestExactStatistics:
 
     def test_permutation_needs_data_on_both_sides(self):
         assert permutation_expectancy_p([], [1.0]) is None
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# R. Position sizing / risk-budget utilization
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _sized_position(**kw) -> "object":
+    """A collapsed Position with an entry-time signal row attached.
+
+    Defaults describe the live failure mode: a UI-placed order that supplied
+    its own quantity, so the risk-engine formula never ran.
+    """
+    signal = {
+        "id": "sig1",
+        "symbol": kw.pop("symbol", "SAIL"),
+        "entry_price": 185.70,
+        "stop_loss": 185.05,          # 0.65/share = 1.5 x ATR 0.43
+        "atr": 0.43,
+        "quantity": 51.0,
+        "risk_amount": 33.15,
+        "risk_percent": 0.3315,
+        "signal_quality": "QUALIFIED",
+    }
+    # `signal=None` models an UNLINKED position: no signals row exists at all.
+    override = kw.pop("signal", ...)
+    if override is None:
+        signal = None
+    elif override is not ...:
+        signal.update(override)
+    pos = SimpleNamespace(
+        position_id=kw.pop("position_id", "pos1"),
+        symbol=kw.pop("symbol", "SAIL"),
+        direction=kw.pop("direction", "LONG"),
+        entry_price=kw.pop("entry_price", 185.70),
+        stop_loss=kw.pop("stop_loss", 185.05),
+        target_1=kw.pop("target_1", 186.65),
+        target_2=kw.pop("target_2", 187.30),
+        pnl=kw.pop("pnl", 33.15),
+        quantity=kw.pop("quantity", 51.0),
+        initial_quantity=kw.pop("initial_quantity", 51.0),
+        atr=kw.pop("atr", 0.43),
+        signal=signal,
+    )
+    for k, v in kw.items():
+        setattr(pos, k, v)
+    return pos
+
+
+class TestPositionSizeCalculation:
+    """The sizing arithmetic must mirror ``RiskEngine.calculate_position_size``."""
+
+    def test_risk_budget_is_two_percent_of_capital(self):
+        assert risk_budget_for(10_000.0, 2.0) == pytest.approx(200.0)
+        assert risk_budget_for(100_000.0, 2.0) == pytest.approx(2_000.0)
+
+    def test_risk_based_quantity_divides_budget_by_risk_per_share(self):
+        assert risk_based_quantity(200.0, 0.65) == 307
+        assert risk_based_quantity(200.0, 5.71) == 35
+
+    def test_capital_based_quantity_uses_the_95_percent_headroom(self):
+        # 0.95 * 10,000 / 185.70 = 51.16 -> 51
+        assert capital_based_quantity(10_000.0, 185.70) == 51
+        assert capital_based_quantity(10_000.0, 777.85) == 12
+
+    def test_production_quantity_is_the_minimum_of_both_bounds(self):
+        assert production_quantity(185.70, 185.05, 10_000.0, 2.0) == 51
+
+    def test_production_quantity_matches_the_live_engine_exactly(self):
+        """The measurement must never disagree with production."""
+        from app.services.risk_engine import RiskEngine
+
+        engine = RiskEngine()
+        for entry, stop in ((185.70, 185.05), (777.85, 783.56), (414.10, 412.59),
+                            (179.48, 180.32), (10.0, 9.9), (10.0, 10.1)):
+            assert production_quantity(entry, stop, 10_000.0, 2.0) == \
+                engine.calculate_position_size(entry, stop, "QUALIFIED", "LONG")
+
+    def test_zero_or_negative_risk_pct_yields_no_position(self):
+        assert production_quantity(100.0, 99.0, 10_000.0, 0.0) == 0
+        assert production_quantity(100.0, 99.0, 10_000.0, -1.0) == 0
+
+    def test_a_zero_width_stop_yields_no_position(self):
+        assert production_quantity(100.0, 100.0, 10_000.0, 2.0) == 0
+
+    def test_a_wider_stop_raises_rupee_risk_not_lowers_it(self):
+        """Documented, measured behaviour at the live capital level.
+
+        Because the cash cap binds, the share count barely moves as the stop
+        widens, so rupee risk per trade RISES. This is reported, never fixed:
+        raising risk is out of scope for the optimization program.
+        """
+        narrow = sizing_breakdown(
+            _sized_position(entry_price=100.0, stop_loss=99.0,
+                            signal={"stop_loss": 99.0, "quantity": 9.0}),
+            10_000.0, 2.0)
+        wide = sizing_breakdown(
+            _sized_position(entry_price=100.0, stop_loss=98.0,
+                            signal={"stop_loss": 98.0, "quantity": 9.0}),
+            10_000.0, 2.0)
+        assert wide.actual_rupee_risk > narrow.actual_rupee_risk
+
+
+class TestCapitalConstraint:
+
+    def test_capital_binds_when_cash_cap_is_tighter(self):
+        bd = sizing_breakdown(_sized_position(), 10_000.0, 2.0)
+        assert bd.capital_based_quantity < bd.risk_based_quantity
+        assert bd.binding == BINDING_CAPITAL
+        assert bd.capital_constrained is True
+
+    def test_capital_never_binds_on_a_very_wide_stop(self):
+        """With a wide enough stop the risk budget is the tighter bound."""
+        pos = _sized_position(entry_price=100.0, stop_loss=50.0,
+                              signal={"stop_loss": 50.0, "quantity": 4.0})
+        bd = sizing_breakdown(pos, 10_000.0, 2.0)
+        assert bd.risk_based_quantity < bd.capital_based_quantity
+        assert bd.binding == BINDING_RISK_BUDGET
+        assert bd.capital_constrained is False
+
+    def test_identical_bounds_report_a_tie(self):
+        # capital_qty = int(0.95 * 10,000 / 100) = 95.
+        # risk_qty    = int(200 / 2.10)        = 95. Both bounds land on 95.
+        pos = _sized_position(entry_price=100.0, stop_loss=97.90,
+                              signal={"stop_loss": 97.90, "quantity": 95.0})
+        bd = sizing_breakdown(pos, 10_000.0, 2.0)
+        assert bd.risk_based_quantity == bd.capital_based_quantity == 95
+        assert bd.binding == BINDING_TIE
+        assert bd.sizing_path == PATH_FORMULA
+
+    def test_a_quantity_that_ignores_both_bounds_is_explicit(self):
+        """A UI-supplied quantity bypasses BOTH caps - in either direction."""
+        under = sizing_breakdown(
+            _sized_position(signal={"quantity": 5.0}), 10_000.0, 2.0)
+        assert under.binding == BINDING_EXPLICIT
+        assert under.sizing_path == PATH_EXPLICIT
+
+        over = sizing_breakdown(
+            _sized_position(signal={"quantity": 10_000.0}), 10_000.0, 2.0)
+        assert over.binding == BINDING_EXPLICIT, (
+            "an oversized fill must not be reported as if a cap governed it"
+        )
+
+
+class TestRiskUtilization:
+
+    def test_actual_risk_is_quantity_times_risk_per_share(self):
+        bd = sizing_breakdown(_sized_position(), 10_000.0, 2.0)
+        assert bd.actual_rupee_risk == pytest.approx(51.0 * 0.65)
+
+    def test_utilization_is_actual_risk_over_the_budget(self):
+        bd = sizing_breakdown(_sized_position(), 10_000.0, 2.0)
+        assert bd.utilization_percent == pytest.approx(
+            bd.actual_rupee_risk / bd.risk_budget * 100.0)
+
+    def test_utilization_never_exceeds_one_hundred_percent(self):
+        for qty in (1.0, 5.0, 51.0, 95.0):
+            bd = sizing_breakdown(
+                _sized_position(signal={"quantity": qty}), 10_000.0, 2.0)
+            if bd.actual_rupee_risk is not None:
+                assert bd.utilization_percent <= 100.0 + 1e-9
+
+    def test_intended_risk_is_capped_at_the_budget(self):
+        bd = sizing_breakdown(_sized_position(signal={"quantity": 51.0}),
+                              10_000.0, 2.0)
+        assert bd.intended_rupee_risk <= bd.risk_budget
+
+    def test_a_breakeven_stop_is_reported_unusable_not_as_zero_risk(self):
+        """Profit Capture rewrites the stop to entry after T1. A ledger stop
+        equal to entry carries NO risk information and must not be turned into
+        a confident 'zero risk' reading."""
+        pos = _sized_position(stop_loss=185.70, signal={"stop_loss": None})
+        bd = sizing_breakdown(pos, 10_000.0, 2.0)
+        assert bd.risk_per_share is None
+        assert bd.usable is False
+        assert bd.actual_rupee_risk is None
+        assert bd.utilization_percent is None
+
+    def test_the_entry_time_signal_stop_wins_over_a_trailed_ledger_stop(self):
+        pos = _sized_position(stop_loss=185.70,            # trailed to breakeven
+                              signal={"stop_loss": 185.05})  # original
+        bd = sizing_breakdown(pos, 10_000.0, 2.0)
+        assert bd.risk_per_share == pytest.approx(0.65)
+        assert bd.stop_source == STOP_SOURCE_SIGNAL
+        assert bd.geometry_reliable is True
+
+    def test_a_ledger_only_stop_is_flagged_unreliable(self):
+        pos = _sized_position(stop_loss=184.40, signal=None)
+        bd = sizing_breakdown(pos, 10_000.0, 2.0)
+        assert bd.stop_source == STOP_SOURCE_LEDGER_TRAILED
+        assert bd.geometry_reliable is False
+
+    def test_malformed_numbers_degrade_to_unknown(self):
+        for bad in (None, float("nan"), float("inf"), "abc", True, {}):
+            bd = sizing_breakdown(
+                _sized_position(signal={"quantity": bad}), 10_000.0, 2.0)
+            assert bd.actual_rupee_risk is None or bd.actual_rupee_risk >= 0
+
+    def test_unusable_geometry_is_not_reported_as_a_bound_having_bound(self):
+        """TITAN/LTF carry a breakeven stop, so risk_qty is 0. 'RISK_BUDGET
+        bound' would read as though the 2% budget governed the size when in
+        fact nothing sized the position at all."""
+        pos = _sized_position(entry_price=100.0, stop_loss=100.0,
+                              signal={"stop_loss": None, "quantity": 1.0})
+        bd = sizing_breakdown(pos, 10_000.0, 2.0)
+        assert bd.binding == BINDING_UNAVAILABLE
+        assert bd.sizing_path == PATH_UNAVAILABLE
+        assert bd.usable is False
+
+
+class TestSizingShadowIsolation:
+    """The counterfactual is a SHADOW measurement and nothing else."""
+
+    def test_shadow_is_labelled_hypothetical(self):
+        cmp = shadow_sizing_comparison(_sized_position())
+        assert "SHADOW" in cmp.labelled
+        assert "NOT REALIZED" in cmp.labelled
+        assert cmp.to_dict()["label"] == cmp.labelled
+
+    def test_shadow_sizing_uses_the_risk_budget_alone(self):
+        cmp = shadow_sizing_comparison(_sized_position())
+        assert cmp.shadow_quantity == risk_based_quantity(200.0, 0.65) == 307
+
+    def test_shadow_can_only_raise_exposure_never_lower_it(self):
+        for qty in (1.0, 5.0, 51.0):
+            cmp = shadow_sizing_comparison(
+                _sized_position(signal={"quantity": qty}))
+            assert cmp.shadow_quantity >= cmp.baseline_quantity
+
+    def test_shadow_pnl_is_the_realized_pnl_scaled_by_the_multiple(self):
+        cmp = shadow_sizing_comparison(_sized_position(pnl=33.15))
+        assert cmp.quantity_multiple == pytest.approx(307 / 51.0)
+        assert cmp.shadow_pnl == pytest.approx(33.15 * (307 / 51.0))
+        assert cmp.shadow_pnl_delta == pytest.approx(cmp.shadow_pnl - 33.15)
+
+    def test_a_losing_trade_scales_to_a_larger_loss(self):
+        cmp = shadow_sizing_comparison(_sized_position(pnl=-30.0))
+        assert cmp.shadow_pnl < 0
+        assert cmp.shadow_pnl < cmp.realized_pnl, (
+            "more exposure on a loser must be a bigger loss, not a smaller one"
+        )
+
+    def test_shadow_report_is_never_marked_promotable(self):
+        report = sizing_report([_sized_position()])
+        assert report["shadow"]["promotable"] is False
+        assert "measurement only" in report["shadow"]["reason"].lower()
+
+    def test_shadow_uses_no_exit_information(self):
+        """Behavioural no-lookahead check: the counterfactual is computed from
+        entry-time inputs only, so perturbing every exit-time field must not
+        move it."""
+        base = shadow_sizing_comparison(_sized_position(pnl=33.15))
+        perturbed = shadow_sizing_comparison(_sized_position(
+            pnl=33.15,
+            exit_price=999.0,
+            exit_time=datetime(2030, 1, 1, 15, 30),
+            target_1=1.0,
+            target_2=2.0,
+            stop_loss=1.0,
+        ))
+        assert perturbed.shadow_quantity == base.shadow_quantity
+        assert perturbed.quantity_multiple == pytest.approx(base.quantity_multiple)
+        assert perturbed.shadow_pnl == pytest.approx(base.shadow_pnl)
+
+
+class TestSizingReport:
+    """Aggregate utilization reporting."""
+
+    def test_report_counts_both_sizing_paths(self):
+        report = sizing_report([
+            _sized_position(signal={"quantity": 51.0}),   # matches formula
+            _sized_position(signal={"quantity": 5.0}),    # explicit
+        ])
+        assert report["positions_usable"] == 2
+        assert report["via_risk_engine_formula"] == 1
+        assert report["via_explicit_quantity"] == 1
+
+    def test_report_pct_of_formula_is_separate_from_pct_of_all(self):
+        report = sizing_report([
+            _sized_position(signal={"quantity": 51.0}),
+            _sized_position(signal={"quantity": 51.0}),
+            _sized_position(signal={"quantity": 5.0}),
+        ])
+        assert report["capital_constrained"] == 2
+        assert report["capital_constrained_pct"] == pytest.approx(66.67, abs=0.01)
+        assert report["capital_constrained_pct_of_formula"] == pytest.approx(100.0)
+
+    def test_report_means_ignore_unusable_positions(self):
+        report = sizing_report([
+            _sized_position(signal={"quantity": 51.0}),
+            _sized_position(stop_loss=185.70, signal={"stop_loss": None}),
+        ])
+        assert report["positions_total"] == 2
+        assert report["positions_usable"] == 1
+        assert report["mean_actual_risk"] == pytest.approx(51.0 * 0.65)
+
+    def test_empty_report_does_not_divide_by_zero(self):
+        report = sizing_report([])
+        assert report["positions_usable"] == 0
+        assert report["capital_constrained_pct"] is None
+        assert report["mean_actual_risk"] is None
+        assert report["verdict"] == INSUFFICIENT_PROMOTION
+
+    def test_small_sample_is_flagged_insufficient(self):
+        report = sizing_report([_sized_position()])
+        assert report["verdict"] == INSUFFICIENT_PROMOTION
+
+
+class TestSizingDoesNotMutateHistory:
+    """No analysis path may rewrite a historical row."""
+
+    def test_sizing_analysis_leaves_the_live_ledger_byte_identical(self):
+        import shutil
+        import tempfile
+
+        src = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "intradayai.db")
+        if not os.path.exists(src):
+            pytest.skip("no live ledger present in this environment")
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "intradayai.db")
+            shutil.copy2(src, work)
+            before = open(work, "rb").read()
+            conn = sqlite3.connect(f"file:{work}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            rows = [dict(r) for r in conn.execute("SELECT * FROM trades")]
+            signals = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM signals")}
+            conn.close()
+            positions = collapse_positions(rows, signals)
+            sizing_report(positions)
+            for pos in positions:
+                shadow_sizing_comparison(pos)
+            conn = sqlite3.connect(f"file:{work}?mode=ro", uri=True)
+            after_rows = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            after_sum = conn.execute(
+                "SELECT COALESCE(SUM(COALESCE(pnl,0)),0) FROM trades").fetchone()[0]
+            conn.close()
+            assert open(work, "rb").read() == before, "the DB file was modified"
+            assert after_rows == len(rows)
+            assert after_sum == pytest.approx(sum(r["pnl"] or 0 for r in rows))
+
+    def test_the_sizing_module_opens_no_database_connection(self):
+        import inspect
+
+        import app.services.position_sizing as mod
+
+        src = inspect.getsource(mod)
+        for forbidden in ("sqlite3", "INSERT", "UPDATE ", "DELETE", "DROP"):
+            assert forbidden not in src, (
+                f"position_sizing must not contain {forbidden!r}"
+            )
+
+
+class TestSizingEndToEndAccounting:
+    """Partial + final accounting through the real public path, then the
+    sizing report over the resulting rows."""
+
+    def test_partial_then_final_close_produces_correct_sizing_and_pnl(self):
+        from app.services.paper_trading import PaperAccount
+
+        account = PaperAccount(user_id="u1")
+        account.cash = 1_000_000.0
+        placed = account.place_order("SAIL", "LONG", 50, 185.70,
+                                     stop_loss=185.05, target_1=186.65,
+                                     target_2=187.30, signal_id="sig1")
+        account.fill_order(placed["order_id"], 185.70)
+        pos_id = placed["order_id"]
+
+        first = account.close_position(pos_id, 186.65, quantity=25,
+                                       reason="T1_PARTIAL")
+        second = account.close_position(pos_id, 187.30, reason="T2_FINAL")
+        assert first["pnl"] == pytest.approx(25 * 0.95)
+        assert first["realized_pnl"] == pytest.approx(25 * 0.95)
+        assert second["pnl"] == pytest.approx(25 * 1.60)
+        assert second["realized_pnl"] == pytest.approx(25 * 0.95 + 25 * 1.60), (
+            "the final slice must carry the POSITION total"
+        )
+
+        rows = [t for t in account.closed_trades if t.get("position_id") == pos_id]
+        rows = [{**t, "status": "closed"} for t in rows]
+        positions = collapse_positions(rows, {
+            "sig1": {"id": "sig1", "symbol": "SAIL", "stop_loss": 185.05,
+                     "atr": 0.43, "quantity": 50.0, "risk_amount": 32.50},
+        })
+        assert len(positions) == 1, "slices must collapse into one position"
+        pos = positions[0]
+        assert pos.pnl == pytest.approx(25 * 0.95 + 25 * 1.60)
+
+        report = sizing_report(positions, account_capital=10_000.0, risk_pct=2.0)
+        bd = report["breakdowns"][0]
+        assert bd["risk_per_share"] == pytest.approx(0.65)
+        assert bd["actual_quantity"] == 50.0
+        assert bd["actual_rupee_risk"] == pytest.approx(50 * 0.65)
+        assert bd["utilization_percent"] == pytest.approx(32.5 / 200 * 100)
+
+    def test_signal_realized_pnl_holds_the_position_total_after_two_slices(self):
+        """The end-to-end contract: ``signals.realized_pnl`` is the position
+        total, so a two-slice exit is not under-reported by the partial."""
+        from app.services.paper_trading import PaperAccount
+
+        account = PaperAccount(user_id="u1")
+        account.cash = 1_000_000.0
+        placed = account.place_order("SAIL", "LONG", 50, 185.70,
+                                     stop_loss=185.05, target_1=186.65,
+                                     target_2=187.30)
+        account.fill_order(placed["order_id"], 185.70)
+        pos_id = placed["order_id"]
+        account.close_position(pos_id, 186.65, quantity=25, reason="T1_PARTIAL")
+        final = account.close_position(pos_id, 187.30, reason="T2_FINAL")
+
+        total = 25 * 0.95 + 25 * 1.60
+        assert final["realized_pnl"] == pytest.approx(total)
+        assert final["pnl"] == pytest.approx(25 * 1.60), (
+            "the per-slice pnl must stay the slice's own value"
+        )
+
+
+class TestShadowBaselineDecision:
+    """``baseline_decision`` must describe what production REALLY did.
+
+    A ``NO_TRADE`` signal never reaches the risk engine and can never become a
+    position. Recording it as ``TRADE`` would manufacture a baseline agreement
+    on a trade that never happened, which is the one thing the candidate-vs-
+    baseline comparison must not do.
+    """
+
+    @staticmethod
+    def _captured(monkeypatch, direction, **kw):
+        """Run the real scanner hook and capture what it persists."""
+        from app.services import profit_selection_store, scanner
+
+        seen: list = []
+
+        def _capture(record, baseline_decision, db_path=None):
+            seen.append((record, baseline_decision))
+            return "row1"
+
+        monkeypatch.setattr(profit_selection_store, "persist_selection_decision",
+                            _capture)
+        signal = {"symbol": "X", "direction": direction, "confidence": 0.5,
+                  "signal_score": {"total": 55.0}, "id": "sig9",
+                  "setup": {"entry": 100.0, "stop_loss": 99.0,
+                            "target_1": 102.0, "risk_reward_ratio": 2.0}}
+        result: dict = {}
+        scanner._run_profit_selection(result, signal, None, None,
+                                      candle_ts="2026-09-30 14:00:00", **kw)
+        assert seen, "the hook persisted nothing"
+        return seen[-1][1]
+
+    def test_a_no_trade_signal_is_recorded_as_skip(self, monkeypatch):
+        assert self._captured(monkeypatch, "NO_TRADE") == "SKIP"
+
+    @pytest.mark.parametrize("direction", ["", "NONE", None])
+    def test_a_missing_direction_is_recorded_as_skip(self, monkeypatch,
+                                                     direction):
+        assert self._captured(monkeypatch, direction) == "SKIP"
+
+    @pytest.mark.parametrize("direction", ["LONG", "SHORT", "WEAK_LONG",
+                                          "WEAK_SHORT", "STRONG_SHORT"])
+    def test_an_actionable_direction_defaults_to_trade(self, monkeypatch,
+                                                      direction):
+        assert self._captured(monkeypatch, direction) == "TRADE"
+
+    def test_the_direction_overrides_a_caller_supplied_trade(self, monkeypatch):
+        """The data-gated call site passes TRADE/SKIP explicitly; a NO_TRADE
+        signal must still land on SKIP."""
+        assert self._captured(monkeypatch, "NO_TRADE",
+                              baseline_decision="TRADE") == "SKIP"
+
+    def test_an_explicit_skip_is_respected_for_actionable_signals(self,
+                                                                  monkeypatch):
+        assert self._captured(monkeypatch, "LONG",
+                              baseline_decision="SKIP") == "SKIP"
+
+    def test_the_measurement_still_runs_and_never_blocks(self, monkeypatch):
+        """A SKIP baseline must not stop the scan or change the payload."""
+        from app.services import profit_selection_store, scanner
+
+        monkeypatch.setattr(profit_selection_store, "persist_selection_decision",
+                            lambda record, baseline_decision, db_path=None: "r")
+        signal = {"symbol": "X", "direction": "NO_TRADE", "confidence": 0.0,
+                  "signal_score": {"total": 55.0}, "setup": {}}
+        result: dict = {}
+        out = scanner._run_profit_selection(result, signal, None, None,
+                                           candle_ts="2026-09-30 14:00:00")
+        assert out is not None
+        assert out["mode"] == "SHADOW"
+        assert out["applied_to_production"] is False
+
+    def test_a_persist_failure_never_breaks_the_scan(self, monkeypatch):
+        from app.services import profit_selection_store, scanner
+
+        def _boom(record, baseline_decision, db_path=None):
+            raise RuntimeError("shadow store is down")
+
+        monkeypatch.setattr(profit_selection_store, "persist_selection_decision",
+                            _boom)
+        result: dict = {}
+        out = scanner._run_profit_selection(
+            result, {"symbol": "X", "direction": "LONG", "confidence": 0.5,
+                     "signal_score": {"total": 55.0}, "setup": {}},
+            None, None, candle_ts="2026-09-30 14:00:00")
+        assert out is None, "a shadow failure is swallowed, never raised"
+        assert "profit_selection" not in result
+
+
+class TestShadowRecordScoreExtraction:
+    """Regression: ``signal['signal_score']`` is a nested dict.
+
+    Passing it straight through a finite-coercion yields None and the shadow
+    ledger persisted 0.0 for EVERY row, destroying the score dimension of the
+    measurement instrument. The scalar lives at ``['total']``.
+    """
+
+    def test_nested_score_is_unwrapped_to_its_total(self):
+        record = shadow_record(
+            {"symbol": "SAIL", "direction": "LONG", "confidence": 0.5,
+             "signal_score": {"total": 78.08, "trend": 20.0, "momentum": 18.08},
+             "setup": {"entry": 185.70, "stop_loss": 185.05, "target_1": 186.65,
+                       "target_2": 187.30, "risk_reward_ratio": 1.33}},
+            _decision(), signal_id="abc")
+        assert record["signal_score"] == pytest.approx(78.08)
+
+    def test_a_flat_score_is_still_accepted(self):
+        record = shadow_record(
+            {"symbol": "X", "direction": "LONG", "confidence": 0.5,
+             "signal_score": 61.5, "setup": {}},
+            _decision(), signal_id="abc")
+        assert record["signal_score"] == pytest.approx(61.5)
+
+    def test_a_missing_score_is_none_not_zero(self):
+        record = shadow_record(
+            {"symbol": "X", "direction": "LONG", "confidence": 0.5, "setup": {}},
+            _decision(), signal_id="abc")
+        assert record["signal_score"] is None
+
+    def test_the_scalar_total_actually_reaches_the_rule_engine(self):
+        """Before the fix the dict coerced to None, so a min_signal_score rule
+        returned UNKNOWN instead of PASS/FAIL and the score dimension of the
+        instrument was dead. Drive the rule directly."""
+        def decide(total, floor):
+            return evaluate_selection(
+                {"symbol": "X", "direction": "LONG", "confidence": 0.5,
+                 "signal_score": {"total": total},
+                 "signal_quality": "NORMAL",
+                 "setup": {"entry": 100.0, "stop_loss": 99.0,
+                           "target_1": 102.0, "risk_reward_ratio": 2.0}},
+                config=SelectionConfig(min_signal_score=floor),
+            )
+
+        assert "min_signal_score" in decide(55.0, 70.0).failed_rules
+        assert decide(55.0, 70.0).unknown_rules == []
+        assert "min_signal_score" not in decide(55.0, 50.0).failed_rules
+        assert decide(55.0, 50.0).unknown_rules == []

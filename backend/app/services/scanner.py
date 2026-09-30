@@ -48,7 +48,7 @@ def _run_profit_selection(
     row,
     market_ctx: Optional[dict],
     candle_ts=None,
-    baseline_decision: str = "TRADE",
+    baseline_decision: Optional[str] = None,
 ) -> Optional[dict]:
     """Run the Profit Selection Layer in SHADOW mode and record the decision.
 
@@ -57,6 +57,13 @@ def _run_profit_selection(
     targets, and by default does not block anything — the decision is written
     to the shadow ledger so a future promotion can be measured against what
     production actually did.
+
+    ``baseline_decision`` must describe what production REALLY did with this
+    signal, because the whole value of the shadow ledger is the
+    candidate-vs-baseline comparison. A ``NO_TRADE`` signal never reaches the
+    risk engine and can never become a position, so recording it as ``TRADE``
+    would invent a baseline agreement on a trade that never happened. It is
+    therefore derived from the direction when the caller does not state it.
 
     Returns the decision dict (also placed on ``result['profit_selection']``),
     or None when there is no signal to judge.
@@ -70,6 +77,14 @@ def _run_profit_selection(
         from app.services.profit_selection_store import persist_selection_decision
 
         cfg = SelectionConfig.from_settings(settings)
+        direction = str(signal.get("direction") or "").upper()
+        actionable = direction not in ("", "NO_TRADE", "NONE")
+        if baseline_decision is None:
+            baseline_decision = "TRADE" if actionable else "SKIP"
+        elif not actionable:
+            # Even when the caller states a decision, a NO_TRADE signal cannot
+            # have been traded, so the recorded baseline is SKIP.
+            baseline_decision = "SKIP"
         # SHADOW MODE IS STRUCTURAL: the layer can only ever return TRADE or
         # SKIP for a hypothetical, and it is applied to production only in
         # ENFORCE, which is itself guarded by assert_promotable.
@@ -279,9 +294,10 @@ class MarketScanner:
                                         quality=result.get("setup_quality"))
             # Profit Selection Layer (SHADOW). Sits after quality, before the
             # risk engine; records a TRADE/SKIP decision but blocks nothing.
+            # baseline_decision is left to the layer, which derives it from the
+            # direction - a NO_TRADE signal never reached the risk engine.
             _run_profit_selection(result, signal, row, market_ctx,
-                                  candle_ts=decision_ts,
-                                  baseline_decision="TRADE")
+                                  candle_ts=decision_ts)
         if signal and settings.USE_24H_CONTEXT:
             signal_24h = evaluate_signal(
                 df, symbol,
