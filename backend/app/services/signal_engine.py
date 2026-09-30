@@ -9,7 +9,7 @@ from app.models.schemas import (
 )
 from app.services.indicators import calculate_all_indicators
 from app.core.market_session import now_ist
-from app.services.strategy_config import get_strategy
+from app.services.strategy_config import StrategyVersion, get_strategy
 import uuid
 
 CRITICAL_INDICATORS = ["atr_14", "adx_14", "vwap", "rsi_14", "relative_volume"]
@@ -1012,7 +1012,17 @@ def evaluate_signal(
                 "risks": ["Insufficient data"]}
     
     row = df.iloc[-1]
-    sv = get_strategy(strategy_version) if strategy_version is not None else None
+    # ``strategy_version`` may be a registered version NAME (e.g. "v1") or an
+    # already-resolved StrategyVersion instance. Resolving once here means the
+    # returned ``strategy_version`` label is the real registered name, so a
+    # persisted signals row can never carry NULL just because the caller passed
+    # a string. None keeps the historical no-version behaviour untouched.
+    if strategy_version is None:
+        sv = None
+    elif isinstance(strategy_version, StrategyVersion):
+        sv = strategy_version
+    else:
+        sv = get_strategy(strategy_version)
     decision = evaluate_row_signal(row, market_context=market_context, strategy_version=sv,
                                    context_24h=context_24h)
 
@@ -1066,7 +1076,7 @@ def evaluate_signal(
         "risks": explanation.risks,
         "direction_evidence": decision["direction_evidence"],
         "strategy": strategy,
-        "strategy_version": getattr(strategy_version, "version", None),
+        "strategy_version": getattr(sv, "version", None),
         "data_source": data_source,
         "indicator_values": indicator_values,
         "market_data_timestamp": market_data_ts_str,

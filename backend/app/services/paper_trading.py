@@ -881,11 +881,21 @@ class PaperAccount:
         else:
             result = "BREAKEVEN"
         trade_reason = reason or EXIT_REASON_MANUAL_CLOSE
+        # POSITION-LEVEL cumulative realized P&L, including the slice that is
+        # closing right now. Before this was computed, a Profit-Capture
+        # position (T1_PARTIAL then T2_FINAL/TRAILING_STOP) exposed only the
+        # partial's P&L, because pos["realized_pnl"] was updated solely on the
+        # partial branch below and the position is popped on a full close.
+        # Downstream attribution (signals.outcome / realized_pnl) therefore
+        # recorded the LAST slice instead of the position total. Purely
+        # additive: cash, total_pnl and the per-slice `pnl` are untouched.
+        position_realized = round((pos.get("realized_pnl") or 0.0) + pnl, 2)
         trade = {
             **pos,
             "exit_price": exit_price,
             "exit_time": now_ist().isoformat(),
             "pnl": round(pnl, 2),
+            "realized_pnl": position_realized,
             "result": result,
             "status": "closed",
             "user_id": user_id or self.user_id or pos.get("user_id"),
@@ -899,7 +909,7 @@ class PaperAccount:
         if partial:
             pos["quantity"] = rest
             pos["remaining_quantity"] = rest
-            pos["realized_pnl"] = round((pos.get("realized_pnl") or 0.0) + pnl, 2)
+            pos["realized_pnl"] = position_realized
             pos["current_price"] = exit_price
             pos["unrealized_pnl"] = self._unrealized_for(pos, exit_price)
         else:
@@ -908,6 +918,7 @@ class PaperAccount:
         result_dict = {
             "trade": trade,
             "pnl": round(pnl, 2),
+            "realized_pnl": position_realized,
             "exit_reason": trade_reason,
         }
         if partial:

@@ -6,6 +6,7 @@ from typing import Optional
 from app.services.market_data.base import MarketDataProvider
 from app.services.indicators import calculate_all_indicators
 from app.services.signal_engine import evaluate_signal
+from app.services.strategy_config import LIVE_STRATEGY_VERSION
 from app.services.signal_quality import compute_setup_quality
 from app.services.signal_snapshot import set_signal, get_signal, invalidate_symbol
 from app.services.signal_snapshot import set_signal, get_signal
@@ -39,6 +40,85 @@ def _attach_quality(result: dict, quality: dict) -> dict:
     for k in _QUALITY_FIELDS:
         result[k] = quality.get(k)
     return result
+
+
+def _run_profit_selection(
+    result: dict,
+    signal: Optional[dict],
+    row,
+    market_ctx: Optional[dict],
+    candle_ts=None,
+    baseline_decision: str = "TRADE",
+) -> Optional[dict]:
+    """Run the Profit Selection Layer in SHADOW mode and record the decision.
+
+    Placement: AFTER signal generation + setup quality, BEFORE the risk engine.
+    It does not recompute the signal score, does not alter the entry/stop/
+    targets, and by default does not block anything — the decision is written
+    to the shadow ledger so a future promotion can be measured against what
+    production actually did.
+
+    Returns the decision dict (also placed on ``result['profit_selection']``),
+    or None when there is no signal to judge.
+    """
+    if not signal:
+        return None
+    try:
+        from app.services.profit_selection import (
+            SelectionConfig, evaluate_selection, shadow_record,
+        )
+        from app.services.profit_selection_store import persist_selection_decision
+
+        cfg = SelectionConfig.from_settings(settings)
+        # SHADOW MODE IS STRUCTURAL: the layer can only ever return TRADE or
+        # SKIP for a hypothetical, and it is applied to production only in
+        # ENFORCE, which is itself guarded by assert_promotable.
+        indicator_values = {
+            "adx_14": _safe_float(row, "adx_14"),
+            "relative_volume": _safe_float(row, "relative_volume"),
+            "atr_14": _safe_float(row, "atr_14"),
+            "vwap": _safe_float(row, "vwap"),
+            "close": _safe_float(row, "close"),
+        }
+        decision = evaluate_selection(
+            {
+                **signal,
+                "signal_quality": result.get("setup_quality"),
+                "setup_quality_score": result.get("setup_quality_score"),
+            },
+            config=cfg,
+            indicator_values=indicator_values,
+            market_context=market_ctx,
+            entry_time=candle_ts or signal.get("timestamp"),
+        )
+        record = shadow_record(
+            {**signal,
+             "signal_quality": result.get("setup_quality"),
+             "setup_quality_score": result.get("setup_quality_score")},
+            decision,
+            signal_id=signal.get("id"),
+        )
+        persist_selection_decision(record, baseline_decision=baseline_decision)
+        payload = decision.to_dict()
+        result["profit_selection"] = payload
+        return payload
+    except Exception as e:
+        # Measurement must never break a scan.
+        logger.warning("profit selection shadow failed: %s", e)
+        return None
+
+
+def _safe_float(row, key) -> Optional[float]:
+    try:
+        import math
+
+        value = row.get(key) if row is not None else None
+        if value is None:
+            return None
+        v = float(value)
+        return v if math.isfinite(v) else None
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return None
 
 
 class MarketScanner:
@@ -154,6 +234,7 @@ class MarketScanner:
             data_age_seconds=data_age,
             data_status=data_status_val,
             market_data_timestamp=quote.get("timestamp"),
+            strategy_version=LIVE_STRATEGY_VERSION,
         )
         if signal:
             result["signal"] = signal["direction"]
@@ -196,6 +277,11 @@ class MarketScanner:
             signal_store.persist_signal(signal, candle_ts=decision_ts,
                                         market_ctx=market_ctx,
                                         quality=result.get("setup_quality"))
+            # Profit Selection Layer (SHADOW). Sits after quality, before the
+            # risk engine; records a TRADE/SKIP decision but blocks nothing.
+            _run_profit_selection(result, signal, row, market_ctx,
+                                  candle_ts=decision_ts,
+                                  baseline_decision="TRADE")
         if signal and settings.USE_24H_CONTEXT:
             signal_24h = evaluate_signal(
                 df, symbol,
@@ -205,6 +291,7 @@ class MarketScanner:
                 data_status=data_status_val,
                 market_data_timestamp=quote.get("timestamp"),
                 context_24h=ctx24,
+                strategy_version=LIVE_STRATEGY_VERSION,
             )
             if signal_24h:
                 q24 = compute_setup_quality(signal_24h, row, market_context=market_ctx, df=df)
@@ -289,6 +376,7 @@ class MarketScanner:
                 data_age_seconds=data_age,
                 data_status=data_status_val,
                 market_data_timestamp=quote.get("timestamp"),
+                strategy_version=LIVE_STRATEGY_VERSION,
             )
 
             result = {
@@ -324,6 +412,14 @@ class MarketScanner:
             _attach_quality(result, compute_setup_quality(signal, row, market_context=market_ctx, df=df))
             # Traceability + Mode B shadow (see _process_stock). Persisted only
             # when the data gate allows trading, matching scan_universe.
+            if signal:
+                # Recorded whether or not production traded it: a signal the
+                # data gate rejected is exactly the case where a future
+                # selection rule has something to say.
+                _run_profit_selection(
+                    result, signal, row, market_ctx, candle_ts=decision_ts,
+                    baseline_decision="TRADE" if should_trade else "SKIP",
+                )
             if signal and should_trade:
                 signal_store.persist_signal(signal, candle_ts=decision_ts,
                                             market_ctx=market_ctx,
@@ -337,6 +433,7 @@ class MarketScanner:
                     data_status=data_status_val,
                     market_data_timestamp=quote.get("timestamp"),
                     context_24h=ctx24,
+                    strategy_version=LIVE_STRATEGY_VERSION,
                 )
                 if signal_24h:
                     q24 = compute_setup_quality(signal_24h, row, market_context=market_ctx, df=df)

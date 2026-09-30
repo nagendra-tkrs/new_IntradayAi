@@ -158,6 +158,27 @@ def register_strategy(sv: StrategyVersion):
     STRATEGY_REGISTRY[sv.version] = sv
 
 
+# ---------------------------------------------------------------------------
+# Canonical version label for the LIVE scanner path.
+#
+# The live scanner previously called ``evaluate_signal()`` without a strategy
+# version, so every persisted ``signals`` row carried ``strategy_version =
+# NULL`` and the AI-traceability chain could not name the configuration that
+# produced a recommendation.
+#
+# ``v1`` is the *exact* configuration the live engine already runs, and passing
+# it is behaviour-neutral: every value v1 supplies is byte-for-byte the same as
+# the engine's no-version default (see test_strategy_version_live_parity, which
+# asserts the parity). The label is therefore purely additive traceability --
+# it names the running configuration, it does not select a different one.
+#
+# Do NOT change this to another registered version without re-running that
+# parity test: any other version has different direction bands (v2/v3 raise
+# them) and would change which symbols become tradable.
+# ---------------------------------------------------------------------------
+LIVE_STRATEGY_VERSION = "v1"
+
+
 def get_strategy(version: str = "v1") -> StrategyVersion:
     return STRATEGY_REGISTRY.get(version, STRATEGY_REGISTRY.get("v1"))
 

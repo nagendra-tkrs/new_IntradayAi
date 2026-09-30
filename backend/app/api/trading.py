@@ -141,6 +141,15 @@ async def _finalize_paper_trade(result: dict, user_id: str):
     # Traceability: mark the linked signals row's outcome (WIN/LOSS/BREAKEVEN,
     # realized P&L, holding minutes) when the closing trade references a
     # signal_id. Never blocks the close flow (wrapped defensively).
+    #
+    # ATTRIBUTION CONTRACT: `signals.realized_pnl` is the POSITION total, not
+    # the exit slice. A Profit-Capture position writes one ledger row per slice
+    # (T1_PARTIAL, then T2_FINAL / TRAILING_STOP) and all of them share one
+    # signal_id, so passing the slice P&L here meant the signal ended up holding
+    # only the LAST close's P&L and understating the position by every prior
+    # partial. `close_position` now carries the position-level `realized_pnl`;
+    # fall back to the slice only if an older caller omitted it, so a
+    # single-close position is still attributed exactly.
     try:
         close_trade = result.get("trade", {})
         signal_id = close_trade.get("signal_id")
@@ -150,7 +159,31 @@ async def _finalize_paper_trade(result: dict, user_id: str):
             exited = _parse_dt(close_trade.get("exit_time"))
             if opened and exited:
                 holding_min = int(max((exited - opened).total_seconds(), 0) // 60)
-            signal_store.mark_signal_outcome(signal_id, pnl, holding_min)
+            position_pnl = close_trade.get("realized_pnl")
+            if position_pnl is None:
+                position_pnl = result.get("realized_pnl")
+            attributed_pnl = pnl if position_pnl is None else position_pnl
+            signal_store.mark_signal_outcome(
+                signal_id, float(attributed_pnl), holding_min
+            )
+            # Mirror the same attributed figure into the shadow ledger so a
+            # future Profit Selection promotion can weigh the layer's
+            # SKIP decisions against what the trade it did not block earned.
+            try:
+                from app.services.profit_selection_store import (
+                    attach_realized_outcome,
+                )
+
+                attributed_outcome = (
+                    "WIN" if attributed_pnl > 0
+                    else ("LOSS" if attributed_pnl < 0 else "BREAKEVEN")
+                )
+                attach_realized_outcome(
+                    signal_id, float(attributed_pnl), attributed_outcome,
+                    trade_id=close_trade.get("id"),
+                )
+            except Exception:
+                pass
     except Exception:
         pass
     if is_partial:

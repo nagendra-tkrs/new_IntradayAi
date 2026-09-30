@@ -1,4 +1,6 @@
 import os
+from typing import Optional
+
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
 
@@ -38,12 +40,12 @@ class Settings(BaseSettings):
     PAPER_TRADING_MONITOR_INTERVAL_SECONDS: float = 5.0
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8020
-    CORS_ORIGINS: str = '["http://localhost:3005"]'
+    CORS_ORIGINS: str = '["http://localhost:3000"]'
 
     GOOGLE_CLIENT_ID: str = "678365536626-2ago6n13j2a71e36jp0gi33gj2jfr30f.apps.googleusercontent.com"
     GOOGLE_CLIENT_SECRET: str = ""
-    GOOGLE_REDIRECT_URI: str = "https://trading.tksrproductservices.com/api/auth/google/callback"
-    FRONTEND_URL: str = "http://localhost:3005"
+    GOOGLE_REDIRECT_URI: str = "http://localhost:8020/api/auth/google/callback"
+    FRONTEND_URL: str = "http://localhost:3000"
 
     # Universe Manager (Phase 3) — persistence-layer settings. Defaults preserve
     # the legacy 40-stock behavior byte-for-byte: UNIVERSE_SOURCE=legacy keeps
@@ -181,6 +183,50 @@ class Settings(BaseSettings):
     QUALITY_RISK_MULTIPLIERS: str = (
         '{"REJECTED": 0.0, "WEAK": 0.0, "NORMAL": 1.0, "QUALIFIED": 1.0, "PREMIUM": 1.0}'
     )
+
+    # ------------------------------------------------------------------
+    # Profit Selection Layer (Phase 5/11) - a TRADE/SKIP gate that sits AFTER
+    # signal generation + setup quality and BEFORE the risk engine.
+    #
+    # DEFAULT-OFF BY CONSTRUCTION. PROFIT_SELECTION_MODE="SHADOW" means the
+    # layer computes a decision and writes it to the shadow ledger
+    # (signal_profit_selection_shadow) but the production path proceeds exactly
+    # as before - no signal is ever blocked. Every threshold below defaults to
+    # NULL/empty, which means "rule disabled, always passes", so enabling the
+    # module changes NO production decision.
+    #
+    # "ENFORCE" is intentionally not reachable by flipping a setting alone: see
+    # profit_selection.assert_promotable, which refuses to enforce until the
+    # candidate has cleared the sample and fidelity gates in
+    # optimization_experiments.
+    #
+    #   PROFIT_SELECTION_MODE               SHADOW (default) | ENFORCE
+    #   PROFIT_SELECTION_MIN_SCORE          minimum base signal score
+    #   PROFIT_SELECTION_MIN_CONFIDENCE     minimum model confidence
+    #   PROFIT_SELECTION_MIN_QUALITY_SCORE  minimum setup_quality_score
+    #   PROFIT_SELECTION_MIN_ADX            minimum ADX
+    #   PROFIT_SELECTION_MIN_RELATIVE_VOLUME  minimum relative volume
+    #   PROFIT_SELECTION_MIN_RR             minimum risk/reward of the setup
+    #   PROFIT_SELECTION_MIN_ATR_PCT / PROFIT_SELECTION_MAX_ATR_PCT
+    #   PROFIT_SELECTION_QUALITIES          comma list, e.g. "QUALIFIED,PREMIUM"
+    #   PROFIT_SELECTION_REQUIRE_VWAP       price must be on the side of VWAP
+    #   PROFIT_SELECTION_REQUIRE_MARKET_CONTEXT  signal must agree with NIFTY
+    #   PROFIT_SELECTION_ALLOWED_WINDOWS    e.g. "09:30-15:00"
+    #   PROFIT_SELECTION_BLOCKED_WINDOWS    e.g. "09:15-09:30"
+    PROFIT_SELECTION_MODE: str = "SHADOW"
+    PROFIT_SELECTION_MIN_SCORE: Optional[float] = None
+    PROFIT_SELECTION_MIN_CONFIDENCE: Optional[float] = None
+    PROFIT_SELECTION_MIN_QUALITY_SCORE: Optional[float] = None
+    PROFIT_SELECTION_MIN_ADX: Optional[float] = None
+    PROFIT_SELECTION_MIN_RELATIVE_VOLUME: Optional[float] = None
+    PROFIT_SELECTION_MIN_RR: Optional[float] = None
+    PROFIT_SELECTION_MIN_ATR_PCT: Optional[float] = None
+    PROFIT_SELECTION_MAX_ATR_PCT: Optional[float] = None
+    PROFIT_SELECTION_QUALITIES: str = ""
+    PROFIT_SELECTION_REQUIRE_VWAP: bool = False
+    PROFIT_SELECTION_REQUIRE_MARKET_CONTEXT: bool = False
+    PROFIT_SELECTION_ALLOWED_WINDOWS: str = ""
+    PROFIT_SELECTION_BLOCKED_WINDOWS: str = ""
 
     # ------------------------------------------------------------------
     # 24-Hour market-context experiment (A/B testing seam).
