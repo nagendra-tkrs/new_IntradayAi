@@ -56,9 +56,17 @@ from app.services.position_sizing import (  # noqa: E402
     BINDING_CAPITAL, BINDING_EXPLICIT, BINDING_RISK_BUDGET, BINDING_TIE,
     PATH_EXPLICIT, PATH_FORMULA, PATH_UNAVAILABLE, STOP_SOURCE_LEDGER_TRAILED,
     BINDING_UNAVAILABLE,
-    STOP_SOURCE_SIGNAL, capital_based_quantity, production_quantity,
-    risk_based_quantity, risk_budget_for, shadow_sizing_comparison,
-    sizing_breakdown, sizing_report,
+    CLASS_CAPITAL_CONSTRAINED, CLASS_MANUAL_QUANTITY, CLASS_RISK_CONSTRAINED,
+    CLASS_RISK_ENGINE_SIZED, CLASS_UNCLASSIFIED,
+    SOURCE_MANUAL, SOURCE_RISK_ENGINE,
+    STOP_SOURCE_SIGNAL, EntryRiskGeometry, capital_based_quantity,
+    capture_entry_geometry, captured_geometry_fields, classify_order,
+    production_quantity, risk_based_quantity, risk_budget_for,
+    shadow_sizing_comparison, sizing_breakdown, sizing_report,
+)
+from app.services.position_sizing_store import (  # noqa: E402
+    GEOMETRY_TABLE, SOURCE_ORDER_FILL, ensure_geometry_schema, load_all_geometry,
+    load_geometry_for, persist_entry_geometry,
 )
 from app.services.profit_selection import (  # noqa: E402
     DECISION_SKIP, DECISION_TRADE, PromotionNotAllowed, Rule, RuleOutcome,
@@ -2209,3 +2217,719 @@ class TestShadowRecordScoreExtraction:
         assert decide(55.0, 70.0).unknown_rules == []
         assert "min_signal_score" not in decide(55.0, 50.0).failed_rules
         assert decide(55.0, 50.0).unknown_rules == []
+
+# ────────────────────────────────────────────────────────────────────────────
+# T. Entry-time risk geometry capture
+#
+# The problem this exists to solve: a closed `trades` row records the stop as
+# it stood at EXIT. Profit Capture rewrites that stop (breakeven at T1, then
+# trailing). So for any position that reached T1, the entry-time risk per
+# share is not recoverable from the ledger - the measurement instrument had to
+# estimate it, and 12 of 16 sampled positions were ESTIMATES.
+#
+# The capture happens once, inside PaperAccount.fill_order, and is written to
+# an INSERT-only ledger. Nothing that runs later in the trade's life can alter
+# it. That is the guarantee under test.
+# ────────────────────────────────────────────────────────────────────────────
+
+CAPITAL = 10_000.0
+RISK_PCT = 2.0          # -> risk_budget 200.0
+
+
+def _geom_engine(tmp_path, **cfg):
+    """A paper engine whose measurement ledgers land in a throwaway DB."""
+    from app.services.paper_trading import PaperTradingEngine
+    from app.services.profit_capture import ProfitCaptureConfig
+    return PaperTradingEngine(
+        db_path=str(tmp_path / "geom.db"),
+        profit_config=ProfitCaptureConfig(**cfg) if cfg else None,
+    )
+
+
+def _open_long(pt, entry=100.0, sl=98.0, t1=105.0, t2=107.0, qty=10,
+               symbol="GEOMX", source=SOURCE_MANUAL):
+    r = pt.place_order(symbol, "LONG", qty, entry, sl, t1, t2,
+                       quantity_source=source)
+    assert r["status"] == "pending"
+    f = pt.fill_order(r["order_id"])
+    assert f["status"] == "filled"
+    return r["order_id"]
+
+
+def _geo(db, position_id):
+    return load_geometry_for(position_id, db_path=db)
+
+
+class TestEntryGeometryFormulas:
+    """Section 4 arithmetic, computed from entry-time values only."""
+
+    def test_risk_budget_is_capital_times_configured_risk_percent(self):
+        assert risk_budget_for(CAPITAL, RISK_PCT) == pytest.approx(200.0)
+        assert risk_budget_for(50_000.0, 1.0) == pytest.approx(500.0)
+
+    def test_risk_based_quantity_floors_the_budget_over_risk_per_share(self):
+        assert risk_based_quantity(200.0, 2.0) == 100
+        # 200/2.5 = 80 exactly; floor must not gain a share to rounding
+        assert risk_based_quantity(200.0, 2.5) == 80
+        # 200/3 = 66.67 -> 66, not 67
+        assert risk_based_quantity(200.0, 3.0) == 66
+        # a stop wider than the whole budget cannot fund even one share
+        assert risk_based_quantity(200.0, 250.0) == 0
+
+    def test_capital_based_quantity_keeps_95_percent_headroom(self):
+        assert capital_based_quantity(CAPITAL, 100.0) == 95      # 9500/100
+        assert capital_based_quantity(CAPITAL, 250.0) == 38      # 9500/250 = 38
+        assert capital_based_quantity(CAPITAL, 10_000.0) == 0     # 0.95 share
+        assert capital_based_quantity(CAPITAL, 0.0) == 0
+
+    def test_allowed_quantity_is_the_minimum_of_the_two_constraints(self):
+        # Tight stop -> the risk budget is not the limit; cash is.
+        g = capture_entry_geometry(
+            {"id": "p", "symbol": "A", "direction": "LONG", "entry_price": 100.0,
+             "stop_loss": 99.0, "quantity": 1},
+            account_capital=CAPITAL, risk_pct=RISK_PCT)
+        assert g.risk_constraint_quantity == 200      # 200 / 1.0
+        assert g.capital_constraint_quantity == 95     # 9500 / 100
+        assert g.allowed_quantity == 95
+        assert g.binding_constraint == BINDING_CAPITAL
+
+    def test_a_wide_stop_makes_the_RISK_budget_bind(self):
+        # Stop 20 wide -> 200/20 = 10 shares, far below the 95 cash allows.
+        g = capture_entry_geometry(
+            {"id": "p", "symbol": "A", "direction": "LONG", "entry_price": 100.0,
+             "stop_loss": 80.0, "quantity": 10},
+            account_capital=CAPITAL, risk_pct=RISK_PCT)
+        assert g.risk_constraint_quantity == 10
+        assert g.capital_constraint_quantity == 95
+        assert g.allowed_quantity == 10
+        assert g.binding_constraint == BINDING_RISK_BUDGET
+
+    def test_a_wider_stop_does_NOT_de_risk_once_the_budget_binds(self):
+        """The finding from the sizing report, now asserted.
+
+        Widening the stop shrinks the share count, so it *looks* like
+        de-risking. It is not: once the risk budget is the binding constraint,
+        shares x risk_per_share is pinned at the budget. A wider stop buys a
+        smaller position at the SAME rupee risk - it never reduces risk.
+        """
+        carried = []
+        for stop in (99.0, 95.0, 90.0, 80.0, 75.0, 60.0, 50.0):
+            g = capture_entry_geometry(
+                {"id": "p", "symbol": "A", "direction": "LONG",
+                 "entry_price": 100.0, "stop_loss": stop, "quantity": 1},
+                account_capital=CAPITAL, risk_pct=RISK_PCT)
+            carried.append((stop, g.risk_constraint_quantity,
+                            g.allowed_quantity * g.initial_risk_per_share,
+                            g.initial_risk_per_share))
+        # quantity falls monotonically as the stop widens ...
+        quantities = [c[1] for c in carried]
+        assert quantities == sorted(quantities, reverse=True)
+        # ... but rupee risk never drops below the budget: the only case that
+        # does is the tightest stop, which is cash-capped instead.
+        assert carried[0][2] == pytest.approx(95.0)          # 95 x 1.0, capped
+        assert carried[0][3] == pytest.approx(1.0)
+        for stop, risk_qty, risk, rps in carried[1:]:
+            assert risk == pytest.approx(200.0), (stop, risk_qty, risk)
+
+    def test_a_wide_stop_that_does_not_divide_the_budget_loses_less_than_one_share(
+            self, ):
+        """The floor in risk_based_quantity is the only thing that makes a
+        budget-bound position carry less than the full budget."""
+        g = capture_entry_geometry(
+            {"id": "p", "symbol": "A", "direction": "LONG", "entry_price": 100.0,
+             "stop_loss": 70.0, "quantity": 1},     # 30/share -> 200/30 = 6.67
+            account_capital=CAPITAL, risk_pct=RISK_PCT)
+        assert g.risk_constraint_quantity == 6
+        assert g.allowed_quantity == 6
+        assert g.allowed_quantity * g.initial_risk_per_share == pytest.approx(180.0)
+        assert 0 < 200.0 - 180.0 < g.initial_risk_per_share
+
+
+class TestEntryGeometryUtilization:
+    def test_utilization_is_actual_risk_over_the_configured_budget(self):
+        g = capture_entry_geometry(
+            {"id": "p", "symbol": "A", "direction": "LONG", "entry_price": 100.0,
+             "stop_loss": 98.0, "quantity": 50},
+            account_capital=CAPITAL, risk_pct=RISK_PCT)
+        assert g.risk_budget == pytest.approx(200.0)
+        assert g.actual_risk == pytest.approx(100.0)        # 50 x 2.0
+        assert g.risk_budget_utilization == pytest.approx(50.0)
+
+    def test_a_single_default_ui_share_is_a_tiny_fraction_of_the_budget(self):
+        """The structural finding: the UI's default 1 share against a 2% budget."""
+        g = capture_entry_geometry(
+            {"id": "p", "symbol": "A", "direction": "LONG", "entry_price": 2500.0,
+             "stop_loss": 2460.0, "quantity": 1},
+            account_capital=CAPITAL, risk_pct=RISK_PCT)
+        assert g.actual_risk == pytest.approx(40.0)
+        assert g.risk_budget_utilization == pytest.approx(20.0)
+
+    def test_intended_risk_is_the_budget_implied_risk_not_the_affordable_one(self):
+        """Documented divergence, per the sizing contract.
+
+        intended_risk is risk_constraint_quantity x risk_per_share, i.e. what
+        the BUDGET implies. It is deliberately NOT capped by cash, so it can
+        exceed what an affordable position carries. Conflating the two would
+        hide the very gap this instrument measures.
+        """
+        g = capture_entry_geometry(
+            {"id": "p", "symbol": "A", "direction": "LONG", "entry_price": 100.0,
+             "stop_loss": 99.0, "quantity": 95},   # exactly the cash cap
+            account_capital=CAPITAL, risk_pct=RISK_PCT)
+        assert g.intended_risk == pytest.approx(200.0)   # 200 shares x 1.0
+        assert g.actual_risk == pytest.approx(95.0)     # 95 shares x 1.0
+        assert g.intended_risk > g.actual_risk
+        assert g.risk_budget_utilization == pytest.approx(47.5)
+
+    def test_a_breakeven_stop_yields_no_risk_per_share_and_is_marked_unreliable(self):
+        g = capture_entry_geometry(
+            {"id": "p", "symbol": "A", "direction": "LONG", "entry_price": 100.0,
+             "stop_loss": 100.0, "quantity": 10},
+            account_capital=CAPITAL, risk_pct=RISK_PCT)
+        assert g.initial_risk_per_share is None
+        assert g.risk_budget_utilization is None
+        assert g.geometry_reliable is False
+        assert g.usable is False
+
+    def test_geometry_is_unreliable_without_a_stop_at_all(self):
+        g = capture_entry_geometry(
+            {"id": "p", "symbol": "A", "direction": "LONG", "entry_price": 100.0,
+             "stop_loss": 0, "quantity": 10},
+            account_capital=CAPITAL, risk_pct=RISK_PCT)
+        assert g.initial_risk_per_share is None
+        assert g.geometry_reliable is False
+
+    def test_short_geometry_uses_the_absolute_distance_to_the_stop(self):
+        g = capture_entry_geometry(
+            {"id": "p", "symbol": "A", "direction": "SHORT", "entry_price": 100.0,
+             "stop_loss": 102.0, "quantity": 10},
+            account_capital=CAPITAL, risk_pct=RISK_PCT)
+        assert g.initial_risk_per_share == pytest.approx(2.0)
+        assert g.actual_risk == pytest.approx(20.0)
+        assert g.geometry_reliable is True
+
+
+class TestOrderClassification:
+    def test_a_recorded_manual_quantity_is_never_relabelled_as_engine_sized(self):
+        # allowed_quantity happens to equal the filled quantity, but the caller
+        # SAID the quantity was hand-typed - the statement wins.
+        assert classify_order(95, 95, SOURCE_MANUAL, BINDING_CAPITAL) == \
+            CLASS_MANUAL_QUANTITY
+
+    def test_recorded_engine_sizing_is_split_by_the_binding_constraint(self):
+        assert classify_order(95, 95, SOURCE_RISK_ENGINE, BINDING_CAPITAL) == \
+            CLASS_CAPITAL_CONSTRAINED
+        assert classify_order(10, 10, SOURCE_RISK_ENGINE, BINDING_RISK_BUDGET) == \
+            CLASS_RISK_CONSTRAINED
+        assert classify_order(10, 10, SOURCE_RISK_ENGINE, BINDING_TIE) == \
+            CLASS_RISK_ENGINE_SIZED
+
+    def test_without_a_caller_statement_the_class_is_inferred_from_the_quantity(self):
+        assert classify_order(95, 95, None, BINDING_CAPITAL) == \
+            CLASS_CAPITAL_CONSTRAINED
+        assert classify_order(1, 95, None, BINDING_CAPITAL) == \
+            CLASS_MANUAL_QUANTITY
+        assert classify_order(1, 0, None, BINDING_UNAVAILABLE) == \
+            CLASS_UNCLASSIFIED
+        assert classify_order(None, 95, None, BINDING_CAPITAL) == \
+            CLASS_UNCLASSIFIED
+
+    def test_all_four_required_labels_are_reachable(self):
+        produced = {
+            classify_order(95, 95, SOURCE_MANUAL, BINDING_CAPITAL),
+            classify_order(95, 95, SOURCE_RISK_ENGINE, BINDING_CAPITAL),
+            classify_order(10, 10, SOURCE_RISK_ENGINE, BINDING_RISK_BUDGET),
+            classify_order(10, 10, SOURCE_RISK_ENGINE, BINDING_TIE),
+        }
+        assert produced == {
+            CLASS_MANUAL_QUANTITY, CLASS_CAPITAL_CONSTRAINED,
+            CLASS_RISK_CONSTRAINED, CLASS_RISK_ENGINE_SIZED,
+        }
+
+
+class TestEntryGeometryIsCapturedAtFill:
+    """Section 1/2/3: capture, immutability, and honesty about history."""
+
+    def test_fill_records_the_entry_time_geometry(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, qty=50)
+        g = _geo(str(tmp_path / "geom.db"), pid)
+        assert g is not None
+        assert g["capture_source"] == SOURCE_ORDER_FILL
+        assert g["entry_price"] == pytest.approx(100.0)
+        assert g["initial_stop_loss"] == pytest.approx(98.0)
+        assert g["initial_target_1"] == pytest.approx(105.0)
+        assert g["initial_target_2"] == pytest.approx(107.0)
+        assert g["initial_risk_per_share"] == pytest.approx(2.0)
+        assert g["initial_risk_amount"] == pytest.approx(100.0)
+        assert g["initial_quantity"] == pytest.approx(50.0)
+        assert g["configured_risk_percent"] == pytest.approx(RISK_PCT)
+        assert g["risk_budget"] == pytest.approx(200.0)
+        assert g["capital_constraint_quantity"] == 95
+        assert g["risk_constraint_quantity"] == 100
+        assert g["actual_quantity"] == pytest.approx(50.0)
+        assert g["risk_budget_utilization"] == pytest.approx(50.0)
+        assert g["order_classification"] == CLASS_MANUAL_QUANTITY
+        assert g["geometry_reliable"] == 1
+
+    def test_the_capture_uses_the_FILL_price_not_the_order_price(self, tmp_path):
+        """A limit order filled away from its limit has different risk."""
+        pt = _geom_engine(tmp_path)
+        r = pt.place_order("FILLX", "LONG", 10, 100.0, 98.0, 105.0, 107.0,
+                           quantity_source=SOURCE_MANUAL)
+        pt.fill_order(r["order_id"], fill_price=99.0)
+        g = _geo(str(tmp_path / "geom.db"), r["order_id"])
+        assert g["entry_price"] == pytest.approx(99.0)
+        assert g["initial_risk_per_share"] == pytest.approx(1.0)   # 99 - 98
+        assert g["actual_risk"] == pytest.approx(10.0)
+
+    def test_the_capture_happens_after_any_order_edit(self, tmp_path):
+        """Capture at FILL, not at place: the levels that matter are the ones
+        the position actually opened with.
+
+        Also pins a pre-existing accounting quirk that measurement must not
+        inherit: ``edit_order`` rewrites ``quantity`` but leaves
+        ``initial_quantity`` at the pre-edit size, so at fill the live
+        ``quantity`` - not ``initial_quantity`` - is the size that was actually
+        bought. Fixing that quirk in the trade ledger is out of scope here.
+        """
+        pt = _geom_engine(tmp_path)
+        r = pt.place_order("EDITX", "LONG", 10, 100.0, 98.0, 105.0, 107.0,
+                           quantity_source=SOURCE_MANUAL)
+        pt.edit_order(r["order_id"], stop_loss=97.0, quantity=20)
+        pt.fill_order(r["order_id"])
+        g = _geo(str(tmp_path / "geom.db"), r["order_id"])
+        assert g["initial_stop_loss"] == pytest.approx(97.0)
+        assert g["initial_quantity"] == pytest.approx(20.0)
+        assert g["actual_quantity"] == pytest.approx(20.0)
+        assert g["initial_risk_per_share"] == pytest.approx(3.0)
+        assert g["initial_risk_amount"] == pytest.approx(60.0)
+        assert g["risk_budget_utilization"] == pytest.approx(30.0)
+        # the position's own pre-edit `initial_quantity` is still 10 (the
+        # pre-existing quirk); only the geometry capture got it right
+        assert pt.get_position(r["order_id"])["initial_quantity"] == 10
+        assert pt.get_position(r["order_id"])["quantity"] == 20
+
+    def test_the_auto_fill_path_captures_geometry_too(self, tmp_path):
+        """check_entry_triggers is the live fill path - it must not be a hole."""
+        pt = _geom_engine(tmp_path)
+        r = pt.place_order("AUTOX", "LONG", 10, 100.0, 98.0, 105.0, 107.0,
+                           quantity_source=SOURCE_MANUAL)
+        fills = pt.check_entry_triggers({"AUTOX": 100.5})
+        assert len(fills) == 1
+        g = _geo(str(tmp_path / "geom.db"), r["order_id"])
+        assert g is not None and g["geometry_reliable"] == 1
+
+    def test_a_short_position_captures_geometry(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        r = pt.place_order("SHRTX", "SHORT", 10, 100.0, 102.0, 95.0, 93.0,
+                           quantity_source=SOURCE_RISK_ENGINE)
+        pt.fill_order(r["order_id"])
+        g = _geo(str(tmp_path / "geom.db"), r["order_id"])
+        assert g["direction"] == "SHORT"
+        assert g["initial_risk_per_share"] == pytest.approx(2.0)
+        assert g["quantity_source"] == SOURCE_RISK_ENGINE
+
+    def test_a_position_without_a_usable_stop_is_still_recorded(self, tmp_path):
+        """Recording 'we could not measure this' beats leaving no row, which a
+        reader could mistake for a pre-capture position or a zero risk."""
+        pt = _geom_engine(tmp_path)
+        r = pt.place_order("NOSLX", "LONG", 10, 100.0, 0, 105.0, 107.0,
+                           quantity_source=SOURCE_MANUAL)
+        pt.fill_order(r["order_id"])
+        g = _geo(str(tmp_path / "geom.db"), r["order_id"])
+        assert g is not None
+        assert g["geometry_reliable"] == 0
+        assert g["initial_risk_per_share"] is None
+        assert g["risk_budget_utilization"] is None
+
+    def test_the_ledger_survives_the_position_being_closed(self, tmp_path):
+        """paper_positions is a snapshot and the row is DELETed on close; the
+        geometry ledger is not."""
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, t1=105.0, t2=107.0, qty=10)
+        pt.close_position(pid, 103.0)
+        assert pt.get_position(pid) is None
+        g = _geo(str(tmp_path / "geom.db"), pid)
+        assert g is not None
+        assert g["initial_stop_loss"] == pytest.approx(98.0)
+
+    def test_the_live_position_carries_the_frozen_levels_under_initial_keys(
+            self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, t1=105.0, t2=107.0, qty=50)
+        pos = pt.get_position(pid)
+        assert pos["initial_stop_loss"] == pytest.approx(98.0)
+        assert pos["initial_risk_per_share"] == pytest.approx(2.0)
+        assert pos["initial_risk_budget"] == pytest.approx(200.0)
+        assert pos["initial_risk_utilization"] == pytest.approx(50.0)
+        assert pos["initial_geometry_reliable"] is True
+
+    def test_the_mirrored_keys_cannot_collide_with_live_geometry(self, tmp_path):
+        """Every mirrored key must be `initial_*`: Profit Capture writes plain
+        `stop_loss`/`target_*`, so a shared name would be silently rewritten."""
+        for key in captured_geometry_fields():
+            assert key.startswith("initial_")
+            assert key not in ("stop_loss", "target_1", "target_2", "quantity")
+
+
+class TestProfitCaptureCannotRewriteEntryRisk:
+    """Section 2 + Section 8: the INITIAL / CURRENT / REALIZED separation."""
+
+    def test_breakeven_protection_moves_the_current_stop_but_not_the_initial(
+            self, tmp_path):
+        """The exact scenario that made 12 of 16 sizing figures estimates.
+
+        Isolated with trailing off so only the T1 protection step is observed:
+        the stop goes to breakeven, which collapses the *ledger's* risk per
+        share to zero - while the captured entry risk stays at 2.0.
+        """
+        from app.services.profit_capture import (
+            PROTECT_MOVE_TO_ENTRY, TRAILING_NONE,
+        )
+        pt = _geom_engine(tmp_path, protect_mode=PROTECT_MOVE_TO_ENTRY,
+                          trailing_mode=TRAILING_NONE)
+        pid = _open_long(pt, entry=100.0, sl=98.0, t1=105.0, t2=107.0, qty=10)
+        db = str(tmp_path / "geom.db")
+        before = _geo(db, pid)
+        assert before["initial_stop_loss"] == pytest.approx(98.0)
+        assert pt.get_position(pid)["stop_loss"] == pytest.approx(98.0)
+
+        exits = pt.check_stops({"GEOMX": 105.5})
+        assert any(e.get("exit_reason") == "T1_PARTIAL" for e in exits)
+
+        pos = pt.get_position(pid)
+        assert pos["stop_loss"] == pytest.approx(100.0)          # CURRENT moved
+        assert pos["initial_stop_loss"] == pytest.approx(98.0)   # INITIAL frozen
+        # This is the measurement the capture exists to make possible: the
+        # ledger's own stop now implies ZERO risk per share.
+        assert abs(pos["entry_price"] - pos["stop_loss"]) == 0.0
+        assert pos["initial_risk_per_share"] == pytest.approx(2.0)
+
+        after = _geo(db, pid)
+        assert after["initial_stop_loss"] == pytest.approx(98.0)
+        assert after["initial_risk_per_share"] == pytest.approx(2.0)
+        assert after["actual_risk"] == pytest.approx(20.0)
+        assert after["risk_budget_utilization"] == pytest.approx(10.0)
+        assert before == after, "the entry-time row was mutated after the fact"
+
+    def test_trailing_the_stop_further_leaves_the_initial_risk_untouched(
+            self, tmp_path):
+        """Default config: T1 protection to breakeven, then the trailing stop
+        ratchets above it. The CURRENT stop ends at 109.5 - a 9.5 'risk' per
+        share in the ledger, which is a profit lock, not a risk measurement."""
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, t1=105.0, t2=130.0, qty=10)
+        db = str(tmp_path / "geom.db")
+        pt.check_stops({"GEOMX": 105.5})
+        assert pt.get_position(pid)["stop_loss"] == pytest.approx(103.0)
+        pt.check_stops({"GEOMX": 112.0})
+        pos = pt.get_position(pid)
+        assert pos["stop_loss"] == pytest.approx(109.5)
+        assert pos["stop_loss"] > pos["entry_price"]
+        assert pos["initial_stop_loss"] == pytest.approx(98.0)
+
+        g = _geo(db, pid)
+        assert g["initial_stop_loss"] == pytest.approx(98.0)
+        assert g["initial_risk_per_share"] == pytest.approx(2.0)
+        assert g["actual_risk"] == pytest.approx(20.0)
+        assert g["risk_budget_utilization"] == pytest.approx(10.0)
+
+    def test_partial_exit_then_final_exit_keeps_pnl_and_entry_geometry_correct(
+            self, tmp_path):
+        """T1 partial 5 @ 105.5 = +27.50, then T2 final 5 @ 108.0 = +40.00."""
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, t1=105.0, t2=107.0, qty=10)
+        db = str(tmp_path / "geom.db")
+
+        exits = pt.check_stops({"GEOMX": 105.5})
+        assert [(e["exit_reason"], e["exit_quantity"], e["pnl"]) for e in exits] \
+            == [("T1_PARTIAL", 5.0, 27.5)]
+        pos = pt.get_position(pid)
+        assert pos["remaining_quantity"] == pytest.approx(5.0)
+        assert pos["realized_pnl"] == pytest.approx(27.5)
+
+        exits2 = pt.check_stops({"GEOMX": 108.0})
+        assert [e["exit_reason"] for e in exits2] == ["T2_FINAL"]
+        assert pt.get_position(pid) is None
+        assert pt.get_portfolio_summary()["realized_pnl"] == pytest.approx(67.5)
+
+        g = _geo(db, pid)
+        assert g["initial_stop_loss"] == pytest.approx(98.0)
+        assert g["initial_quantity"] == pytest.approx(10.0)    # NOT the 5 left
+        assert g["initial_risk_per_share"] == pytest.approx(2.0)
+        assert g["actual_risk"] == pytest.approx(20.0)         # NOT 5 x 2.0
+        assert g["risk_budget_utilization"] == pytest.approx(10.0)
+
+    def test_a_stop_out_entry_closes_at_a_loss_without_erasing_the_geometry(
+            self, tmp_path):
+        """The stop fills at the observed price, so 10 @ 97.5 = -25.00 while
+        the planned entry risk was 10 x 2.0 = 20.00. The capture reports the
+        PLANNED risk, which is what a utilization budget must be measured
+        against; slippage is a separate P&L effect, deliberately not folded
+        in here."""
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, t1=105.0, t2=107.0, qty=10)
+        exits = pt.check_stops({"GEOMX": 97.5})
+        assert [e["exit_reason"] for e in exits] == ["STOP_LOSS"]
+        assert pt.get_position(pid) is None
+        assert pt.get_portfolio_summary()["realized_pnl"] == pytest.approx(-25.0)
+        g = _geo(str(tmp_path / "geom.db"), pid)
+        assert g["initial_stop_loss"] == pytest.approx(98.0)
+        assert g["initial_risk_per_share"] == pytest.approx(2.0)
+        assert g["actual_risk"] == pytest.approx(20.0)
+        assert g["risk_budget_utilization"] == pytest.approx(10.0)
+
+    def test_the_capture_cannot_be_rewritten_by_a_later_fill_of_the_same_row(
+            self, tmp_path):
+        """INSERT OR IGNORE on position_id makes the ledger genuinely insert-once."""
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, qty=10)
+        db = str(tmp_path / "geom.db")
+        first = _geo(db, pid)
+        forged = EntryRiskGeometry(
+            position_id=pid, symbol="GEOMX", direction="LONG", entry_price=1.0,
+            initial_stop_loss=0.5, initial_risk_per_share=0.5, actual_risk=5.0)
+        assert persist_entry_geometry(forged, db_path=db) is False
+        assert _geo(db, pid) == first
+
+    def test_a_position_from_before_the_capture_is_absent_not_reconstructed(
+            self, tmp_path):
+        """Historical positions have no row. That means unreliable - never a
+        backfilled number."""
+        pt = _geom_engine(tmp_path)
+        r = pt.place_order("OLDX", "LONG", 10, 100.0, 98.0, 105.0, 107.0)
+        pt.cancel_order(r["order_id"])
+        pid = "historical000001"
+        assert load_geometry_for(pid, db_path=str(tmp_path / "geom.db")) is None
+        assert pid not in load_all_geometry(db_path=str(tmp_path / "geom.db"))
+
+
+class TestEntryGeometryShadowIsolation:
+    """Section 7: the SHADOW column is measurement, never execution."""
+
+    def test_shadow_is_computed_at_entry_from_entry_time_data_only(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, t1=105.0, t2=107.0, qty=50)
+        g = _geo(str(tmp_path / "geom.db"), pid)
+        # 200 budget / 2.0 risk = 100 shares (the cash cap of 95 is NOT applied
+        # to the shadow: it isolates the risk budget from the cash constraint).
+        assert g["shadow_quantity"] == 100
+        assert g["shadow_exposure"] == pytest.approx(10_000.0)
+        assert g["shadow_initial_risk"] == pytest.approx(200.0)
+        assert g["shadow_utilization"] == pytest.approx(100.0)
+        assert g["current_exposure"] == pytest.approx(5_000.0)
+
+    def test_the_shadow_multiple_is_reported_for_every_capture(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, t1=105.0, t2=107.0, qty=50)
+        g = capture_entry_geometry(pt.get_position(pid), CAPITAL, RISK_PCT)
+        assert g.shadow_multiple == pytest.approx(2.0)
+
+    def test_shadow_is_labelled_as_never_executed(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, qty=50)
+        d = capture_entry_geometry(pt.get_position(pid), CAPITAL, RISK_PCT).to_dict()
+        assert "NOT EXECUTED" in d["shadow_label"]
+        assert "NOT REALIZED" in d["shadow_label"]
+
+    def test_the_shadow_quantity_is_never_placed_as_an_order(self, tmp_path):
+        """The strongest available guard: the shadow number is not even a legal
+        order quantity anywhere in the system."""
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, t1=105.0, t2=107.0, qty=50)
+        g = _geo(str(tmp_path / "geom.db"), pid)
+        assert g["shadow_quantity"] == 100
+        pos = pt.get_position(pid)
+        assert pos["quantity"] == pytest.approx(50.0)
+        assert len(pt.get_positions()) == 1
+        assert pt.get_portfolio_summary()["positions_count"] == 1
+        # and the exposure actually committed is the current one
+        assert pt.get_portfolio_summary()["total_value"] < 10_000.0 + 50.0
+
+    def test_shadow_does_not_enter_realized_pnl(self, tmp_path):
+        """50 actual shares vs the 100-share SHADOW. The shadow's hypothetical
+        result is never booked; only the actual 50 shares earn."""
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, t1=105.0, t2=107.0, qty=50)
+        db = str(tmp_path / "geom.db")
+        g = _geo(db, pid)
+        assert g["shadow_quantity"] == 100
+        assert g["actual_quantity"] == pytest.approx(50.0)
+
+        pt.check_stops({"GEOMX": 105.5})       # T1: 25 @ +5.50 = +137.50
+        pt.check_stops({"GEOMX": 107.5})       # T2: 25 @ +7.50 = +187.50
+        assert pt.get_portfolio_summary()["realized_pnl"] == pytest.approx(325.0)
+
+        # the doubled-size counterfactual stays a counterfactual
+        shadow_pnl = 2 * 325.0
+        assert pt.get_portfolio_summary()["realized_pnl"] < shadow_pnl
+        # ... and re-reading the ledger changes nothing
+        assert _geo(db, pid)["actual_quantity"] == pytest.approx(50.0)
+        assert _geo(db, pid)["shadow_quantity"] == 100
+
+
+class TestGeometryLedgerIsAdditive:
+    """Section 9: the ledger is additive and never rewrites history."""
+
+    def test_ensure_is_idempotent_and_touches_nothing_else(self, tmp_path):
+        import shutil
+        import tempfile
+
+        src = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "intradayai.db")
+        if not os.path.exists(src):
+            pytest.skip("no live ledger present in this environment")
+        with tempfile.TemporaryDirectory() as tmp:
+            work = os.path.join(tmp, "copy.db")
+            shutil.copy2(src, work)
+
+            def snapshot(path):
+                con = sqlite3.connect(path)
+                out = {
+                    "tables": {r[0] for r in con.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'")},
+                    "trades": con.execute(
+                        "SELECT COUNT(*), COALESCE(SUM(COALESCE(pnl,0)),0) "
+                        "FROM trades").fetchone(),
+                    "geometry_cols": sorted(
+                        r[1] for r in con.execute(
+                            f"PRAGMA table_info({GEOMETRY_TABLE})")) if
+                        GEOMETRY_TABLE in {x[0] for x in con.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'")}
+                        else None,
+                }
+                con.close()
+                return out
+
+            before = snapshot(work)
+            ensure_geometry_schema(work)
+            ensure_geometry_schema(work)     # second run must be a no-op
+            after = snapshot(work)
+
+            # exactly one new table, and nothing removed
+            assert after["tables"] - before["tables"] <= {GEOMETRY_TABLE}
+            assert not before["tables"] - after["tables"], "a table was dropped"
+            # historical performance data is byte-for-byte identical
+            assert after["trades"] == before["trades"]
+            # and the geometry table's own shape is stable across runs
+            if before["geometry_cols"] is not None:
+                assert after["geometry_cols"] == before["geometry_cols"]
+            cols = set(after["geometry_cols"] or ())
+            assert {"risk_budget", "initial_stop_loss", "actual_risk"} <= cols
+
+    def test_the_geometry_ledger_is_a_separate_table_from_trades(self, tmp_path):
+        """The measurement columns must never be added to `trades`.
+
+        They share descriptive names (entry_price, quantity, stop_loss) but
+        live in their own INSERT-only table, so a historical trade row can
+        never gain a geometry column that would read as a measurement it
+        never had.
+        """
+        from app.services.position_sizing_store import _COLUMNS
+        db = str(tmp_path / "sep.db")
+        ensure_geometry_schema(db)
+        conn = sqlite3.connect(db)
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        geo_cols = {r[1] for r in conn.execute(f"PRAGMA table_info({GEOMETRY_TABLE})")}
+        trades_tables = {t for t in tables if t.endswith("trades")}
+        trade_cols = set()
+        for t in trades_tables:
+            trade_cols |= {r[1] for r in conn.execute(f"PRAGMA table_info({t})")}
+        conn.close()
+        assert GEOMETRY_TABLE in tables
+        assert GEOMETRY_TABLE not in trades_tables
+        assert "risk_budget" in geo_cols and "risk_budget" not in trade_cols
+        assert "risk_budget_utilization" in geo_cols
+        assert "risk_budget_utilization" not in trade_cols
+        assert set(_COLUMNS) == geo_cols, "the INSERT column list has drifted"
+
+    def test_a_capture_never_writes_to_the_trades_ledger(self, tmp_path):
+        db = str(tmp_path / "geom.db")
+        ensure_geometry_schema(db)
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE trades (id VARCHAR(16), pnl FLOAT)")
+        conn.execute("INSERT INTO trades VALUES ('t1', 12.5)")
+        conn.commit()
+        conn.close()
+
+        g = capture_entry_geometry(
+            {"id": "p1", "symbol": "A", "direction": "LONG", "entry_price": 100.0,
+             "stop_loss": 98.0, "quantity": 50},
+            account_capital=CAPITAL, risk_pct=RISK_PCT)
+        persist_entry_geometry(g, db_path=db)
+
+        conn = sqlite3.connect(db)
+        assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
+        assert conn.execute("SELECT pnl FROM trades").fetchone()[0] == 12.5
+        conn.close()
+
+    def test_a_measurement_failure_never_prevents_a_fill(self, tmp_path, monkeypatch):
+        """The capture is best-effort by construction: a broken measurement
+        layer must not be able to stop a trade."""
+        import app.services.position_sizing as ps
+
+        def boom(*a, **kw):
+            raise RuntimeError("geometry capture exploded")
+
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, qty=10)
+        monkeypatch.setattr(ps, "capture_entry_geometry", boom)
+        r = pt.place_order("BOOMX", "LONG", 10, 100.0, 98.0, 105.0, 107.0,
+                           quantity_source=SOURCE_MANUAL)
+        filled = pt.fill_order(r["order_id"])
+        assert filled["status"] == "filled"
+        assert pt.get_position(r["order_id"]) is not None
+        assert pid  # the pre-existing capture is untouched
+
+
+class TestOrderFlowIsUnchanged:
+    """The capture is measurement only: order flow must behave identically."""
+
+    def test_place_order_gains_only_a_new_optional_key(self):
+        import inspect
+
+        from app.services.paper_trading import PaperAccount
+        sig = inspect.signature(PaperAccount.place_order)
+        assert sig.parameters["quantity_source"].default is None
+        # every pre-existing parameter keeps its original name and default
+        assert sig.parameters["quantity"].default is inspect.Parameter.empty
+        assert sig.parameters["stop_loss"].default == 0
+        assert sig.parameters["signal_id"].default is None
+
+    def test_the_api_records_the_branch_it_actually_taken_without_changing_it(
+            self):
+        import inspect
+
+        from app.api import trading
+        src = inspect.getsource(trading.place_paper_order)
+        # the sizing decision itself is untouched
+        assert "qty = order.quantity" in src
+        assert "if qty <= 0:" in src
+        assert "risk_engine.calculate_position_size(" in src
+        # and the provenance is a pure record of that branch
+        assert "SOURCE_RISK_ENGINE if order.quantity <= 0 else SOURCE_MANUAL" in src
+
+    def test_a_geometry_capture_does_not_change_the_filled_quantity(self, tmp_path):
+        pt = _geom_engine(tmp_path)
+        pid = _open_long(pt, entry=100.0, sl=98.0, qty=37)
+        assert pt.get_position(pid)["quantity"] == pytest.approx(37.0)
+        assert pt.get_portfolio_summary()["cash"] == pytest.approx(
+            10_000.0 - 37 * 100.0)
+
+    def test_the_risk_engine_sizing_path_is_untouched(self):
+        """Guards the upstream formula the measurement mirrors."""
+        from app.services.risk_engine import RiskConfig, RiskEngine
+        eng = RiskEngine(RiskConfig(account_capital=10_000.0))
+        assert eng.calculate_position_size(100.0, 98.0) == 95     # cash-capped
+        assert eng.calculate_position_size(100.0, 80.0) == 10     # risk-capped
+        # and the mirror agrees with it on both branches
+        for entry, stop in ((100.0, 98.0), (100.0, 80.0), (2500.0, 2460.0),
+                            (100.0, 99.9), (50.0, 1.0)):
+            engine_qty = eng.calculate_position_size(entry, stop)
+            g = capture_entry_geometry(
+                {"id": "p", "symbol": "A", "direction": "LONG", "entry_price": entry,
+                 "stop_loss": stop, "quantity": max(engine_qty, 1)},
+                account_capital=10_000.0, risk_pct=2.0)
+            assert g.allowed_quantity == engine_qty, (entry, stop)

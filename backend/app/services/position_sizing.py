@@ -440,6 +440,318 @@ def shadow_sizing_comparison(
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# ENTRY-TIME CAPTURE
+#
+# Everything above this line reconstructs geometry from a closed ledger row and
+# therefore has to cope with a stop that Profit Capture has already moved. What
+# follows captures the geometry instead of reconstructing it, once, at the
+# instant an order becomes an open position.
+# ────────────────────────────────────────────────────────────────────────────
+
+# Explicit order classifications required for measurement.
+CLASS_RISK_ENGINE_SIZED = "RISK_ENGINE_SIZED"
+CLASS_MANUAL_QUANTITY = "MANUAL_QUANTITY"
+CLASS_CAPITAL_CONSTRAINED = "CAPITAL_CONSTRAINED"
+CLASS_RISK_CONSTRAINED = "RISK_CONSTRAINED"
+CLASS_UNCLASSIFIED = "UNCLASSIFIED"
+
+#: How the quantity that filled was chosen.
+SOURCE_RISK_ENGINE = "RISK_ENGINE"
+SOURCE_MANUAL = "MANUAL"
+
+
+def classify_order(
+    actual_quantity: Optional[float],
+    allowed_quantity: int,
+    quantity_source: Optional[str] = None,
+    binding: str = BINDING_UNAVAILABLE,
+) -> str:
+    """Classify an order WITHOUT altering the quantity that was filled.
+
+    The four labels are mutually exclusive and are reported, never acted on. A
+    manually supplied UI quantity is never silently replaced by a computed
+    one - the whole point of this task is to make the difference visible.
+
+    ``quantity_source`` is authoritative when the caller states it (the order
+    endpoint knows whether it invoked the risk engine). When it is absent the
+    class is INFERRED by comparing the filled quantity against
+    ``allowed_quantity``, which is exact for an engine-sized order and merely
+    indicative for a hand-typed one that happens to coincide.
+    """
+    if quantity_source == SOURCE_MANUAL:
+        return CLASS_MANUAL_QUANTITY
+    if quantity_source == SOURCE_RISK_ENGINE:
+        if binding == BINDING_CAPITAL:
+            return CLASS_CAPITAL_CONSTRAINED
+        if binding == BINDING_RISK_BUDGET:
+            return CLASS_RISK_CONSTRAINED
+        return CLASS_RISK_ENGINE_SIZED
+
+    # Inferred path: no caller statement available.
+    if actual_quantity is None or actual_quantity <= 0 or allowed_quantity <= 0:
+        return CLASS_UNCLASSIFIED
+    if int(round(actual_quantity)) == int(allowed_quantity):
+        if binding == BINDING_CAPITAL:
+            return CLASS_CAPITAL_CONSTRAINED
+        if binding == BINDING_RISK_BUDGET:
+            return CLASS_RISK_CONSTRAINED
+        return CLASS_RISK_ENGINE_SIZED
+    return CLASS_MANUAL_QUANTITY
+
+
+@dataclass(frozen=True)
+class EntryRiskGeometry:
+    """Immutable entry-time risk geometry for ONE filled position.
+
+    Every value here is read at fill time and is never recomputed. The
+    ``initial_*`` names are load-bearing: Profit Capture writes ``stop_loss``,
+    ``target_1`` and ``target_2`` on the live position as it manages the trade,
+    so the entry-time levels must live under names it cannot collide with.
+
+    ``usable``/``geometry_reliable`` are False when the capture could not be
+    established (no stop, a breakeven stop, or a non-positive level). Such a
+    capture is still recorded, because "we could not measure this" is a fact
+    worth keeping, whereas a silent NULL reads like a zero risk.
+    """
+
+    position_id: str
+    symbol: str
+    direction: str
+    user_id: Optional[str] = None
+    signal_id: Optional[str] = None
+    captured_at: Optional[str] = None
+    capture_source: str = "ORDER_FILL"
+
+    entry_price: float = 0.0
+    initial_stop_loss: Optional[float] = None
+    initial_target_1: Optional[float] = None
+    initial_target_2: Optional[float] = None
+    initial_risk_per_share: Optional[float] = None
+    initial_risk_amount: Optional[float] = None
+    initial_quantity: Optional[float] = None
+
+    account_capital: float = 0.0
+    configured_risk_percent: float = 0.0
+    risk_budget: float = 0.0
+    risk_constraint_quantity: int = 0
+    capital_constraint_quantity: int = 0
+    allowed_quantity: int = 0
+    actual_quantity: Optional[float] = None
+    intended_risk: Optional[float] = None
+    actual_risk: Optional[float] = None
+    risk_budget_utilization: Optional[float] = None
+
+    order_classification: str = CLASS_UNCLASSIFIED
+    binding_constraint: str = BINDING_UNAVAILABLE
+    quantity_source: Optional[str] = None
+
+    # -- SHADOW: risk-budget-driven sizing. Never executed, never realized.
+    shadow_quantity: int = 0
+    shadow_exposure: float = 0.0
+    shadow_initial_risk: Optional[float] = None
+    shadow_utilization: Optional[float] = None
+    current_exposure: float = 0.0
+
+    geometry_reliable: bool = False
+
+    @property
+    def usable(self) -> bool:
+        return bool(
+            self.entry_price > 0
+            and self.initial_risk_per_share
+            and self.initial_risk_per_share > 0
+            and self.initial_quantity
+            and self.initial_quantity > 0
+        )
+
+    @property
+    def shadow_multiple(self) -> Optional[float]:
+        if not (self.actual_quantity and self.actual_quantity > 0
+                and self.shadow_quantity > 0):
+            return None
+        return self.shadow_quantity / self.actual_quantity
+
+    def to_row(self) -> dict:
+        """Flatten to the exact column set of the geometry ledger."""
+        return {
+            "position_id": self.position_id,
+            "user_id": self.user_id,
+            "signal_id": self.signal_id,
+            "symbol": self.symbol,
+            "direction": self.direction,
+            "captured_at": self.captured_at,
+            "capture_source": self.capture_source,
+            "entry_price": self.entry_price,
+            "initial_stop_loss": self.initial_stop_loss,
+            "initial_target_1": self.initial_target_1,
+            "initial_target_2": self.initial_target_2,
+            "initial_risk_per_share": self.initial_risk_per_share,
+            "initial_risk_amount": self.initial_risk_amount,
+            "initial_quantity": self.initial_quantity,
+            "account_capital": self.account_capital,
+            "configured_risk_percent": self.configured_risk_percent,
+            "risk_budget": self.risk_budget,
+            "risk_constraint_quantity": self.risk_constraint_quantity,
+            "capital_constraint_quantity": self.capital_constraint_quantity,
+            "allowed_quantity": self.allowed_quantity,
+            "actual_quantity": self.actual_quantity,
+            "intended_risk": self.intended_risk,
+            "actual_risk": self.actual_risk,
+            "risk_budget_utilization": self.risk_budget_utilization,
+            "order_classification": self.order_classification,
+            "binding_constraint": self.binding_constraint,
+            "quantity_source": self.quantity_source,
+            "shadow_quantity": self.shadow_quantity,
+            "shadow_exposure": self.shadow_exposure,
+            "shadow_initial_risk": self.shadow_initial_risk,
+            "shadow_utilization": self.shadow_utilization,
+            "current_exposure": self.current_exposure,
+            "geometry_reliable": 1 if self.geometry_reliable else 0,
+        }
+
+    def to_dict(self) -> dict:
+        row = self.to_row()
+        row["geometry_reliable"] = self.geometry_reliable
+        row["shadow_multiple"] = self.shadow_multiple
+        row["shadow_label"] = "SHADOW - NOT EXECUTED, NOT REALIZED P&L"
+        return row
+
+
+def capture_entry_geometry(
+    position: dict,
+    account_capital: float = 10_000.0,
+    risk_pct: float = 2.0,
+    quantity_source: Optional[str] = None,
+    captured_at: Optional[str] = None,
+) -> EntryRiskGeometry:
+    """Freeze the risk geometry of ``position`` at the moment it was filled.
+
+    Reads ONLY the levels the position carries right now - which, when called
+    from ``PaperAccount.fill_order``, are the levels as of entry. It does not
+    consult any later price, any bar, or any exit record, so the result is
+    free of lookahead and is identical whether computed at fill or recomputed
+    years later from the stored row.
+
+    ``quantity_source`` should be supplied by the caller that actually chose
+    the quantity (``RISK_ENGINE`` or ``MANUAL``) so the classification is a
+    recorded fact rather than an inference. When omitted the class is inferred
+    by comparing the filled quantity against ``allowed_quantity``.
+    """
+    entry = _finite(position.get("entry_price")) or 0.0
+    stop = _finite(position.get("stop_loss"))
+    t1 = _finite(position.get("target_1"))
+    t2 = _finite(position.get("target_2"))
+    # At FILL, `quantity` is authoritative: fill_order prices the fill from
+    # order["quantity"], and edit_order rewrites that field without touching
+    # initial_quantity. So an edited order's initial_quantity is the PRE-EDIT
+    # size and must not be used here.
+    #
+    # Note the deliberate asymmetry with the reconstruction path above, which
+    # prefers initial_quantity: on a CLOSED ledger row `quantity` has been
+    # reduced to the final remaining slice, so the order is reversed there.
+    # Capture-at-fill and reconstruct-from-closed-row are different questions
+    # and must not share a precedence rule.
+    qty = _finite(position.get("quantity"))
+    if qty is None or qty <= 0:
+        qty = _finite(position.get("initial_quantity"))
+
+    # A stop sitting exactly on entry carries no risk information: it is either
+    # a breakeven stop or an absent one, and neither yields a risk per share.
+    rps: Optional[float] = None
+    if entry > 0 and stop is not None and stop > 0 and abs(entry - stop) > 0:
+        rps = abs(entry - stop)
+
+    capital = _finite(account_capital) or 0.0
+    pct = _finite(risk_pct) or 0.0
+    budget = risk_budget_for(capital, pct)
+
+    risk_q = risk_based_quantity(budget, rps) if rps else 0
+    cap_q = capital_based_quantity(capital, entry) if entry > 0 else 0
+    allowed = min(risk_q, cap_q)
+
+    # Per the sizing contract: intended_risk is the risk the BUDGET implies
+    # (risk_constraint_quantity x risk_per_share). It is deliberately NOT capped
+    # by the cash constraint, so it can exceed the risk an affordable position
+    # would actually carry - which is exactly the gap this task quantifies.
+    intended = risk_q * rps if (risk_q and rps) else None
+    actual_risk = qty * rps if (qty and rps) else None
+
+    binding = binding_constraint(risk_q, cap_q, None)
+    shadow_q = risk_q
+
+    return EntryRiskGeometry(
+        position_id=str(position.get("id") or ""),
+        user_id=position.get("user_id"),
+        signal_id=position.get("signal_id"),
+        symbol=str(position.get("symbol") or ""),
+        direction=str(position.get("direction") or ""),
+        captured_at=captured_at,
+        entry_price=entry,
+        initial_stop_loss=stop,
+        initial_target_1=t1,
+        initial_target_2=t2,
+        initial_risk_per_share=rps,
+        initial_risk_amount=actual_risk,
+        initial_quantity=qty,
+        account_capital=capital,
+        configured_risk_percent=pct,
+        risk_budget=budget,
+        risk_constraint_quantity=risk_q,
+        capital_constraint_quantity=cap_q,
+        allowed_quantity=allowed,
+        actual_quantity=qty,
+        intended_risk=intended,
+        actual_risk=actual_risk,
+        risk_budget_utilization=(
+            actual_risk / budget * 100.0
+            if (actual_risk is not None and budget > 0) else None
+        ),
+        order_classification=classify_order(
+            qty, allowed, quantity_source, binding
+        ),
+        binding_constraint=binding,
+        quantity_source=quantity_source,
+        shadow_quantity=shadow_q,
+        shadow_exposure=shadow_q * entry,
+        shadow_initial_risk=(shadow_q * rps) if (shadow_q and rps) else None,
+        shadow_utilization=(
+            (shadow_q * rps) / budget * 100.0
+            if (shadow_q and rps and budget > 0) else None
+        ),
+        current_exposure=(qty * entry) if (qty and entry) else 0.0,
+        geometry_reliable=bool(entry > 0 and rps and qty and qty > 0),
+    )
+
+
+def captured_geometry_fields() -> dict:
+    """Map of position-dict key -> :class:`EntryRiskGeometry` attribute.
+
+    Naming these explicitly (rather than splatting a whole dataclass into the
+    position) keeps the position readable and guarantees the capture adds only
+    keys that Profit Capture's ``profit_meta`` serializer and the trailing
+    logic have no reason to touch.
+
+    Every key on the left is ``initial_*``. That is the load-bearing part: the
+    live position's ``stop_loss``/``target_1``/``target_2`` are rewritten by
+    Profit Capture, so the frozen entry levels must sit under names that
+    nothing else writes.
+    """
+    return {
+        "initial_entry_price": "entry_price",
+        "initial_stop_loss": "initial_stop_loss",
+        "initial_target_1": "initial_target_1",
+        "initial_target_2": "initial_target_2",
+        "initial_risk_per_share": "initial_risk_per_share",
+        "initial_risk_amount": "initial_risk_amount",
+        "initial_risk_budget": "risk_budget",
+        "initial_allowed_quantity": "allowed_quantity",
+        "initial_risk_utilization": "risk_budget_utilization",
+        "initial_order_classification": "order_classification",
+        "initial_geometry_reliable": "geometry_reliable",
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Aggregate
 # ────────────────────────────────────────────────────────────────────────────
 

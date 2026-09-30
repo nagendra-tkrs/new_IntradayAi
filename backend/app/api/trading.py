@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy import select
 from app.services.paper_trading import PaperTradingEngine
+from app.services.position_sizing import SOURCE_MANUAL, SOURCE_RISK_ENGINE
 from app.services.risk_engine import RiskEngine, RiskConfig
 from app.services import signal_store
 from app.services.performance_comparison import compare_legacy_vs_profit_capture
@@ -241,6 +242,16 @@ async def place_paper_order(order: OrderRequest, user: User = Depends(get_curren
     if not valid:
         raise HTTPException(status_code=400, detail=msg)
 
+    # ── Sizing-path provenance (measurement only) ──────────────────────────
+    # `qty = order.quantity` means the risk engine is consulted ONLY when the
+    # caller sends quantity <= 0. The paper-trading UI always sends a quantity
+    # (`orderQty[sym] || 1` / `useState(1)`, default 1 share), so in practice
+    # calculate_position_size() below is unreachable from the UI and the
+    # configured risk budget is bypassed. This records which branch ACTUALLY
+    # ran so risk utilization can be attributed rather than inferred. It does
+    # not alter the branch, the quantity, or any validation.
+    quantity_source = SOURCE_RISK_ENGINE if order.quantity <= 0 else SOURCE_MANUAL
+
     qty = order.quantity
     if qty <= 0:
         qty = risk_engine.calculate_position_size(
@@ -269,6 +280,7 @@ async def place_paper_order(order: OrderRequest, user: User = Depends(get_curren
         user_id=user.id,
         atr=order.atr,
         signal_id=order.signal_id,
+        quantity_source=quantity_source,
     )
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])

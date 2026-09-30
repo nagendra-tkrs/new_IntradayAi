@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -20,6 +21,8 @@ from app.services.profit_capture import (
     apply_t1_protection,
     update_trailing_stop,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_sqlite_path(db_url: str) -> Optional[str]:
@@ -489,8 +492,14 @@ class PaperAccount:
         self,
         user_id: Optional[str] = None,
         profit_config: Optional[ProfitCaptureConfig] = None,
+        db_path: Optional[str] = None,
     ):
         self.user_id = user_id
+        # Where measurement ledgers (entry-time risk geometry) are written.
+        # None resolves to the configured DATABASE_URL - and, because
+        # signal_store._conn skips writes under pytest, tests never touch the
+        # live ledger unless they pass an explicit path.
+        self._db_path = db_path
         self.cash: float = settings.INITIAL_CAPITAL
         self.pending_orders: dict[str, dict] = {}
         self.positions: dict[str, dict] = {}
@@ -663,6 +672,7 @@ class PaperAccount:
         user_id: Optional[str] = None,
         atr: Optional[float] = None,
         signal_id: Optional[str] = None,
+        quantity_source: Optional[str] = None,
     ) -> dict:
         if quantity <= 0:
             return {"error": "Invalid quantity"}
@@ -719,6 +729,13 @@ class PaperAccount:
             # Traceability: the AI recommendation (signals.id) this order
             # originated from, when the caller supplies it.
             "signal_id": signal_id,
+            # Measurement only: how the caller chose ``quantity`` (RISK_ENGINE
+            # vs MANUAL). Carried onto the position purely so the entry-time
+            # geometry capture can report a RECORDED classification instead of
+            # inferring it. Never read by any validation, sizing or execution
+            # decision - see api/trading.create_paper_order, where this is set
+            # from the branch that actually ran.
+            "quantity_source": quantity_source,
         }
         self.pending_orders[position_id] = position
         self._dirty = True
@@ -820,6 +837,45 @@ class PaperAccount:
         order["filled_at"] = now_ist().isoformat()
         self.positions[position_id] = order
         self._dirty = True
+        # ── Entry-time risk geometry capture (measurement only) ──────────────
+        # This is the ONLY place the entry-time stop is still recoverable:
+        # `fill_order` is the single choke point every fill passes through
+        # (the manual fill endpoint AND `check_entry_triggers` auto-fill), and
+        # it runs before Profit Capture can move `stop_loss` to breakeven. The
+        # capture is frozen into an INSERT-only ledger
+        # (position_sizing_store), so nothing later in the trade's life - T1
+        # protection, trailing stop, partial close - can alter it.
+        #
+        # Wrapped end-to-end: a measurement failure must never prevent a fill.
+        geometry = None
+        try:
+            from app.services.position_sizing import (
+                capture_entry_geometry, captured_geometry_fields,
+            )
+            from app.services.position_sizing_store import persist_entry_geometry
+
+            geometry = capture_entry_geometry(
+                order,
+                account_capital=float(getattr(settings, "INITIAL_CAPITAL", 10_000) or 10_000),
+                # The CONFIGURED per-trade risk, not the quality-adjusted one the
+                # risk engine may have applied. Measurement must stay stable
+                # across signals: the strategy's configured budget is the
+                # denominator utilization is measured against.
+                risk_pct=float(
+                    getattr(settings, "BASE_RISK_PER_TRADE_PCT", 2.0) or 2.0
+                ),
+                quantity_source=order.get("quantity_source"),
+                captured_at=order.get("filled_at"),
+            )
+            # Mirror the frozen levels onto the live position under `initial_*`
+            # keys so they remain visible for the position's lifetime. These
+            # names cannot collide with the live `stop_loss`/`target_*` that
+            # Profit Capture rewrites.
+            for pos_key, geo_field in captured_geometry_fields().items():
+                order[pos_key] = getattr(geometry, geo_field, None)
+            persist_entry_geometry(geometry, db_path=self._db_path)
+        except Exception as e:  # never block a fill on measurement issues
+            logger.warning("entry-time geometry capture failed for %s: %s", position_id, e)
         return {"order_id": position_id, "status": "filled", "position": order}
 
     def cancel_order(self, position_id: str) -> dict:
@@ -1184,7 +1240,11 @@ class PaperTradingEngine:
 
     def _ensure_account(self, user_id: Optional[str]) -> PaperAccount:
         if user_id not in self.accounts:
-            acc = PaperAccount(user_id=user_id, profit_config=self.profit_config)
+            acc = PaperAccount(
+                user_id=user_id,
+                profit_config=self.profit_config,
+                db_path=self._db_path,
+            )
             if user_id:
                 # Replay the durable closed-trade ledger (read-only) so a fresh
                 # account agrees with /paper/trades, /paper/performance and the
@@ -1248,6 +1308,7 @@ class PaperTradingEngine:
         user_id: Optional[str] = None,
         atr: Optional[float] = None,
         signal_id: Optional[str] = None,
+        quantity_source: Optional[str] = None,
     ) -> dict:
         acc = self._ensure_account(user_id)
         result = acc.place_order(
@@ -1261,6 +1322,7 @@ class PaperTradingEngine:
             user_id=user_id,
             atr=atr,
             signal_id=signal_id,
+            quantity_source=quantity_source,
         )
         if "error" not in result:
             self.persist_snapshot(acc.user_id)

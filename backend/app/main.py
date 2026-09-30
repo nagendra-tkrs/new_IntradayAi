@@ -53,6 +53,13 @@ async def lifespan(app: FastAPI):
         ensure_signal_schema()
     except Exception:
         pass
+    # Additive entry-time risk-geometry ledger (position_risk_geometry).
+    # Measurement only: INSERT-only, never read back into any trading decision.
+    try:
+        from app.services.position_sizing_store import ensure_geometry_schema
+        ensure_geometry_schema()
+    except Exception:
+        pass
     # Best-effort: ensure a default user exists so authenticated endpoints work
     # even when Google OAuth is not configured or used.
     try:

@@ -273,6 +273,7 @@ def main() -> int:
 
     if args.no_bars:
         _print_sizing(positions, payload)
+        _print_captured_geometry(payload)
         _print_verdict(base)
         if args.json_out:
             _dump(payload, args.json_out)
@@ -446,10 +447,88 @@ def main() -> int:
     # ---------------------------------------------------------------- 8
     _print_sizing(positions, payload)
 
+    # ---------------------------------------------------------------- 9
+    _print_captured_geometry(payload)
+
     _print_verdict(base)
     if args.json_out:
         _dump(payload, args.json_out)
     return 0
+
+
+def _load_captured_geometry(payload: dict) -> None:
+    """Read the INSERT-only entry-time geometry ledger (read-only).
+
+    Absence is meaningful: a position with no row was filled before the capture
+    existed, so its geometry is simply unknown. Nothing here reconstructs,
+    backfills or estimates - it reports only what was actually captured.
+    """
+    from app.services.position_sizing_store import (
+        GEOMETRY_TABLE, SOURCE_ORDER_FILL,
+    )
+
+    rows = []
+    try:
+        conn = _read_only(_resolve_db_path())
+    except Exception:
+        conn = None
+    if conn is not None:
+        try:
+            conn.row_factory = sqlite3.Row
+            have = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if GEOMETRY_TABLE in have:
+                rows = [dict(r) for r in conn.execute(
+                    f"SELECT * FROM {GEOMETRY_TABLE} ORDER BY captured_at")]
+        except Exception:
+            rows = []
+        finally:
+            conn.close()
+
+    def _mean(key):
+        vals = [r.get(key) for r in rows if r.get(key) is not None]
+        return sum(vals) / len(vals) if vals else None
+
+    reliable = [r for r in rows if r.get("geometry_reliable")]
+    classes: dict = {}
+    for r in rows:
+        classes[r.get("order_classification") or "UNCLASSIFIED"] = \
+            classes.get(r.get("order_classification") or "UNCLASSIFIED", 0) + 1
+    bindings: dict = {}
+    for r in rows:
+        if (r.get("order_classification") or "") in (
+                "CAPITAL_CONSTRAINED", "RISK_CONSTRAINED", "RISK_ENGINE_SIZED"):
+            bindings[r.get("binding_constraint") or "?"] = \
+                bindings.get(r.get("binding_constraint") or "?", 0) + 1
+
+    # Positions that exist in the real cohort but were never captured.
+    uncaptured = 0
+    try:
+        sizing = payload.get("sizing") or {}
+        for b in sizing.get("breakdowns") or []:
+            if not b.get("geometry_reliable"):
+                uncaptured += 1
+    except Exception:
+        uncaptured = 0
+
+    payload["captured_geometry"] = {
+        "table": GEOMETRY_TABLE,
+        "capture_source": SOURCE_ORDER_FILL,
+        "rows": rows,
+        "reliable_count": len(reliable),
+        "unreliable_count": len(rows) - len(reliable),
+        "uncaptured_count": uncaptured,
+        "class_counts": classes,
+        "binding_counts": bindings,
+        "mean_current_exposure": _mean("current_exposure"),
+        "mean_shadow_exposure": _mean("shadow_exposure"),
+        "mean_actual_risk": _mean("actual_risk"),
+        "mean_shadow_risk": _mean("shadow_initial_risk"),
+        "mean_utilization_percent": _mean("risk_budget_utilization"),
+        "mean_shadow_utilization": _mean("shadow_utilization"),
+        "shadow_label": "SHADOW - NOT EXECUTED, NOT REALIZED P&L",
+        "note": "Captured at the fill, before Profit Capture can move the stop.",
+    }
 
 
 def _print_sizing(real_positions, payload: dict) -> None:
@@ -555,6 +634,81 @@ def _print_sizing(real_positions, payload: dict) -> None:
     print(f"  NOT PROMOTED: {sh['reason']}")
     print("  Sizing is a risk-INCREASING change. The real ledger is untouched and")
     print("  no shadow figure above is recorded as realized P&L.")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Section 9 - ENTRY-TIME CAPTURED GEOMETRY
+#
+# Everything above reconstructs geometry from a closed ledger row, so it has to
+# cope with a stop Profit Capture already moved. This section reads the
+# INSERT-only capture ledger instead, where the entry-time stop is exact by
+# construction. The two are printed adjacently and must not be averaged.
+# ────────────────────────────────────────────────────────────────────────────
+
+GEOMETRY_CLASSES = (
+    "RISK_ENGINE_SIZED", "MANUAL_QUANTITY",
+    "CAPITAL_CONSTRAINED", "RISK_CONSTRAINED", "UNCLASSIFIED",
+)
+
+
+def _print_captured_geometry(payload: dict) -> None:
+    _load_captured_geometry(payload)
+    g = payload.get("captured_geometry") or {}
+    rows = g.get("rows") or []
+    print()
+    print(RULE)
+    print("SECTION 9 - ENTRY-TIME CAPTURED RISK GEOMETRY (exact, not reconstructed)")
+    print(RULE)
+    print(f"  ledger      : {g.get('table')}   captured positions: {len(rows)}")
+    print(f"  reliability : {g.get('reliable_count')} reliable, "
+          f"{g.get('unreliable_count')} recorded-but-unusable, "
+          f"{g.get('uncaptured_count')} positions with no capture at all")
+    if g.get("unreliable_count"):
+        print("    (recorded-but-unusable = no stop / breakeven stop at fill; the")
+        print("     row is kept so 'unmeasurable' is never mistaken for 'zero risk')")
+    if g.get("uncaptured_count"):
+        print(f"    (uncaptured = filled before the capture existed. Not backfilled,"
+              f" not estimated: geometry_reliable = false.)")
+    print()
+    if not rows:
+        print("  No position has been filled since the entry-time capture was")
+        print("  installed, so there is nothing exact to report yet. Section 8's")
+        print("  figures remain ESTIMATES until real fills land in the ledger.")
+        print("  This is the expected state, not a failure.")
+        return
+
+    print(f"  CURRENT (as traded) vs SHADOW (risk-budget-sized)  "
+          f"[{g.get('shadow_label')}]")
+    print(f"    mean current exposure     : Rs {n(g.get('mean_current_exposure'))}")
+    print(f"    mean SHADOW exposure      : Rs {n(g.get('mean_shadow_exposure'))}")
+    print(f"    mean current initial risk : Rs {n(g.get('mean_actual_risk'))}")
+    print(f"    mean SHADOW initial risk  : Rs {n(g.get('mean_shadow_risk'))}")
+    print(f"    mean current utilization  : {n(g.get('mean_utilization_percent'))}%")
+    print(f"    mean SHADOW utilization   : {n(g.get('mean_shadow_utilization'))}%")
+    print()
+    print("  ORDER CLASSIFICATION  (explicit, recorded - never acted on)")
+    for cls in GEOMETRY_CLASSES:
+        print(f"    {cls:<22}: {g.get('class_counts', {}).get(cls, 0)}")
+    print()
+    print("  BINDING CONSTRAINT  (engine-sized positions only)")
+    for name, cnt in sorted((g.get("binding_counts") or {}).items()):
+        print(f"    {name:<22}: {cnt}")
+    print()
+    print("  PER CAPTURED POSITION")
+    hdr = (f"    {'symbol':<11} {'entry':>9} {'initSL':>9} {'rps':>7} {'riskQ':>6} "
+           f"{'capQ':>6} {'actQ':>7} {'actRisk':>8} {'intRisk':>8} {'util%':>7}  class")
+    print(hdr)
+    print("    " + "-" * (len(hdr) - 4))
+    for r in rows:
+        print(f"    {r['symbol'][:11]:<11} {r['entry_price']:>9.2f} "
+              f"{(r['initial_stop_loss'] or 0):>9.2f} "
+              f"{(r['initial_risk_per_share'] or 0):>7.2f} "
+              f"{r['risk_constraint_quantity']:>6} "
+              f"{r['capital_constraint_quantity']:>6} "
+              f"{(r['actual_quantity'] or 0):>7.2f} "
+              f"{n(r['actual_risk']):>8} {n(r['intended_risk']):>8} "
+              f"{n(r['risk_budget_utilization'], 2):>7}  "
+              f"{r['order_classification']}")
 
 
 def _print_verdict(base: dict) -> None:
