@@ -405,19 +405,51 @@ def _eval_risk_reward(signal_setup) -> dict:
 
 
 def _eval_conflict(signal_score, direction_evidence, side: int) -> dict:
-    score = signal_score or {}
-    if hasattr(score, "model_dump"):
-        score = score.model_dump()  # pydantic model -> dict
-    evidence = direction_evidence or {}
-    if hasattr(evidence, "model_dump"):
-        evidence = evidence.model_dump()  # pydantic model -> dict
+    # Contract note (contract-mismatch fix, measurement layer only):
+    #   `signal_score` is SignalScore, a DISPLAY-mapped model whose fields are
+    #   trend_score/momentum_score/.../total. It carries NO `conflict`,
+    #   `long_total` or `short_total` keys, and those display values must never
+    #   be used as decision inputs.
+    #   `direction_evidence` is DirectionalEvidence — the struct that actually
+    #   owns `long_total`, `short_total` and `conflict` — and it arrives as a
+    #   PYDANTIC MODEL, not a dict.
+    # The previous lookup read the totals from `signal_score` (always absent ->
+    # NaN) and then fell back to `direction_evidence.get(...)`, which raised
+    # AttributeError on the model and was swallowed. Every directional signal
+    # therefore fell through to "confirmed / 8.00 / Low conflicting evidence",
+    # so the documented opposing-evidence bands below (12 / 20 cutoffs) could
+    # never execute. Both sources are now read through one normalising helper.
+    # Nothing about the engine's conflict threshold
+    # (min(long_total, short_total) >= CONFLICT_MIN_EVIDENCE == 20) or the
+    # band cutoffs below is changed — only the field lookup is repaired.
+    def _totals(obj):
+        """Return a dict view of `obj` whether it is a dict, a pydantic model,
+        or a plain object exposing the fields as attributes."""
+        if obj is None:
+            return {}
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump()
+        if hasattr(obj, "get"):                     # already a mapping
+            return obj
+        # Plain object: read the declared attributes. `vars()` is not enough —
+        # for class-level attributes (e.g. dataclass/pydantic-v1 style) the
+        # instance __dict__ is empty and `vars()` would silently return {}.
+        return {k: getattr(obj, k) for k in dir(obj)
+                if not k.startswith("_") and not callable(getattr(obj, k, None))}
+
+    score = _totals(signal_score)
+    evidence = _totals(direction_evidence)
+
+    # DirectionalEvidence is the owner of the conflict flag; SignalScore never
+    # carries one. Read it, do not recompute it.
     conflict = bool(score.get("conflict")) or bool(evidence.get("conflict"))
-    opposing = _finite(score.get("short_total" if side == 1 else "long_total"))
+
+    # Opposing evidence for the signal's own side: SHORT evidence for a LONG,
+    # LONG evidence for a SHORT.
+    opposing_key = "short_total" if side == 1 else "long_total"
+    opposing = _finite(evidence.get(opposing_key))
     if pd.isna(opposing):
-        try:
-            opposing = _finite(direction_evidence.get("long_total" if side == -1 else "short_total"))
-        except AttributeError:
-            opposing = float("nan")
+        opposing = _finite(score.get(opposing_key))
     if conflict:
         return _cat("failed", 0.0, ["Strong conflicting LONG and SHORT evidence"])
     if pd.isna(opposing) or opposing < 4:

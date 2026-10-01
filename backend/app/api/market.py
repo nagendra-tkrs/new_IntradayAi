@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.services.market_data.provider_factory import get_provider, get_data_status
 from app.services.scanner import MarketScanner
 from app.services.signal_quality import rank_top_signals, select_top_signals
+from app.services.scanner_diagnostics import build_scan_diagnostics
 from app.services.indicators import calculate_all_indicators
 from app.services.data_validation import data_status
 from app.core.market_session import is_market_hours
@@ -276,7 +277,8 @@ async def stock_chart(symbol: str, days: int = 1, interval: str = "5m"):
 
 
 @router.get("/scanner")
-async def run_scanner(universe: str = settings.LIVE_UNIVERSE):
+async def run_scanner(universe: str = settings.LIVE_UNIVERSE,
+                      diagnostics: bool = False):
     provider = _get_provider()
     scanner = _get_scanner()
     active = active_universe.is_active_universe_request(universe)
@@ -305,7 +307,7 @@ async def run_scanner(universe: str = settings.LIVE_UNIVERSE):
         if q:
             quality_dist[q] = quality_dist.get(q, 0) + 1
     ds = get_data_status()
-    return {
+    payload = {
         "total_scanned": len(results),
         "signals_found": len([r for r in results if r.get("signal") not in ("NO_TRADE", "ERROR", None)]),
         "setup_quality_distribution": quality_dist,
@@ -318,3 +320,8 @@ async def run_scanner(universe: str = settings.LIVE_UNIVERSE):
         "top_signals": top_signals,
         "disclaimer": "Market data supplied through yfinance may be delayed. Signal scores are not guaranteed accuracy.",
     }
+    if diagnostics:
+        # Observation only. Computed from the rows that already exist; it
+        # cannot change which signals were produced or which are returned.
+        payload["pipeline_diagnostics"] = build_scan_diagnostics(results, top_signals)
+    return payload
